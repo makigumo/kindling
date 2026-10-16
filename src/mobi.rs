@@ -5716,6 +5716,24 @@ fn build_lookup_terms(
             (start_pos, text_len, hw_display_len, entry_ordinal),
         );
         headwords.insert(hw.clone());
+
+        // The entry's other orths are index labels over the SAME span: a
+        // lookup for any of them should open this entry, so they need no
+        // locating of their own. They are inserted before the inflections
+        // loop below, which is the order kindlegen's per-orth labels follow,
+        // and they bypass `headwords_only` because they are spellings of the
+        // headword rather than separate inflected forms.
+        for alias in &entry.aliases {
+            if terms.contains_key(alias) || alias.is_empty() {
+                continue;
+            }
+            ordered_labels.push(alias.clone());
+            terms.insert(
+                alias.clone(),
+                (start_pos, text_len, hw_display_len, entry_ordinal),
+            );
+            headwords.insert(alias.clone());
+        }
     }
 
     if !headwords_only {
@@ -6282,6 +6300,7 @@ mod punctuated_label_order_tests {
     fn entry(headword: &str) -> DictionaryEntry {
         DictionaryEntry {
             headword: headword.to_string(),
+            aliases: Vec::new(),
             inflections: Vec::new(),
             html_content: String::new(),
         }
@@ -7145,12 +7164,91 @@ mod punctuated_label_order_tests {
 }
 
 #[cfg(test)]
+mod orth_alias_tests {
+    use super::*;
+
+    /// One `<idx:entry>` carries an average of 4.86 `<idx:orth>` across the
+    /// Wadoku Japanese-German dictionary and up to 306 on a single entry. All
+    /// of them have to become index labels pointing at that one entry, or the
+    /// headwords that are not the entry's first orth do not resolve.
+    #[test]
+    fn every_orth_of_an_entry_becomes_a_label_over_that_entry() {
+        let entry = DictionaryEntry {
+            headword: "あ".into(),
+            aliases: vec!["亜".into(), "東亜".into(), "とうあ".into()],
+            inflections: vec!["ありゅう".into()],
+            html_content: String::new(),
+        };
+        let positions = vec![(11_976, 4_096)];
+        let (terms, _) = build_lookup_terms(&[entry], &positions, b"", false, "ja", false, false);
+        // Returned in the Kindle's search order, not source order: what
+        // matters here is that each spelling is present at all.
+        let labels: Vec<&str> = terms.iter().map(|t| t.label.as_str()).collect();
+        for want in ["あ", "亜", "東亜", "とうあ", "ありゅう"] {
+            assert!(
+                labels.contains(&want),
+                "{want:?} is indexed; got {labels:?}"
+            );
+        }
+        for t in &terms {
+            assert_eq!(t.start_pos, 11_976, "{} shares the entry's span", t.label);
+            assert_eq!(t.text_len, 4_096, "{} shares the entry's length", t.label);
+        }
+    }
+
+    /// The aliases are the headword spelled other ways, so they must be
+    /// indexed even when inflected forms are switched off: dropping them
+    /// there is what left 51,514 of Wadoku's 63,155 headwords unindexed.
+    #[test]
+    fn aliases_survive_headwords_only() {
+        let entry = DictionaryEntry {
+            headword: "あ".into(),
+            aliases: vec!["亜".into()],
+            inflections: vec!["ありゅう".into()],
+            html_content: String::new(),
+        };
+        let positions = vec![(0, 100)];
+        let (terms, _) = build_lookup_terms(&[entry], &positions, b"", true, "ja", false, false);
+        let labels: Vec<&str> = terms.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, vec!["あ", "亜"]);
+    }
+
+    /// An orth that is already a label points at the entry that claimed it
+    /// first, and must not be re-inserted under a later one.
+    #[test]
+    fn an_orth_already_used_stays_with_the_entry_that_claimed_it() {
+        let entries = vec![
+            DictionaryEntry {
+                headword: "亜".into(),
+                aliases: Vec::new(),
+                inflections: Vec::new(),
+                html_content: String::new(),
+            },
+            DictionaryEntry {
+                headword: "東亜".into(),
+                aliases: vec!["亜".into()],
+                inflections: Vec::new(),
+                html_content: String::new(),
+            },
+        ];
+        let positions = vec![(100, 10), (200, 10)];
+        let (terms, _) = build_lookup_terms(&entries, &positions, b"", false, "ja", false, false);
+        let first = terms
+            .iter()
+            .find(|t| t.label == "亜")
+            .expect("亜 is indexed");
+        assert_eq!(first.start_pos, 100, "the earlier entry keeps the label");
+    }
+}
+
+#[cfg(test)]
 mod cyrillic_alias_tests {
     use super::*;
 
     fn entry(headword: &str, inflections: &[&str]) -> DictionaryEntry {
         DictionaryEntry {
             headword: headword.to_string(),
+            aliases: Vec::new(),
             inflections: inflections.iter().map(|s| s.to_string()).collect(),
             html_content: String::new(),
         }
@@ -8369,6 +8467,7 @@ mod entry_anchor_tests {
     fn entry(headword: &str, html: &str) -> DictionaryEntry {
         DictionaryEntry {
             headword: headword.to_string(),
+            aliases: Vec::new(),
             inflections: Vec::new(),
             html_content: html.to_string(),
         }
@@ -8639,6 +8738,7 @@ mod unfound_entry_policy_tests {
             .iter()
             .map(|hw| DictionaryEntry {
                 headword: hw.to_string(),
+                aliases: Vec::new(),
                 inflections: Vec::new(),
                 html_content: String::new(),
             })
