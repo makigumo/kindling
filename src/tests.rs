@@ -2809,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_palmdb_name_long_title_truncation() {
+    fn test_palmdb_name_long_title_elides_like_kindlegen() {
         let dir = TempDir::new("palmdb_long");
 
         // Create a fixture with a very long title
@@ -2850,52 +2850,91 @@ mod tests {
         let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
         assert!(
             name_len <= 31,
-            "Truncated name should be <= 31 bytes, got {}",
-            name_len
-        );
-        // New format: first 28 bytes (at a char boundary) + "..." = 31 bytes.
-        assert_eq!(
-            name_len, 31,
-            "Truncated name should be 31 bytes (28 prefix + '...'), got {}",
+            "Elided name should be <= 31 bytes, got {}",
             name_len
         );
 
+        // kindlegen's elision, measured on its own 2.9 build: the first 12
+        // characters of the name, a hyphen, and the last 14, so the title's
+        // last word survives. Everything from 28 characters up lands here.
         let name = std::str::from_utf8(&name_bytes[..name_len]).unwrap();
-        assert!(
-            name.ends_with("..."),
-            "Truncated name should end with '...': '{}'",
-            name
-        );
-        assert!(
-            name.starts_with("A_Very_Long_Dictionary_Title"),
-            "Truncated name should preserve the prefix: '{}'",
-            name
+        assert_eq!(
+            name, "A_Very_Long_-cters_For_Sure",
+            "long title should elide to 12 characters, '-', and 14 characters"
         );
         println!(
-            "  \u{2713} Long title truncated to {} bytes: '{}'",
+            "  \u{2713} Long title elided to {} bytes: '{}'",
             name_len, name
         );
     }
 
     #[test]
-    fn test_palmdb_name_utf8_truncation_char_boundary() {
-        let dir = TempDir::new("palmdb_utf8");
+    fn test_palmdb_name_transliterates_accents() {
+        let dir = TempDir::new("palmdb_accents");
 
         let html = r#"<html><head><guide></guide></head><body>
 <idx:entry><idx:orth value="x">x</idx:orth><b>x</b> test<hr/></idx:entry>
 </body></html>"#;
         fs::write(dir.path().join("content.html"), html).unwrap();
 
-        // Title with multi-byte UTF-8 characters (Greek). Each Greek letter is
-        // 2 bytes in UTF-8, so a title like "Λεξικό Αρχαίας Ελληνικής Γλώσσας"
-        // is ~55 bytes even though it is ~31 chars. Verify we truncate without
-        // splitting a multi-byte codepoint.
-        let long_title = "Λεξικό Αρχαίας Ελληνικής Γλώσσας Μεγάλο";
-        let opf = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+        // An accented title. The PalmDB name is a filename token in the
+        // device's single-byte world, so `ü`, `ç` and `ö` fold to `u`, `c` and
+        // `o` on the way in: the fold the devices themselves use for a lookup,
+        // and the one kindlegen applies to its own names.
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package version="2.0" xmlns="http://www.idpf.org/2007/opf">
   <metadata>
-    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">{}</dc:title>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Kindling Türkçe Sözlük</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">tr</dc:language>
+    <x-metadata>
+      <DictionaryInLanguage>tr</DictionaryInLanguage>
+      <DictionaryOutLanguage>tr</DictionaryOutLanguage>
+    </x-metadata>
+  </metadata>
+  <manifest>
+    <item id="content" href="content.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="content"/>
+  </spine>
+</package>"#;
+        let opf_path = dir.path().join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let (name_bytes, _, _) = parse_palmdb(&data);
+
+        let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+        let name = std::str::from_utf8(&name_bytes[..name_len]).unwrap();
+        assert_eq!(
+            name, "Kindling_Turkce_Sozluk",
+            "accents should fold to ASCII"
+        );
+        assert!(
+            name_bytes[..name_len].is_ascii(),
+            "PalmDB name must be ASCII: {:?}",
+            name
+        );
+        println!("  \u{2713} Accented title PalmDB name: '{}'", name);
+    }
+
+    #[test]
+    fn test_palmdb_name_without_ascii_spelling_falls_back() {
+        let dir = TempDir::new("palmdb_no_ascii");
+
+        let html = r#"<html><head><guide></guide></head><body>
+<idx:entry><idx:orth value="x">x</idx:orth><b>x</b> test<hr/></idx:entry>
+</body></html>"#;
+        fs::write(dir.path().join("content.html"), html).unwrap();
+
+        // Greek has no ASCII spelling, so the transliterated name would be
+        // empty - a name the indexer cannot key on. kindlegen writes a letter
+        // from each code point instead, which for a Japanese title is `HWW_CE`;
+        // this falls back to the title the rest of the build uses.
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Λεξικό Αρχαίας Ελληνικής Γλώσσας</dc:title>
     <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">el</dc:language>
     <x-metadata>
       <DictionaryInLanguage>el</DictionaryInLanguage>
@@ -2908,34 +2947,22 @@ mod tests {
   <spine>
     <itemref idref="content"/>
   </spine>
-</package>"#,
-            long_title
-        );
+</package>"#;
         let opf_path = dir.path().join("content.opf");
-        fs::write(&opf_path, &opf).unwrap();
+        fs::write(&opf_path, opf).unwrap();
 
         let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
         let (name_bytes, _, _) = parse_palmdb(&data);
 
         let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+        let name = std::str::from_utf8(&name_bytes[..name_len]).unwrap();
+        assert_eq!(name, "Dictionary", "an ASCII-only name must fall back");
         assert!(
-            name_len <= 31,
-            "Name should be <= 31 bytes, got {}",
-            name_len
-        );
-
-        // Must decode as valid UTF-8 (no splitting multi-byte codepoints).
-        let name = std::str::from_utf8(&name_bytes[..name_len])
-            .expect("Truncated PalmDB name must be valid UTF-8 (char boundary respected)");
-        assert!(
-            name.ends_with("..."),
-            "Truncated name should end with '...': '{}'",
+            name_bytes[..name_len].is_ascii(),
+            "PalmDB name must be ASCII: {:?}",
             name
         );
-        println!(
-            "  \u{2713} UTF-8 title truncated to {} bytes: '{}'",
-            name_len, name
-        );
+        println!("  \u{2713} Non-ASCII title PalmDB name: '{}'", name);
     }
 
     #[test]
