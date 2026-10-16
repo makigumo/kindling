@@ -643,11 +643,20 @@ fn build_indx_primary(
     index_name: &[u8],
     label_encoding: u32,
 ) -> Vec<u8> {
-    // The name is embedded right after the 192-byte fixed header, which is
-    // what the 199-byte "orth" header length accounts for. It is the OPF's
-    // `DefaultLookupIndex`; kindlingen hardcoded "default" here, so every
-    // dictionary it built claimed that name regardless of what its OPF said.
-    let embed_name = header_length == 199;
+    // The name, when there is one, is embedded immediately after the
+    // 192-byte fixed header. An empty entry name leaves the header at its
+    // fixed 192 bytes and puts nothing behind it (the character-map and
+    // index-names sub-indexes do this). 199 was the length for a
+    // 7-byte "default" name; it was never the name's actual length for any
+    // other index name, which is why the odd-length one (`Japanisch`, 9 bytes)
+    // landed two bytes past its IDXT offset and the device could not binary
+    // search the index by it.
+    let embed_name = !index_name.is_empty();
+    let header_length = if embed_name {
+        192 + index_name.len()
+    } else {
+        header_length
+    };
     let name_bytes: &[u8] = if embed_name { index_name } else { b"" };
 
     let mut header = vec![0u8; INDX_HEADER_LENGTH];
