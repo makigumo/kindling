@@ -5883,8 +5883,10 @@ mod tests {
     fn test_dict_css_preserved_in_text() {
         let dir = TempDir::new("dict_css_preserved");
 
-        // Build HTML with a <style> block in the <head>
-        let html = r#"<html><head><style>.def { margin-left: 20px; }</style><guide></guide></head><body>
+        // Build HTML with a <style> block in the <head>. The declaration is a
+        // `padding`, which has no legacy tag to become: the point here is that
+        // a sheet kindling cannot use still reaches the output.
+        let html = r#"<html><head><style>.def { padding-left: 20px; }</style><guide></guide></head><body>
 <idx:entry><idx:orth value="apple">apple</idx:orth><span class="def">a fruit</span></idx:entry>
 <idx:entry><idx:orth value="banana">banana</idx:orth><span class="def">another fruit</span></idx:entry>
 </body></html>"#;
@@ -5916,7 +5918,7 @@ mod tests {
         let text = extract_text_from_uncompressed_mobi(&data);
 
         assert!(
-            text.contains(".def { margin-left: 20px; }"),
+            text.contains(".def { padding-left: 20px; }"),
             "CSS style block should be preserved in text output, got: {}",
             &text[..text.len().min(500)]
         );
@@ -5940,7 +5942,7 @@ u { font-size: 260%; font-weight: bold; }
 p { margin: 0.3em 0; }
 .def { color: red; }
 </style></head><body>
-<idx:entry><idx:orth value="zstyle"><b>zstyle</b></idx:orth><p><u>UNDER</u> plain</p></idx:entry>
+<idx:entry><idx:orth value="zstyle"><b>zstyle</b></idx:orth><p class="def"><u>UNDER</u> plain</p></idx:entry>
 </body></html>"#;
         fs::write(dir.path().join("content.html"), html).unwrap();
 
@@ -5982,9 +5984,18 @@ p { margin: 0.3em 0; }
             "compiled declarations should leave the stylesheet, got: {}",
             &text[..text.len().min(800)]
         );
-        // Everything the popup cannot express still ships.
+        // A colour compiles too, and it has no `style` attribute of its own to
+        // be stripped: it reaches the entry as a `<font color>` face, which is
+        // what kindlegen writes for the same rule.
         assert!(
-            text.contains("margin: 0.3em 0") && text.contains(".def"),
+            text.contains(r#"<font color="red">"#),
+            "a colour rule should reach the entry as inline markup, got: {}",
+            &text[..text.len().min(800)]
+        );
+        // Everything the popup cannot express still ships. A margin whose left
+        // component is zero has no legacy tag to become, so this one stays.
+        assert!(
+            text.contains("margin: 0.3em 0"),
             "uncompiled rules should survive, got: {}",
             &text[..text.len().min(800)]
         );
@@ -10034,7 +10045,7 @@ p { margin: 0.3em 0; }
         // Shapes that only the anchoring path gets right, so a regression to the
         // old assembler shows up as a difference rather than as a silent pass.
         let html = r#"<html xmlns:idx="idx"><head><title>D</title>
-<style type="text/css">p { margin: 3px; }</style></head><body><mbp:frameset>
+<style type="text/css">p { padding: 3px; }</style></head><body><mbp:frameset>
 <idx:entry><idx:orth value="alpha"><b>alpha</b></idx:orth><p>first</p></idx:entry>
 <idx:entry><idx:orth value="beta"/><p>no headword in this body at all</p></idx:entry>
 <idx:entry><idx:orth value="gamma"/><h1>gamma</h1><p>headword in a heading</p></idx:entry>
@@ -10068,7 +10079,7 @@ p { margin: 0.3em 0; }
             "below the split threshold the flag must not change the text blob"
         );
         assert!(
-            a.contains("margin: 3px"),
+            a.contains("padding: 3px"),
             "the stylesheet must survive at both settings, got: {}",
             &a[..a.len().min(300)]
         );
@@ -10117,7 +10128,7 @@ p { margin: 0.3em 0; }
                 dir.path().join("c.html"),
                 dict_html(
                     r#"<head profile="http://example.invalid/">"#,
-                    r#"<style type="text/css">p { margin: 7px; }</style>"#,
+                    r#"<style type="text/css">p { padding: 7px; }</style>"#,
                     "alpha",
                 ),
             )
@@ -10134,7 +10145,7 @@ p { margin: 0.3em 0; }
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
             assert!(
-                text.contains("margin: 7px"),
+                text.contains("padding: 7px"),
                 "<head profile=...> must not swallow the stylesheet"
             );
         }
@@ -10151,7 +10162,7 @@ p { margin: 0.3em 0; }
                 ),
             )
             .unwrap();
-            fs::write(dir.path().join("style.css"), "p { color: red; }").unwrap();
+            fs::write(dir.path().join("style.css"), "p { padding: 3px; }").unwrap();
             let opf = dir.path().join("content.opf");
             fs::write(
                 &opf,
@@ -10165,7 +10176,7 @@ p { margin: 0.3em 0; }
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
             assert!(
-                text.contains("color: red"),
+                text.contains("padding: 3px"),
                 "an external <link rel=stylesheet> must reach the dictionary"
             );
         }
@@ -10178,7 +10189,9 @@ p { margin: 0.3em 0; }
                     dir.path().join(format!("part{i}.html")),
                     dict_html(
                         "<head>",
-                        &format!(r#"<style type="text/css">.part{i} {{ margin: {i}px; }}</style>"#),
+                        &format!(
+                            r#"<style type="text/css">.part{i} {{ padding: {i}px; }}</style>"#
+                        ),
                         word,
                     ),
                 )
