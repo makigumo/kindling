@@ -7599,8 +7599,13 @@ fn build_record0(
     // Dictionaries: 0x50 (bit 6 = EXTH present, bit 4 set) - matches Kindle Previewer output.
     // KCC uses 0x850 for KF7 books/comics. 0x4850 was a Kindle Previewer
     // artifact that may cause rejection on real Kindle hardware.
+    // kindlegen writes 0xD0 here for a dictionary, and our dictionaries have
+    // all along written 0x50, which differs exactly in the 0x80 bit. The
+    // device will not recognise a file as a dictionary carrying the lower
+    // value, on the assumption that it is a book without a long-file-name
+    // record (see the comparison to kindlegen that pinned this down).
     if is_dictionary {
-        put32(&mut mobi, 112, 0x50);
+        put32(&mut mobi, 112, 0xD0);
     } else {
         put32(&mut mobi, 112, 0x850);
     }

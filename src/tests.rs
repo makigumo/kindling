@@ -493,8 +493,8 @@ mod tests {
         // MOBI header offset 112 = PalmDOC(16) + 112 = rec0 offset 128
         let cap_marker = read_u32_be(rec0, 128);
         assert_eq!(
-            cap_marker, 0x50,
-            "Dictionary capability marker at offset 112 should be 0x50, got 0x{:X}",
+            cap_marker, 0xD0,
+            "Dictionary capability marker at offset 112 should be 0xD0, got 0x{:X}",
             cap_marker
         );
         println!("  \u{2713} Dict capability marker: 0x{:X}", cap_marker);
@@ -7824,8 +7824,8 @@ p { margin: 0.3em 0; }
         // Offset 112: capability marker - 0x50 for dicts
         let cap = read_u32_be(rec0, 16 + 112);
         assert_eq!(
-            cap, 0x50,
-            "Dict capability marker should be 0x50, got 0x{:X}",
+            cap, 0xD0,
+            "Dict capability marker should be 0xD0, got 0x{:X}",
             cap
         );
         println!("  \u{2713} Dict capability marker: 0x{:X}", cap);
