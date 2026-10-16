@@ -202,6 +202,26 @@ fn greek_ordt_covers_script(headword_chars: &HashSet<char>) -> bool {
     total == 0 || hits * 2 >= total
 }
 
+/// The INDX records of a dictionary, plus where the "index names" pair sits
+/// inside them.
+///
+/// A dictionary's MOBI header names two INDX records: the orthographic index
+/// at 0x28 and the index-names index at 0x30. The names index is the one
+/// whose single entry is spelled the name the OPF gave the lookup index, so
+/// the firmware can tell which of a file's several indexes is the one the
+/// `DefaultLookupIndex` meta selected. kindling wrote neither the name nor
+/// the header field, so every dictionary it built announced itself as
+/// `default` and pointed at no names index at all.
+#[derive(Debug, Default)]
+pub struct OrthIndx {
+    /// Records in file order:
+    /// `[primary1, data1_1, ..., primary2, data2_1, primary3, data3_1]`.
+    pub records: Vec<Vec<u8>>,
+    /// Index of the names-index primary within `records`, i.e. what the MOBI
+    /// header's 0x30 field holds relative to the orthographic index record.
+    pub names_index: usize,
+}
+
 /// Build all INDX records for the orthographic (dictionary) index.
 ///
 /// `index_language` is the Windows primary language ID written to the
@@ -210,15 +230,17 @@ fn greek_ordt_covers_script(headword_chars: &HashSet<char>) -> bool {
 /// lookup-term `label_bytes` must already be ORDT symbol sequences and
 /// the terms must be sorted by their ORDT sort keys.
 ///
-/// Returns a list of record byte vectors:
-/// [primary1, data1_1, ..., primary2, data2_1, primary3, data3_1]
+/// `index_name` is the OPF's `DefaultLookupIndex` (`Japanisch` in the Wadoku
+/// OPF). It becomes the orth primary's index name and the one label of the
+/// index-names index, as kindlegen does.
 pub fn build_orth_indx(
     lookup_terms: &[LookupTerm],
     headword_chars: &HashSet<char>,
     strict_accents: bool,
     index_language: u32,
     gen_ordt: Option<&OrdtTables>,
-) -> Vec<Vec<u8>> {
+    index_name: &str,
+) -> OrthIndx {
     // --- Sub-index 1: Headword entries ---
     let tag_defs1 = [
         TagDef {
@@ -320,6 +342,8 @@ pub fn build_orth_indx(
         199,
         index_language,
         ordt_mode1,
+        index_name.as_bytes(),
+        ORTH_LABEL_ENCODING,
     );
 
     let mut sub1 = vec![primary1];
@@ -385,11 +409,19 @@ pub fn build_orth_indx(
         192,
         index_language,
         OrdtMode::None,
+        b"",
+        ORTH_LABEL_ENCODING,
     );
     let mut sub2 = vec![char_primary];
     sub2.extend(char_records);
 
-    // --- Sub-index 3: "default" index name ---
+    // --- Sub-index 3: the index-names index ---
+    //
+    // One entry, spelled the OPF's `DefaultLookupIndex`, with tag 1 pointing
+    // at the first leaf of the orth index. The MOBI header's 0x30 field has
+    // to name this record for the firmware to know which of the file's
+    // indexes the default lookup uses; kindling left 0x30 at 0xFFFFFFFF, so
+    // its dictionaries carried a names index nothing could reach.
     let tag_defs3 = [TagDef {
         tag_id: 1,
         num_values: 1,
@@ -397,23 +429,26 @@ pub fn build_orth_indx(
     }];
     let tagx3 = build_tagx(&tag_defs3);
 
-    let default_label = b"default".to_vec();
+    let name_label = index_name.as_bytes().to_vec();
     let tag_values3 = vec![(1u8, 0u32)];
-    let default_entry = encode_indx_entry(&default_label, &[], &tag_values3, &tag_defs3);
-    let default_data_rec = build_indx_data_record(&[default_entry]);
-    let default_primary = build_indx_primary(
+    let name_entry = encode_indx_entry(&name_label, &[], &tag_values3, &tag_defs3);
+    let name_data_rec = build_indx_data_record(&[name_entry]);
+    let name_primary = build_indx_primary(
         &tagx3,
         1,
         1,
-        &[default_label],
+        &[name_label],
         &[1],
         192,
         index_language,
         OrdtMode::None,
+        b"",
+        UTF8_LABEL_ENCODING,
     );
-    let sub3 = vec![default_primary, default_data_rec];
+    let sub3 = vec![name_primary, name_data_rec];
 
     let total_sub1 = sub1.len();
+    let names_index = total_sub1 + sub2.len();
     eprintln!(
         "  Sub-index 1: {} records ({} entries)",
         total_sub1,
@@ -424,12 +459,18 @@ pub fn build_orth_indx(
         sub2.len(),
         chars.len()
     );
-    eprintln!("  Sub-index 3: {} records (default)", sub3.len());
+    eprintln!(
+        "  Sub-index 3: {} records (index names, {index_name:?})",
+        sub3.len()
+    );
 
-    let mut all = sub1;
-    all.extend(sub2);
-    all.extend(sub3);
-    all
+    let mut records = sub1;
+    records.extend(sub2);
+    records.extend(sub3);
+    OrthIndx {
+        records,
+        names_index,
+    }
 }
 
 /// Build a TAGX section.
@@ -454,6 +495,14 @@ fn build_tagx(tag_defs: &[TagDef]) -> Vec<u8> {
     result.extend_from_slice(&tag_data);
     result
 }
+
+/// INDX header "index encoding" for labels stored as u16 code units or ORDT
+/// symbol sequences: the orth index and the character map.
+const ORTH_LABEL_ENCODING: u32 = 0xFDEA;
+
+/// INDX header "index encoding" for labels stored as UTF-8: the single index
+/// name in the index-names index.
+const UTF8_LABEL_ENCODING: u32 = 65001;
 
 /// The longest label an INDX data entry stores, in bytes; longer labels are
 /// cut to this length (see [`encode_indx_entry`]).
@@ -591,9 +640,15 @@ fn build_indx_primary(
     header_length: usize,
     index_language: u32,
     ordt_mode: OrdtMode<'_>,
+    index_name: &[u8],
+    label_encoding: u32,
 ) -> Vec<u8> {
-    let embed_default = header_length == 199;
-    let default_str: &[u8] = if embed_default { b"default" } else { b"" };
+    // The name is embedded right after the 192-byte fixed header, which is
+    // what the 199-byte "orth" header length accounts for. It is the OPF's
+    // `DefaultLookupIndex`; kindlingen hardcoded "default" here, so every
+    // dictionary it built claimed that name regardless of what its OPF said.
+    let embed_name = header_length == 199;
+    let name_bytes: &[u8] = if embed_name { index_name } else { b"" };
 
     let mut header = vec![0u8; INDX_HEADER_LENGTH];
     header[0..4].copy_from_slice(b"INDX");
@@ -604,7 +659,11 @@ fn build_indx_primary(
     put32(&mut header, 16, 2);
     // offset 20: IDXT offset (set below)
     put32(&mut header, 24, num_data_records as u32); // routing entry count
-    put32(&mut header, 28, 0xFDEA); // index encoding
+    // Header offset 28: how the labels are encoded. 0xFDEA is the orth form
+    // (u16 code units, or ORDT symbols when `ordt_mode` supplies tables);
+    // 65001 is plain UTF-8, which is what the one-byte index name of the
+    // index-names index is stored as.
+    put32(&mut header, 28, label_encoding);
     put32(&mut header, 32, index_language); // index language (Windows primary LCID)
     put32(&mut header, 36, total_entries as u32); // total entry count
 
@@ -651,12 +710,18 @@ fn build_indx_primary(
     let idxt_offset = entries_start + routing_entries.len();
     put32(&mut header, 20, idxt_offset as u32);
 
-    // Assemble: header + [default] + TAGX + routing entries + IDXT
+    // Assemble: header + [index name] + TAGX + routing entries + IDXT
     let mut record = header;
-    record.extend_from_slice(default_str);
+    record.extend_from_slice(name_bytes);
     record.extend_from_slice(tagx);
     record.extend_from_slice(&routing_entries);
     record.extend_from_slice(&idxt);
+
+    // Header offset 0xB8: length of the index name embedded at 192. The
+    // ORDT arms below used to write a hardcoded 7 for "default"; without this
+    // the field read 0 while seven name bytes sat behind it, so a reader
+    // following 0xB8 found the TAGX where it expected an empty name.
+    put32(&mut record, 184, name_bytes.len() as u32);
 
     // Pad to 4-byte boundary
     while record.len() % 4 != 0 {
@@ -684,7 +749,6 @@ fn build_indx_primary(
         put32(&mut record, 168, tables.count()); // oentries
         put32(&mut record, 172, ordt1_abs as u32); // ORDT1 (weights)
         put32(&mut record, 176, ordt2_abs as u32); // ORDT2 (values)
-        put32(&mut record, 184, 7); // name_len ("default")
         return record;
     }
 
@@ -694,7 +758,7 @@ fn build_indx_primary(
     // generated ORDT (handled by `OrdtMode::Generated` above), whose
     // minimal table leaves every letter as a literal that matches exactly,
     // so this Greek embed is skipped and é/e no longer fold (issue #8).
-    if embed_default && matches!(ordt_mode, OrdtMode::Greek) && !ORDT_GREEK.is_empty() {
+    if embed_name && matches!(ordt_mode, OrdtMode::Greek) && !ORDT_GREEK.is_empty() {
         let ordt_start = record.len();
         record.extend_from_slice(ORDT_GREEK);
 
@@ -755,7 +819,6 @@ fn build_indx_primary(
         put32(&mut record, 168, 7); // oentries
         put32(&mut record, 172, ordt1_abs as u32); // ordt1 offset
         put32(&mut record, 176, ordt2_abs as u32); // ordt2 offset
-        put32(&mut record, 184, 7); // name_len ("default")
 
         // SPL table pointers
         put32(&mut record, 56, 2); // spl_count
@@ -955,6 +1018,8 @@ mod tests {
             199,
             9,
             OrdtMode::None,
+            b"default",
+            ORTH_LABEL_ENCODING,
         );
 
         let routing = parse_routing(&rec);
@@ -976,11 +1041,99 @@ mod tests {
             headword_display_len: 1,
             source_ordinal: 0,
         }];
-        let recs = build_orth_indx(&terms, chars, false, 4, None);
+        let recs = build_orth_indx(&terms, chars, false, 4, None, "default").records;
         // Sub-index 1 is its primary and data records; the map comes next.
         let start = 1 + rd32(&recs[0], 24) as usize;
         let n = rd32(&recs[start], 24) as usize;
         recs[start..start + 1 + n].to_vec()
+    }
+
+    /// Read the index name an INDX primary carries: header offset 0xB8 is its
+    /// length, and the bytes sit immediately after the 192-byte header.
+    fn primary_index_name(rec: &[u8]) -> Option<String> {
+        let len = rd32(rec, 0xB8) as usize;
+        if len == 0 {
+            return None;
+        }
+        String::from_utf8(rec[192..192 + len].to_vec()).ok()
+    }
+
+    /// A one-term dictionary built with the given `DefaultLookupIndex`.
+    fn one_term_dict(index_name: &str) -> OrthIndx {
+        let terms = vec![LookupTerm {
+            label_bytes: encode_indx_label("a"),
+            label: "a".to_string(),
+            start_pos: 0,
+            text_len: 1,
+            headword_display_len: 1,
+            source_ordinal: 0,
+        }];
+        build_orth_indx(&terms, &"a".chars().collect(), false, 17, None, index_name)
+    }
+
+    /// The orthographic index announces the OPF's `DefaultLookupIndex`, not a
+    /// hardcoded `default`. kindling wrote "default" whatever the OPF said, so
+    /// a dictionary whose OPF names its index `Japanisch` (as kindlegen's build
+    /// of it does) shipped an index nothing could identify.
+    #[test]
+    fn the_orth_index_carries_the_opf_index_name() {
+        for name in ["Japanisch", "default", "Wörterbuch"] {
+            let idx = one_term_dict(name);
+            assert_eq!(
+                primary_index_name(&idx.records[0]).as_deref(),
+                Some(name),
+                "orth primary of a {name:?} dictionary"
+            );
+        }
+    }
+
+    /// The name is embedded right after the header, so header 0xB8 has to be
+    /// its length or a reader following that field lands in the TAGX.
+    #[test]
+    fn the_embedded_index_name_length_matches_the_header_field() {
+        let rec = &one_term_dict("Japanisch").records[0];
+        assert_eq!(rd32(rec, 0xB8), "Japanisch".len() as u32);
+        assert_eq!(rd32(rec, 0x1C), ORTH_LABEL_ENCODING);
+        assert_eq!(&rec[192..201], b"Japanisch");
+        assert_eq!(&rec[201..205], b"TAGX", "the TAGX follows the name");
+    }
+
+    /// The names index the MOBI header's 0x30 field points at holds exactly
+    /// one entry, spelled that same name. Without the header field naming the
+    /// record, a device has no way to learn which index is the default.
+    #[test]
+    fn the_names_index_is_the_pair_whose_label_is_the_index_name() {
+        let idx = one_term_dict("Japanisch");
+        let names = &idx.records[idx.names_index];
+        assert_eq!(&names[0..4], b"INDX");
+        assert_eq!(rd32(names, 0x18), 1, "one routing entry");
+        assert_eq!(rd32(names, 0x24), 1, "one entry in total");
+        assert_eq!(primary_index_name(names), None, "no name of its own");
+        // The one label is UTF-8, not an orth-style u16/ORDT sequence, so the
+        // header must say so. kindlegen writes 65001 here and 0xFDEA for the
+        // orth index.
+        assert_eq!(rd32(names, 0x1C), UTF8_LABEL_ENCODING);
+
+        // The routing entry is `[len][label][count as u16]` right after TAGX.
+        let tagx_len = rd32(names, 192 + 4) as usize;
+        let entry = &names[192 + tagx_len..];
+        assert_eq!(entry[0] as usize, "Japanisch".len());
+        assert_eq!(&entry[1..10], b"Japanisch");
+
+        // And the data record it routes to stores the same label.
+        let leaf = &idx.records[idx.names_index + 1];
+        assert_eq!(leaf[192], "Japanisch".len() as u8);
+        assert_eq!(&leaf[193..202], b"Japanisch");
+    }
+
+    /// An OPF with no `DefaultLookupIndex` still produces a usable name: the
+    /// spec's default is `default`, and an empty name would make the header's
+    /// 0xB8 field zero while no name sat behind it.
+    #[test]
+    fn an_empty_index_name_does_not_leave_the_header_field_zero() {
+        let rec = &one_term_dict("").records[0];
+        assert_eq!(primary_index_name(rec), None, "nothing embedded");
+        assert_eq!(rd32(rec, 0xB8), 0, "so the length field agrees");
     }
 
     #[test]
@@ -1038,7 +1191,7 @@ mod tests {
             });
         }
         let chars: HashSet<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-        let recs = build_orth_indx(&terms, &chars, false, 9, None);
+        let recs = build_orth_indx(&terms, &chars, false, 9, None, "default").records;
 
         let primary1 = &recs[0];
         let n = rd32(primary1, 24) as usize;
