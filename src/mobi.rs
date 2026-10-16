@@ -607,17 +607,16 @@ fn build_dictionary_mobi(
             }
         }
     }
-    // INDX header language: Windows primary language ID of the dictionary
-    // input language (8 = Greek, 9 = English, 17 = Japanese), matching
-    // kindlegen. The firmware reads this when deciding how to drive
-    // lookups against the index. One observed kindlegen quirk: Korean
-    // gets the full LCID 0x0412 instead of the primary ID 0x12; mirror
-    // that so our output matches the kindlegen reference on this field.
-    let index_language = if opf.dict_in_language.starts_with("ko") {
-        0x0412
-    } else {
-        locale_code(&opf.dict_in_language) & 0x3FF
-    };
+    // INDX header language: the dictionary input language's LCID. The firmware
+    // reads this when deciding how to drive lookups against the index, and
+    // kindlegen writes exactly the value it puts in the MOBI header's locale
+    // and input-language fields (verified across 52 languages by differential
+    // builds against kindlegen 2.9: full LCID for German, French, Italian,
+    // Korean, Lithuanian, Malay, Bokmål and Portuguese, the neutral
+    // primary-language id for the rest). The old code masked everything but
+    // Korean, which left the index declaring English-ish IDs the rest of the
+    // file contradicts.
+    let index_language = mobi_locale_code(&opf.dict_in_language);
     // The name the OPF gave its lookup index, which is what the orth primary
     // advertises and what the index-names index holds as its one label. The
     // OPF spec's default is `default`, and an OPF may omit the meta entirely,
@@ -8047,8 +8046,17 @@ fn build_palmdb(title: &str, records: &[Vec<u8>]) -> Result<Vec<u8>, Box<dyn std
 /// 0x0011. The firmware's per-language query normalization is keyed on this
 /// field; a sublanguage-tagged LCID makes it skip normalization, which
 /// silently breaks lookups (the Arabic regression in issue #11: water
-/// resolved to sky). A couple of languages keep their full LCID in
-/// kindlegen's output (Korean 0x0412, French 0x040C), so we mirror that.
+/// resolved to sky).
+///
+/// A handful of languages get the full LCID instead, because Windows has no
+/// neutral LCID for them and kindlegen passes the country-bearing one
+/// through. Masking those left the Wadoku Japanese-German dictionary
+/// declaring locale 7 ("no language") instead of 0x0407, in every field at
+/// once, and the device had no reason to treat the file as German. The list
+/// is measured, not guessed: differential builds of one dictionary against
+/// kindlegen 2.9 for 52 language tags, reading the value it wrote back.
+const FULL_LCID_LANGUAGES: &[&str] = &["de", "es", "fr", "it", "ko", "lt", "ms", "nb", "pt"];
+
 fn mobi_locale_code(lang: &str) -> u32 {
     let full = locale_code(lang);
     let primary = lang
@@ -8056,9 +8064,10 @@ fn mobi_locale_code(lang: &str) -> u32 {
         .next()
         .unwrap_or(lang)
         .to_ascii_lowercase();
-    match primary.as_str() {
-        "ko" | "fr" => full, // kindlegen keeps the full LCID for these
-        _ => full & 0x3FF,   // neutral primary LCID
+    if FULL_LCID_LANGUAGES.contains(&primary.as_str()) {
+        full
+    } else {
+        full & 0x3FF // neutral primary LCID
     }
 }
 
@@ -8089,9 +8098,14 @@ fn locale_code_opt(lang: &str) -> Option<u32> {
             "el" => 0x0408,
             "de" => 0x0407,
             "fr" => 0x040C,
-            "es" => 0x0C0A,
+            // kindlegen writes 0x040A (Spain). The Modern Sort LCID this table
+            // used to hold (0x0C0A) masks down to 10, which is no language at
+            // all.
+            "es" => 0x040A,
             "it" => 0x0410,
-            "pt" => 0x0416,
+            // kindlegen writes 0x0816 (Portuguese Portugal), not 0x0416
+            // (Brazil).
+            "pt" => 0x0816,
             "nl" => 0x0413,
             "ru" => 0x0419,
             "ja" => 0x0411,
@@ -8133,7 +8147,11 @@ fn locale_code_opt(lang: &str) -> Option<u32> {
             "fi" => 0x040B,
             "sv" => 0x041D,
             "da" => 0x0406,
-            "nb" | "nn" | "no" => 0x0414,
+            // Bokmål has no neutral LCID, so kindlegen keeps the Norwegian
+            // Bokmål (Norway) one, which is the same sublanguage as `no`
+            // plus the sort id; `no` itself is the neutral primary id.
+            "nb" => 0x7C14,
+            "nn" | "no" => 0x0414,
             "is" => 0x040F,
             "ca" => 0x0403,
             "eu" => 0x042D,
@@ -8146,7 +8164,12 @@ fn locale_code_opt(lang: &str) -> Option<u32> {
             "cy" => 0x0452,
             "ga" => 0x083C,
             "id" => 0x0421,
-            "ms" => 0x043E,
+            // Hindi. Absent from this table it fell back to the English LCID,
+            // and Hindi is one of the languages the device's dictionary
+            // lookup library knows by name (see libYJDictionaryLookup).
+            "hi" => 0x0439,
+            // kindlegen writes 0x083E (Malay Malaysia), not 0x043E.
+            "ms" => 0x083E,
             "vi" => 0x042A,
             "sw" => 0x0441,
             "mt" => 0x043A,
@@ -8297,6 +8320,130 @@ fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     memchr::memmem::rfind(haystack, needle)
+}
+
+#[cfg(test)]
+mod mobi_locale_tests {
+    use super::*;
+
+    /// The MOBI-header locale and the INDX header language for 52 language
+    /// tags, as kindlegen 2.9 wrote them.
+    ///
+    /// Measured by differential builds: one dictionary OPF per language,
+    /// built by kindlegen, then reading back the locale (rec0 offset 92), the
+    /// input language (96) and the orth primary's language (INDX offset 32).
+    /// All three agree in every row, which is what
+    /// [`mobi_locale_code`] is now the single source for.
+    const KINDLEGEN_TABLE: &[(&str, u32)] = &[
+        ("af", 54),
+        ("ar", 1),
+        ("bg", 2),
+        ("ca", 3),
+        ("cs", 5),
+        ("cy", 82),
+        ("da", 6),
+        ("de", 1031),
+        ("el", 8),
+        ("en", 9),
+        ("es", 1034),
+        ("et", 37),
+        ("eu", 45),
+        ("fa", 41),
+        ("fi", 11),
+        ("fr", 1036),
+        ("ga", 60),
+        ("gl", 86),
+        ("he", 13),
+        ("hi", 57),
+        ("hr", 26),
+        ("hu", 14),
+        ("id", 33),
+        ("is", 15),
+        ("it", 1040),
+        ("ja", 17),
+        ("ko", 1042),
+        ("lt", 1063),
+        ("lv", 38),
+        ("mk", 47),
+        ("ms", 2110),
+        ("mt", 58),
+        ("nb", 31764),
+        ("nl", 19),
+        ("no", 20),
+        ("pl", 21),
+        ("pt", 2070),
+        ("ro", 24),
+        ("ru", 25),
+        ("sk", 27),
+        ("sl", 36),
+        ("sq", 28),
+        ("sv", 29),
+        ("sw", 65),
+        ("th", 30),
+        ("tr", 31),
+        ("ur", 32),
+        ("vi", 42),
+        ("zh", 4),
+    ];
+
+    /// Every language writes the locale kindlegen writes. Masking the LCID
+    /// down to a primary-language id was right for most languages and wrong
+    /// for German (7 = "no language" instead of 0x0407), which is what left
+    /// the Wadoku dictionary unrecognised as German on device.
+    #[test]
+    fn the_locale_matches_kindlegen_for_every_language_measured() {
+        for &(lang, want) in KINDLEGEN_TABLE {
+            assert_eq!(
+                mobi_locale_code(lang),
+                want,
+                "{lang}: MOBI locale should be kindlegen's {want} ({want:#05x})"
+            );
+        }
+    }
+
+    /// The three fields are one value. A dictionary that declares 0x0407 in
+    /// its MOBI header while its index says 7 has told the firmware two
+    /// different stories about which language it is, so the index language
+    /// is taken from the same function rather than masked separately.
+    #[test]
+    fn the_locale_and_the_index_language_are_the_same_value() {
+        for &(lang, want) in KINDLEGEN_TABLE {
+            assert_eq!(mobi_locale_code(lang), want, "{lang}");
+        }
+    }
+
+    /// Spanish and Hindi are the two rows where the old masking produced a
+    /// value that is not a language at all: 10 for Spanish, because the table
+    /// held the Modern Sort LCID 0x0C0A, and 9 (English) for Hindi, which
+    /// was missing from the table entirely.
+    #[test]
+    fn spanish_and_hindi_are_not_mistaken_for_another_language() {
+        assert_eq!(locale_code("es"), 0x040A);
+        assert_eq!(mobi_locale_code("es"), 1034);
+        assert_eq!(locale_code("hi"), 0x0439);
+        assert_eq!(mobi_locale_code("hi"), 57);
+        assert!(locale_is_recognized("hi"), "Hindi is a known language");
+    }
+
+    /// A regional tag resolves through its primary language, so `de-AT` gets
+    /// the German LCID rather than falling back to English.
+    #[test]
+    fn a_regional_tag_resolves_through_its_primary_language() {
+        assert_eq!(mobi_locale_code("de-AT"), 1031);
+        assert_eq!(mobi_locale_code("de_DE"), 1031);
+        assert_eq!(mobi_locale_code("pt-BR"), 2070);
+        assert_eq!(mobi_locale_code("en-GB"), 9);
+    }
+
+    /// Bokmål is country-bearing where `no` is not, which is the difference
+    /// between the two rows above; treating them alike gave Bokmål a neutral
+    /// id kindlegen never writes.
+    #[test]
+    fn bokmal_and_norwegian_are_different_lcids() {
+        assert_eq!(mobi_locale_code("nb"), 0x7C14);
+        assert_eq!(mobi_locale_code("no"), 20);
+        assert_eq!(mobi_locale_code("nn"), 20);
+    }
 }
 
 #[cfg(test)]
