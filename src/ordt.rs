@@ -259,7 +259,11 @@ pub struct OrdtTables {
 /// `ſ` as s, the Vietnamese `ơ` and `ư` as o and u, and `ɐ` as a. The Latin
 /// letters this leaves out, among them Romanian `ș` and `ț`, weigh nothing (see
 /// [`device_weight`]).
-fn latin_base_letter(unit: u16) -> Option<u8> {
+///
+/// The PalmDB name writer folds a Latin title letter through this same table
+/// (see `mobi::ascii_name`), so a name carries the letter the device would have
+/// looked the word up under.
+pub(crate) fn latin_base_letter(unit: u16) -> Option<u8> {
     let base = match unit {
         0x41..=0x5A => unit as u8 + 0x20,
         0x61..=0x7A => unit as u8,
