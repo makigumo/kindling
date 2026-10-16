@@ -618,7 +618,7 @@ pub fn build_exth(
     title: &str,
     author: &str,
     date: &str,
-    subject: &str,
+    subjects: &[String],
     language: &str,
     dict_in_language: &str,
     dict_out_language: &str,
@@ -678,22 +678,29 @@ pub fn build_exth(
     // firmware files it as an ordinary book and it never reaches the lookup
     // popup's dictionary picker. Amazon's own dictionaries carry
     // `subject = "Dictionaries"`, and so does every third-party one that
-    // works on device; kindling emitted no 105 at all, from any input,
-    // which is why a dictionary it built could be sideloaded, opened and
-    // read as a book but never selected to look words up in.
+    // works on device.
     //
-    // The OPF's own `<dc:subject>` wins when it has one, which PyGlossary
-    // always writes. `dict_in_language` being set is what makes this a
-    // dictionary build, the same condition the 531/532 pair below uses, and
-    // a dictionary that declared no subject still has to carry one.
-    let subject_out = if !subject.is_empty() {
-        Some(subject)
-    } else if !dict_in_language.is_empty() {
-        Some("Dictionaries")
-    } else {
-        None
-    };
-    if let Some(subj) = subject_out {
+    // Every `<dc:subject>` becomes its own 105 record, which is what kindlegen
+    // emits (a Wadoku build carries Reference, Dictionaries, Japanisch,
+    // Deutsch as four records). `Dictionaries` is added when a dictionary
+    // declares no subject at all, and prepended when it declares some but
+    // not that one: the marker has to be present, and only its presence
+    // matters, not where in the list it sits. Taking the OPF's first subject
+    // and trusting it to be the marker is what dropped it from Wadoku, whose
+    // OPF leads with `Reference`.
+    let mut subjects: Vec<&str> = subjects
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !dict_in_language.is_empty()
+        && !subjects
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("dictionaries"))
+    {
+        subjects.insert(0, "Dictionaries");
+    }
+    for subj in subjects {
         records.push(exth_record(105, subj.as_bytes()));
     }
 
@@ -798,6 +805,145 @@ mod tests {
             offset += rec_len;
         }
         records
+    }
+
+    /// Every record of a type, in file order. EXTH 105 is written once per
+    /// `<dc:subject>`, so `find_record` cannot see a second one.
+    fn find_all_records(records: &[(u32, Vec<u8>)], rec_type: u32) -> Vec<Vec<u8>> {
+        records
+            .iter()
+            .filter(|(t, _)| *t == rec_type)
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    /// A dictionary carries `Dictionaries` as a subject so the firmware files
+    /// it as a dictionary rather than an ordinary book, which is what keeps it
+    /// out of the lookup popup's dictionary picker when they are missing.
+    /// kindlegen writes one 105 per `<dc:subject>`, so an OPF that lists
+    /// other subjects too keeps all of them.
+    #[test]
+    fn dictionary_subject_marker_survives_an_opf_that_lists_other_subjects_first() {
+        let subjects: Vec<String> = ["Reference", "Dictionaries", "Japanisch", "Deutsch"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut chars = HashSet::new();
+        chars.insert(0x3042); // あ
+        let exth = build_exth(
+            "Test Dict",
+            "Author",
+            "2026-01-01",
+            &subjects,
+            "de",
+            "ja",
+            "de",
+            "TestDictionaryIdentity",
+            &chars,
+            false,
+            None,
+        );
+        let records = parse_exth_records(&exth);
+        let got: Vec<String> = find_all_records(&records, 105)
+            .iter()
+            .map(|d| String::from_utf8_lossy(d).into_owned())
+            .collect();
+        assert_eq!(got, subjects, "every dc:subject becomes its own 105");
+        assert!(
+            got.iter().any(|s| s == "Dictionaries"),
+            "the dictionary marker must reach the device"
+        );
+    }
+
+    /// An OPF that lists subjects but omits the marker still gets one, since
+    /// the marker's presence is the whole point of the record.
+    #[test]
+    fn dictionary_subject_marker_is_added_when_the_opf_omits_it() {
+        let subjects: Vec<String> = ["Reference"].iter().map(|s| s.to_string()).collect();
+        let mut chars = HashSet::new();
+        chars.insert(0x0041);
+        let exth = build_exth(
+            "Test Dict",
+            "Author",
+            "2026-01-01",
+            &subjects,
+            "en",
+            "en",
+            "fr",
+            "TestDictionaryIdentity",
+            &chars,
+            false,
+            None,
+        );
+        let records = parse_exth_records(&exth);
+        let got: Vec<String> = find_all_records(&records, 105)
+            .iter()
+            .map(|d| String::from_utf8_lossy(d).into_owned())
+            .collect();
+        assert_eq!(got, vec!["Dictionaries", "Reference"]);
+    }
+
+    /// An OPF with no subject at all still gets the marker, which is what the
+    /// pre-existing single-subject fallback did.
+    #[test]
+    fn dictionary_with_no_subject_still_gets_the_marker() {
+        let mut chars = HashSet::new();
+        chars.insert(0x03B1);
+        let exth = build_exth(
+            "Test Dict",
+            "Author",
+            "2026-01-01",
+            &[],
+            "en",
+            "el",
+            "en",
+            "TestDictionaryIdentity",
+            &chars,
+            false,
+            None,
+        );
+        let records = parse_exth_records(&exth);
+        assert_eq!(
+            find_record(&records, 105).as_deref(),
+            Some(&b"Dictionaries"[..])
+        );
+    }
+
+    /// A book build is not a dictionary and must not claim to be one. Books
+    /// carry a single genre in 105, which is why the dictionary path needed
+    /// the plural list the book path still does not.
+    #[test]
+    fn a_book_build_does_not_gain_a_dictionary_subject() {
+        let mut chars = HashSet::new();
+        chars.insert(0x0041);
+        let exth = build_book_exth(
+            "Test Book",
+            "Author",
+            "2026-01-01",
+            "en",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("Fiction"),
+            0,
+        );
+        let records = parse_exth_records(&exth);
+        let got: Vec<String> = find_all_records(&records, 105)
+            .iter()
+            .map(|d| String::from_utf8_lossy(d).into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["Fiction"],
+            "a book keeps its own genre and gains no marker"
+        );
     }
 
     /// Helper to find a record by type.
@@ -1110,7 +1256,7 @@ mod tests {
             "Test Dict",
             "Author",
             "2026-01-01",
-            "",
+            &[],
             "en",
             "el",
             "en",

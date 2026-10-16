@@ -1,7 +1,7 @@
 //! Internal link resolution shared by the MOBI6 and KF8 writers.
 //!
 //! An EPUB links between its own documents with ordinary hrefs
-//! (`../Text/notes.xhtml#n1`, `#local`). Neither Kindle format understands
+//! (`notes.xhtml#n1`, `#local`). Neither Kindle format understands
 //! those, because both formats concatenate every document into one byte
 //! stream and throw the file boundaries away:
 //!
@@ -167,7 +167,7 @@ pub(crate) fn build_document_index(hrefs: &[String]) -> HashMap<String, usize> {
 /// Resolve one `<a href>` against the document that contains it.
 ///
 /// `doc_href` is the containing document's own manifest href, which is what
-/// makes `../Text/notes.xhtml` and a bare `#frag` mean different things in
+/// makes `notes.xhtml` and a bare `#frag` mean different things in
 /// different documents.
 ///
 /// `redirects` names documents that are in the spine but not in this half of
