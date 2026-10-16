@@ -618,13 +618,30 @@ fn build_dictionary_mobi(
     } else {
         locale_code(&opf.dict_in_language) & 0x3FF
     };
-    let indx_records = indx::build_orth_indx(
+    // The name the OPF gave its lookup index, which is what the orth primary
+    // advertises and what the index-names index holds as its one label. The
+    // OPF spec's default is `default`, and an OPF may omit the meta entirely,
+    // so an empty value falls back to it rather than producing an index with
+    // an empty name.
+    let index_name = if opf.default_lookup_index.is_empty() {
+        "default"
+    } else {
+        opf.default_lookup_index.as_str()
+    };
+    let indx = indx::build_orth_indx(
         &lookup_terms,
         &headword_chars_for_indx,
         strict_accents,
         index_language,
         gen_ordt.as_ref(),
+        index_name,
     );
+    let indx_records = indx.records;
+    // Where the names index sits within `indx_records`. kindling left the
+    // MOBI header's 0x30 field at 0xFFFFFFFF while still writing the records,
+    // which is the field a device reads to learn which index the OPF's
+    // `DefaultLookupIndex` names.
+    let names_index_offset = indx.names_index;
     eprintln!("  Orth INDX: {} records", indx_records.len());
     let (kf7_ncx_records, kf7_ncx_cncx_records) = crate::kf8::build_kf7_ncx_indx(&kf7_ncx_entries);
     if !kf7_ncx_records.is_empty() {
@@ -687,6 +704,7 @@ fn build_dictionary_mobi(
         0xFFFFFFFF
     };
     let orth_index_record = after_model + num_image_records;
+    let names_index_record = orth_index_record + names_index_offset;
     let infl_index_record = 0xFFFFFFFFusize;
     let kf7_ncx_index_record = if kf7_ncx_records.is_empty() {
         None
@@ -732,6 +750,7 @@ fn build_dictionary_mobi(
         first_non_book,
         orth_index_record,
         infl_index_record,
+        names_index_record,
         total_records,
         flis_record,
         fcis_record,
@@ -1584,6 +1603,7 @@ fn build_book_mobi(
             kf7_first_non_book,
             0xFFFFFFFF_usize, // orth_index (no dict in KF7 book mode)
             0xFFFFFFFF_usize, // infl_index (no dict)
+            0xFFFFFFFF_usize, // index_names (no dict)
             total_global_records,
             kf7_flis,
             kf7_fcis,
@@ -7367,6 +7387,7 @@ fn build_record0(
     first_non_book_record: usize,
     orth_index_record: usize,
     infl_index_record: usize,
+    names_index_record: usize,
     _total_records: usize,
     flis_record: usize,
     fcis_record: usize,
@@ -7461,7 +7482,10 @@ fn build_record0(
     put32(&mut mobi, 20, version); // file version
     put32(&mut mobi, 24, orth_index_record as u32);
     put32(&mut mobi, 28, infl_index_record as u32); // inflection index
-    put32(&mut mobi, 32, 0xFFFFFFFF); // index names
+    // The index-names index, whose single entry spells the OPF's
+    // DefaultLookupIndex. This is the only way a device learns which of the
+    // file's indices the default lookup uses, and kindling never set it.
+    put32(&mut mobi, 32, names_index_record as u32);
     put32(&mut mobi, 36, 0xFFFFFFFF); // index keys
     for off in (40..64).step_by(4) {
         put32(&mut mobi, off, 0xFFFFFFFF); // extra indices
