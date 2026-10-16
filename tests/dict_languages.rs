@@ -38,10 +38,12 @@ use kindling::ordt::{OrdtTables, uses_generated_ordt};
 
 struct Lang {
     code: &'static str,
-    /// INDX header language field (offset 32 of the orth primary).
+    /// INDX header language field (offset 32 of the orth primary). kindlegen
+    /// writes the same value here as in the MOBI header's locale and input
+    /// language, full LCID or neutral primary id depending on the language.
     indx_lang: u32,
     /// MOBI-header locale (rec0 offset 92) and input language (rec0 offset
-    /// 96): the neutral primary LCID.
+    /// 96).
     mobi_locale: u32,
     /// Expected `ordt_type` for generated-ORDT languages (0 = two-byte
     /// labels because literals are present, 1 = one-byte). Unused otherwise.
@@ -87,7 +89,7 @@ const LANGS: &[Lang] = &[
     },
     Lang {
         code: "fr",
-        indx_lang: 12,
+        indx_lang: 0x040C,
         mobi_locale: 0x040C,
         ordt_type: 0,
     },
@@ -191,11 +193,7 @@ fn check_common(code: &str, c: &Lang, parsed: &ParsedMobi, idx: usize, primary: 
     assert_eq!(u32_be(primary, 28), 0xFDEA, "{code}: INDX encoding");
 
     let rec0 = parsed.palmdb.record(&parsed.raw, 0);
-    assert_eq!(
-        u32_be(rec0, 92),
-        c.mobi_locale,
-        "{code}: MOBI locale (neutral LCID)"
-    );
+    assert_eq!(u32_be(rec0, 92), c.mobi_locale, "{code}: MOBI locale");
     assert_eq!(
         u32_be(rec0, 96),
         c.mobi_locale,
