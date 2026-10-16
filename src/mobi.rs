@@ -8007,6 +8007,267 @@ fn build_eof() -> Vec<u8> {
 /// it can hold. This is a hard limit of the container, not of any Kindle.
 const PALMDB_MAX_RECORDS: usize = 65535;
 
+/// Fixed ASCII spellings for the characters that have one but are not a single
+/// letter [`crate::ordt::latin_base_letter`] folds.
+///
+/// The first group is the letters the device's fold table deliberately leaves
+/// out, spelled as the Kindle reads them: its search treats `ß` as "ss" and
+/// `æ`/`œ` as "ae"/"oe" (see [`crate::ordt::expansion_of`]), and kindlegen
+/// stores `ĳ` as "ij". kindlegen's own name writer leaves the first three as
+/// raw Windows-1252 bytes, which is the opposite of what the name field needs.
+fn fixed_ascii_spelling(c: char) -> Option<&'static str> {
+    Some(match c {
+        'ß' => "ss",
+        'ẞ' => "SS",
+        'æ' => "ae",
+        'Æ' => "AE",
+        'œ' => "oe",
+        'Œ' => "OE",
+        'ĳ' => "ij",
+        'Ĳ' => "IJ",
+        // The typographic punctuation a title carries, as the ASCII it stands
+        // for: the dash family, the single and double quotation marks, and the
+        // ellipsis. kindlegen turns each of these into a letter from its code
+        // point (`–` becomes `V`, `’` becomes `B`), which is a placeholder
+        // falling out of its conversion, not a transliteration.
+        '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}' => "-",
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' | '\u{FF07}' => "'",
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' | '\u{FF02}' => "\"",
+        '\u{2026}' => "...",
+        // Separators that are not the hyphen: a word break in a title, and the
+        // hyphen is the ASCII stand-in that keeps the words apart. kindlegen
+        // drops the middle dot (so `Wort·Bedeutung` becomes `WortBedeutung`)
+        // and answers the bullet family with a placeholder letter, so this is a
+        // reading of the character rather than a copy of kindlegen's output.
+        '\u{00B7}' | '\u{2022}' | '\u{2027}' | '\u{2219}' => "-",
+        // Spaces other than U+0020, which the whitespace collapse turns into
+        // the name's separator. The soft hyphen is invisible, so it leaves
+        // nothing behind rather than a hyphen nobody typed.
+        '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => " ",
+        '\u{00AD}' => "",
+        // Latin ligatures, which are the same letters written as one.
+        '\u{FB00}' => "ff",
+        '\u{FB01}' => "fi",
+        '\u{FB02}' => "fl",
+        '\u{FB03}' => "ffi",
+        '\u{FB04}' => "ffl",
+        '\u{FB05}' => "ft",
+        '\u{FB06}' => "st",
+        _ => return None,
+    })
+}
+
+/// Append the ASCII spelling of one title character to `out`, or nothing when
+/// the character has none.
+///
+/// The PalmDB name field is a filename token, not a label: Kindle's FSCK
+/// indexer keys the index entry it caches per file off this name, which is why
+/// the name is stripped of filesystem-unsafe characters below. Every name
+/// kindlegen 2.9 writes is ASCII, so a name is kept ASCII here too.
+///
+/// kindlegen's own conversion has two usable rules and one that is noise. A
+/// Latin letter with a diacritic folds to its base letter, case kept, and that
+/// is exactly the fold the devices use ([`crate::ordt::latin_base_letter`],
+/// which the drift test pins to kindlegen's own SPL1 spelling table), so `é`
+/// becomes `e`, `Å` becomes `A` and `ø` becomes `o`. The typographic characters
+/// a title carries are spelled by [`fixed_ascii_spelling`], and `ß`, `æ` and
+/// `œ` with it. Everything else becomes one letter from its code point (`'A'`
+/// plus the code point modulo 26): a Japanese title comes out of kindlegen as
+/// `HWW_CE` for `日本語 辞典`, a Cyrillic one as `DZXXQOP_SURQUIHP_RRUIGWI`.
+/// That is a placeholder, so this drops what has no ASCII spelling of its own
+/// instead - a script outside Latin, a Latin letter the device's fold table
+/// leaves out (Vietnamese `ạ`, Romanian `ș`), or a symbol with no ASCII
+/// equivalent. A title that leaves nothing at all is handled by the caller.
+fn push_ascii_spelling(out: &mut String, c: char) {
+    if c.is_ascii() {
+        out.push(c);
+        return;
+    }
+    if let Some(spelling) = fixed_ascii_spelling(c) {
+        out.push_str(spelling);
+        return;
+    }
+    // The fullwidth forms U+FF01 to U+FF5E are the ASCII characters shifted up
+    // by 0xFEE0, so the fullwidth letters a Japanese source uses in a title are
+    // the same letters.
+    if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
+        if let Some(ascii) = char::from_u32(c as u32 - 0xFEE0) {
+            out.push(ascii);
+        }
+        return;
+    }
+    if (c as u32) <= u16::MAX as u32 {
+        if let Some(base) = crate::ordt::latin_base_letter(c as u16) {
+            let base = char::from(base);
+            out.push(if c.is_uppercase() {
+                base.to_ascii_uppercase()
+            } else {
+                base
+            });
+        }
+    }
+}
+
+/// The title as the PalmDB database name spells it: ASCII only, the same
+/// letters and words with the accents and typography folded away.
+fn ascii_name(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for c in title.chars() {
+        push_ascii_spelling(&mut out, c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod palmdb_name_tests {
+    use super::*;
+
+    /// The name field is a filename token in the device's single-byte world, so
+    /// a title is transliterated to ASCII: a Latin accent folds to its base
+    /// letter, the letters the fold table leaves out are spelled as the Kindle
+    /// reads them, and the typographic characters become the ASCII punctuation
+    /// they stand for.
+    #[test]
+    fn transliterates_the_ascii_spelling_of_a_title() {
+        assert_eq!(
+            ascii_name("Wadoku – Japanisch-Deutsches Wörterbuch für Kindle"),
+            "Wadoku - Japanisch-Deutsches Worterbuch fur Kindle"
+        );
+        assert_eq!(
+            ascii_name("Fußball Ærø Œuvre ĳsland"),
+            "Fussball AEro OEuvre ijsland"
+        );
+        assert_eq!(ascii_name("Ärø Øst Ångström"), "Aro Ost Angstrom");
+        assert_eq!(ascii_name("L’homme “quoted”…"), "L'homme \"quoted\"...");
+        assert_eq!(ascii_name("ﬁﬂﬀ"), "fiflff");
+        assert_eq!(ascii_name("ＡＢＣ１２３"), "ABC123");
+        assert_eq!(ascii_name("Fußball\u{00A0}Test"), "Fussball Test");
+    }
+
+    /// A name longer than 27 characters is elided the way kindlegen elides it:
+    /// the first 12 characters, a hyphen, and the last 14. Every literal here
+    /// is a string kindlegen 2.9 wrote for the same title, from a length sweep
+    /// over single words, multi-word titles and accented titles.
+    #[test]
+    fn elides_a_long_name_like_kindlegen() {
+        // kindlegen's own name for this title: it is on the committed
+        // tests/fixtures/langs/en/en-kindlegen.mobi. 32 characters of name
+        // become the first 12, a hyphen, and the last 14.
+        assert_eq!(
+            palmdb_name("Kindling English Test Dictionary"),
+            "Kindling_Eng-est_Dictionary"
+        );
+
+        // The boundary, as measured: 27 characters pass through untouched, 28
+        // elide to 27.
+        let twenty_seven = format!("{}{}", "A".repeat(11), "B".repeat(16));
+        assert_eq!(palmdb_name(&twenty_seven), twenty_seven);
+        let twenty_eight = format!("{}{}", "A".repeat(11), "B".repeat(17));
+        assert_eq!(palmdb_name(&twenty_eight), "AAAAAAAAAAAB-BBBBBBBBBBBBBB");
+
+        // The count is of the converted name, not the title: a title that
+        // converts to 27 name characters keeps all of them even though the
+        // title itself is longer, since the script in it spells nothing.
+        let mixed = format!("{}ABCDEFGHIJKLMNOPQRST", "\u{65e5}".repeat(20));
+        assert_eq!(palmdb_name(&mixed), "ABCDEFGHIJKLMNOPQRST");
+
+        // A long title keeps its last word. The real Wadoku title, against
+        // kindlegen's `Wadoku_V_Jap-uch_fur_Kindle` for it: the same elision,
+        // with a hyphen where kindlegen writes its placeholder `V` for the en
+        // dash.
+        assert_eq!(
+            palmdb_name("Wadoku – Japanisch-Deutsches Wörterbuch für Kindle"),
+            "Wadoku_-_Jap-uch_fur_Kindle"
+        );
+    }
+
+    /// Greek, Cyrillic and CJK have no ASCII spelling here, and kindlegen's own
+    /// answer is a placeholder letter from each code point (`日本語 辞典` comes
+    /// out of it as `HWW_CE`), so they are dropped instead and the caller is
+    /// left with an empty name to fall back from.
+    #[test]
+    fn drops_what_has_no_ascii_spelling() {
+        assert_eq!(ascii_name("Λεξικό"), "");
+        // The space between two dropped words is ASCII, so it survives: the
+        // fallback is keyed on there being no alphanumeric left, not on the
+        // name being empty.
+        assert_eq!(ascii_name("Толковый словарь"), " ");
+        assert_eq!(ascii_name("日本語 辞典"), " ");
+        // A mixed title keeps the part that has an ASCII spelling; the runs of
+        // space the dropped words leave behind are collapsed by the name
+        // writer, which strips and joins on whitespace.
+        assert_eq!(ascii_name("日本語 辞典 Japanese"), "  Japanese");
+    }
+}
+
+/// A closed set of characters the PalmDB name may not contain, because
+/// Kindle's FSCK indexer treats the name as a filename candidate and will
+/// either rename or refuse to index a file whose name holds one. Brackets and
+/// parentheses are stripped because they were historically problematic.
+const PALMDB_NAME_STRIP_CHARS: &[char] = &[
+    '(', ')', '[', ']', ':', '/', '\\', '*', '?', '"', '<', '>', '|',
+];
+
+/// The longest name kindlegen writes, and so the longest one this writes.
+///
+/// Measured against kindlegen 2.9 (the binary in this repository's root): a
+/// converted name of 27 characters passes through untouched, and one of 28 is
+/// elided (see [`PALMDB_NAME_HEAD`]). The count is of the converted name, not
+/// the title: a 30-character title whose conversion drops three characters to
+/// 27 name characters comes through whole, while a 31-character title that
+/// converts to 28 is elided. The field itself holds 31 bytes plus a null, so a
+/// name of this length is comfortably inside it.
+const PALMDB_NAME_MAX: usize = 27;
+
+/// What a name longer than [`PALMDB_NAME_MAX`] keeps: this many characters
+/// from the front, a hyphen, and [`PALMDB_NAME_TAIL`] from the back.
+///
+/// kindlegen's elision is character-based, not word-based - it splits wherever
+/// the twelfth character falls, mid-word included - and the hyphen both marks
+/// the cut and keeps the survivors apart, which is why its names read like
+/// `Kindling_Eng-est_Dictionary`. Every length from 28 characters up collapses
+/// to 12 + 1 + 14 = 27.
+const PALMDB_NAME_HEAD: usize = 12;
+
+/// See [`PALMDB_NAME_HEAD`]. 27 - 12 - 1, and the last word of a long title
+/// survives in this window.
+const PALMDB_NAME_TAIL: usize = 14;
+
+/// The name string the PalmDB header carries for a title.
+///
+/// The title is transliterated to ASCII first (see [`ascii_name`]): the name is
+/// a filename token in the device's single-byte world, and a name with UTF-8
+/// bytes in it is one the indexer may rename or refuse. The ASCII name is then
+/// stripped of [`PALMDB_NAME_STRIP_CHARS`], with runs of whitespace collapsed to
+/// a single underscore so that a title like `Star Wars: Darth Vader` does not
+/// leave a double underscore behind. The result is elided the way kindlegen
+/// elides it (see [`PALMDB_NAME_HEAD`]), so a long title keeps both its opening
+/// words and its last one instead of losing everything after the first 28
+/// characters.
+fn palmdb_name(title: &str) -> String {
+    let mut name = ascii_name(title);
+    for ch in PALMDB_NAME_STRIP_CHARS {
+        name = name.replace(*ch, "");
+    }
+    name = name.split_whitespace().collect::<Vec<_>>().join("_");
+    // A title with no ASCII spelling of its own leaves nothing here: a Greek,
+    // Cyrillic or CJK one, or a title that was nothing but stripped
+    // punctuation. A name of nothing is no name at all for the indexer to key
+    // on, so fall back to the title the rest of the build uses for a source
+    // that carries none.
+    if !name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return "Dictionary".to_string();
+    }
+    if name.len() > PALMDB_NAME_MAX {
+        // The name is ASCII by construction ([`ascii_name`] writes nothing
+        // else), so these are character offsets as well as byte offsets, and
+        // the two windows cannot overlap: 12 + 14 < 28 <= len.
+        let tail = name.len() - PALMDB_NAME_TAIL;
+        return format!("{}-{}", &name[..PALMDB_NAME_HEAD], &name[tail..]);
+    }
+    name
+}
+
 /// Build the complete PalmDB file from a list of records.
 ///
 /// Refuses rather than wraps above [`PALMDB_MAX_RECORDS`] (issue #47). The
@@ -8041,38 +8302,7 @@ fn build_palmdb(title: &str, records: &[Vec<u8>]) -> Result<Vec<u8>, Box<dyn std
         current_offset += rec.len();
     }
 
-    // Derive PalmDB name from title. The PalmDB name field is 32 bytes, and
-    // we reserve 1 byte for a null terminator, leaving 31 bytes for the name.
-    //
-    // Filesystem-unsafe characters (`:`, `/`, `\`, `*`, `?`, `"`, `<`, `>`,
-    // `|`) are stripped because Kindle's FSCK indexer treats the PalmDB name
-    // as a filename candidate and will either rename or refuse to index files
-    // with these characters in their PalmDB name. Brackets and parentheses
-    // are stripped because they were historically problematic. Control
-    // characters and whitespace become underscores.
-    //
-    // If the cleaned name fits in 31 bytes we use it verbatim. Otherwise we
-    // truncate the prefix to 28 bytes (at a UTF-8 character boundary) and
-    // append "..." for a total of 31 bytes.
-    let strip_chars: &[char] = &[
-        '(', ')', '[', ']', ':', '/', '\\', '*', '?', '"', '<', '>', '|',
-    ];
-    let mut palmdb_name = title.to_string();
-    for ch in strip_chars {
-        palmdb_name = palmdb_name.replace(*ch, "");
-    }
-    // Collapse whitespace runs to a single underscore. This avoids things
-    // like "Star_Wars__Vader" (double underscore from ": ").
-    palmdb_name = palmdb_name.split_whitespace().collect::<Vec<_>>().join("_");
-    if palmdb_name.len() > 31 {
-        // Truncate to the largest char boundary <= 28 bytes, then append "...".
-        let mut cutoff = 28.min(palmdb_name.len());
-        while cutoff > 0 && !palmdb_name.is_char_boundary(cutoff) {
-            cutoff -= 1;
-        }
-        palmdb_name.truncate(cutoff);
-        palmdb_name.push_str("...");
-    }
+    let palmdb_name = palmdb_name(title);
 
     let mut name_bytes = [0u8; 32];
     let name_raw = palmdb_name.as_bytes();
