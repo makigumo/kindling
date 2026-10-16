@@ -3747,6 +3747,15 @@ fn strip_idx_markup(html: &str) -> String {
         .get_or_init(|| Regex::new(r"(?is)<script\b[^>]*?(?:/>|>.*?</script\s*>)").unwrap());
     let without_scripts = script_re.replace_all(html, "");
     let html: &str = &without_scripts;
+    // HTML comments are markup too, and the device never renders them, so
+    // kindlingen drops them. The Wadoku source writes 21,890 of them, one per
+    // sub-headword, each an `<!--id:N-->` marker duplicating the `id` of the
+    // element that follows it; all 21,890 used to reach the shipped text,
+    // where the kindlegen build of the same data has none.
+    static COMMENT_RE: OnceLock<Regex> = OnceLock::new();
+    let comment_re = COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
+    let without_comments = comment_re.replace_all(html, "");
+    let html: &str = &without_comments;
     // Hoist every regex into a process-wide OnceLock so
     // build_text_content_by_letter (called once per entry, 502k+ times on the
     // FR reader-dict) doesn't pay the regex compile cost per call. This used
@@ -4803,6 +4812,36 @@ mod record_split_tests {
         assert!(!out.contains("idx:infl"), "{out}");
         assert!(out.contains("first"), "the first entry survives: {out}");
         assert!(out.contains("second"), "the second entry survives: {out}");
+    }
+
+    /// An HTML comment is markup, not display content, so it goes. The
+    /// Wadoku dictionary writes one per sub-headword as an `<!--id:N-->`
+    /// marker next to the `id` it duplicates, and every one of them used to
+    /// ship.
+    #[test]
+    fn an_html_comment_does_not_ship() {
+        let out = strip_idx_markup(
+            r#"<idx:entry><idx:orth value="x">x</idx:orth><div class="subheadword" id="42"><!--id:42-->kanji | gloss</div></idx:entry>"#,
+        );
+        assert!(!out.contains("<!--"), "{out}");
+        assert!(!out.contains("-->"), "{out}");
+        // The anchor and the text it marks both survive; only the marker goes.
+        assert!(out.contains("id=\"42\""), "{out}");
+        assert!(out.contains("kanji | gloss"), "{out}");
+    }
+
+    /// A comment spans several lines in this source, so the pattern has to be
+    /// able to cross them.
+    #[test]
+    fn a_multiline_comment_does_not_ship() {
+        let out = strip_idx_markup(
+            "<idx:entry><b>a</b><!-- hidden\n   still hidden --><b>b</b></idx:entry>",
+        );
+        assert!(!out.contains("hidden"), "{out}");
+        assert!(
+            out.contains("<b>a</b>") && out.contains("<b>b</b>"),
+            "{out}"
+        );
     }
 
     #[test]
