@@ -3758,6 +3758,7 @@ fn strip_idx_markup(html: &str) -> String {
     static IFORM: OnceLock<Regex> = OnceLock::new();
     static INFL_EMPTY: OnceLock<Regex> = OnceLock::new();
     static INFL_FULL: OnceLock<Regex> = OnceLock::new();
+    static INFL_SELF: OnceLock<Regex> = OnceLock::new();
     static ORTH_SELF: OnceLock<Regex> = OnceLock::new();
     static ORTH_OPEN: OnceLock<Regex> = OnceLock::new();
     static ORTH_CLOSE: OnceLock<Regex> = OnceLock::new();
@@ -3782,9 +3783,18 @@ fn strip_idx_markup(html: &str) -> String {
     let style_re = STYLE_RE.get_or_init(|| Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap());
     let head_re = HEAD_RE.get_or_init(|| Regex::new(r"(?s)<head\b[^>]*>.*?</head>").unwrap());
     let iform = IFORM.get_or_init(|| Regex::new(r"<idx:iform[^/]*/>\s*").unwrap());
-    let infl_empty = INFL_EMPTY.get_or_init(|| Regex::new(r"<idx:infl>\s*</idx:infl>\s*").unwrap());
-    let infl_full =
-        INFL_FULL.get_or_init(|| Regex::new(r"(?s)\s*<idx:infl>.*?</idx:infl>\s*").unwrap());
+    // `<idx:infl>` carries no display content, so the whole element goes. The
+    // patterns have to allow attributes: an inflection group is written
+    // `<idx:infl inflgrp="verb">`, and matching only the bare tag left all 439
+    // of the Wadoku dictionary's groups in the shipped text where kindlegen
+    // has none. The open-tag pattern deliberately refuses a self-closing tag,
+    // which has no `</idx:infl>` of its own, so its `.*?` cannot run on to the
+    // next group's closing tag and swallow the content in between.
+    let infl_empty =
+        INFL_EMPTY.get_or_init(|| Regex::new(r"<idx:infl\b[^>]*[^/]>\s*</idx:infl>\s*").unwrap());
+    let infl_full = INFL_FULL
+        .get_or_init(|| Regex::new(r"(?s)\s*<idx:infl\b[^>]*[^/]>.*?</idx:infl>\s*").unwrap());
+    let infl_self = INFL_SELF.get_or_init(|| Regex::new(r"\s*<idx:infl\b[^>]*/>\s*").unwrap());
     let orth_self = ORTH_SELF.get_or_init(|| Regex::new(r"<idx:orth[^>]*/>").unwrap());
     let orth_open = ORTH_OPEN.get_or_init(|| Regex::new(r"<idx:orth[^>]*>").unwrap());
     let orth_close = ORTH_CLOSE.get_or_init(|| Regex::new(r"</idx:orth>").unwrap());
@@ -3856,6 +3866,7 @@ fn strip_idx_markup(html: &str) -> String {
         // Remove idx:infl tags and content
         result = std::borrow::Cow::Owned(infl_empty.replace_all(&result, "").to_string());
         result = std::borrow::Cow::Owned(infl_full.replace_all(&result, "").to_string());
+        result = std::borrow::Cow::Owned(infl_self.replace_all(&result, "").to_string());
     }
 
     if result.contains("<idx:orth") {
@@ -4756,6 +4767,42 @@ mod record_split_tests {
             out.contains("one two"),
             "ASCII runs should still collapse: {out:?}"
         );
+    }
+
+    /// An inflection group carries no display content, so the whole element
+    /// goes, whatever attributes it declares and whether or not it holds any
+    /// forms. The Wadoku dictionary writes 439 of them as
+    /// `<idx:infl inflgrp="verb">`, and the patterns used to match only a bare
+    /// `<idx:infl>`, which left all 439 in the shipped text.
+    #[test]
+    fn an_infl_group_with_attributes_is_stripped_with_its_forms() {
+        let out = strip_idx_markup(
+            r#"<idx:entry><idx:orth value="あいた">あいた</idx:orth><idx:orth value="あいだ">あいだ</idx:orth><idx:infl inflgrp="verb">
+                  <idx:iform value="会た"/>
+                  <idx:iform value="愛いた"/>
+               </idx:infl><p>a definition</p></idx:entry>"#,
+        );
+        assert!(!out.contains("idx:infl"), "{out}");
+        assert!(!out.contains("idx:iform"), "{out}");
+        // Neither the inflected forms nor the element's own text survives, but
+        // the display content around it does.
+        assert!(!out.contains("会た") && !out.contains("愛いた"), "{out}");
+        assert!(out.contains("あいた") && out.contains("あいだ"), "{out}");
+        assert!(out.contains("a definition"), "{out}");
+    }
+
+    /// A group that holds no forms is written self-closing. It has no closing
+    /// tag, so an open-tag pattern must not match it: the `.*?` in the paired
+    /// pattern would then run on to the *next* group's `</idx:infl>` and take
+    /// the entry's real content with it.
+    #[test]
+    fn a_self_closing_infl_group_does_not_take_the_next_entry_with_it() {
+        let out = strip_idx_markup(
+            r#"<idx:entry><idx:orth value="x">x</idx:orth><idx:infl inflgrp="verb"/><p>first</p></idx:entry><idx:entry><idx:orth value="y">y</idx:orth><idx:infl inflgrp="verb"><idx:iform value="why"/></idx:infl><p>second</p></idx:entry>"#,
+        );
+        assert!(!out.contains("idx:infl"), "{out}");
+        assert!(out.contains("first"), "the first entry survives: {out}");
+        assert!(out.contains("second"), "the second entry survives: {out}");
     }
 
     #[test]
