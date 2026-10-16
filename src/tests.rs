@@ -7692,12 +7692,26 @@ p { margin: 0.3em 0; }
         let dir = TempDir::new("dict_hdr_unused");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
-        let (_, _, offsets) = parse_palmdb(&data);
+        let (_, record_count, offsets) = parse_palmdb(&data);
         let rec0 = get_record(&data, &offsets, 0);
 
         // Inflections are flattened into the orth INDX (lemma v1.0.0 behavior)
-        // so there is no separate infl INDX. Offsets 28..60 should all be 0xFFFFFFFF.
-        for off in (28..=60).step_by(4) {
+        // so there is no separate infl INDX at offset 28. Offset 32 does
+        // name the index-names index, which is what tells a device which of
+        // the file's indices the OPF's DefaultLookupIndex selected.
+        assert_eq!(
+            read_u32_be(rec0, 16 + 28),
+            0xFFFFFFFF,
+            "no separate inflection index"
+        );
+        let names_idx = read_u32_be(rec0, 16 + 32);
+        assert!(
+            (names_idx as u16) < record_count,
+            "index names record {} should be < record count {}",
+            names_idx,
+            record_count
+        );
+        for off in (36..=60).step_by(4) {
             let val = read_u32_be(rec0, 16 + off);
             assert_eq!(
                 val, 0xFFFFFFFF,
@@ -7705,7 +7719,7 @@ p { margin: 0.3em 0; }
                 off, val
             );
         }
-        println!("  \u{2713} Dict unused indices [28..60] all 0xFFFFFFFF");
+        println!("  \u{2713} Dict unused indices [36..60] all 0xFFFFFFFF");
     }
 
     #[test]
