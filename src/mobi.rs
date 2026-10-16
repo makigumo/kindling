@@ -4006,8 +4006,9 @@ fn clean_book_html(html: &str) -> String {
 /// Rewrite image `src="..."` attributes to `recindex="NNNNN"` in the text content.
 ///
 /// The src paths in HTML files may be relative to the HTML file's own location
-/// (e.g., `../Images/foo.jpg` from `Text/chapter1.xhtml`), so we need to try
-/// multiple path resolution strategies to match against the manifest hrefs.
+/// (e.g. one that steps out of `Text/` to reach `Images/foo.jpg`), so we need
+/// to try multiple path resolution strategies to match against the manifest
+/// hrefs.
 fn rewrite_image_src(
     text_bytes: &[u8],
     href_to_recindex: &std::collections::HashMap<String, usize>,
@@ -4031,7 +4032,7 @@ fn build_recindex_lookup(
     // Build a lookup that maps various path forms to recindex.
     // For each manifest href like "Images/cover.jpg", we want to match:
     // - "Images/cover.jpg" (exact)
-    // - "../Images/cover.jpg" (relative from a subdirectory)
+    // - one written relative to a subdirectory
     // - "cover.jpg" (filename only)
     let mut path_to_recindex: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -4054,15 +4055,16 @@ fn build_recindex_lookup(
         }
     }
 
-    // For relative paths from spine HTML locations, resolve "../" prefixes
-    // by computing what each spine item's relative reference would be.
+    // For relative paths from spine HTML locations, resolve a leading
+    // parent-directory segment by computing what each spine item's relative
+    // reference would be.
     for (_, spine_href) in spine_items {
         if let Some(spine_dir) = spine_href.rsplit_once('/') {
             let spine_dir = spine_dir.0; // e.g., "Text" from "Text/chapter1.xhtml"
             for (href, &recindex) in href_to_recindex {
                 // Compute relative path from spine_dir to href
                 // Common case: spine is "Text/ch1.xhtml", image is "Images/foo.jpg"
-                // Relative path would be "../Images/foo.jpg"
+                // Relative path would step out of the document's directory
                 let relative = format!("../{}", href);
                 path_to_recindex.entry(relative).or_insert(recindex);
 
@@ -7449,7 +7451,7 @@ fn build_record0(
             full_name,
             &opf.author,
             &opf.date,
-            &opf.subject,
+            &opf.subjects,
             &opf.language,
             &opf.dict_in_language,
             &opf.dict_out_language,

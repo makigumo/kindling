@@ -476,8 +476,9 @@ struct BookDoc {
 /// One image carried into the exported archive.
 ///
 /// The export flattens names the way it does for documents: a source tree of
-/// `Images/`, `Photos/` and `../art/` collapses to `images/img_NN.ext`, which
-/// sidesteps duplicate basenames, `..` above the OPF, percent-encoding, and
+/// `Images/`, `Photos/` and directories above the package collapses to
+/// `images/img_NN.ext`, which sidesteps duplicate basenames, `..` above the
+/// OPF, percent-encoding, and
 /// filesystems that disagree about case. Nothing outside this struct ever
 /// sees the source path again.
 struct ImageRes {
@@ -498,7 +499,7 @@ struct ImageRes {
 ///
 /// The map is keyed on the manifest-style href with `.`/`..` resolved and
 /// percent-escapes decoded, which is the same key `<img src>` resolves to, so
-/// a picture written as `../Images/cover.jpg` from inside `Text/` finds the
+/// a picture written against the package root from inside `Text/` finds the
 /// manifest's `Images/cover.jpg`.
 fn collect_images(opf: &OPFData) -> (Vec<ImageRes>, HashMap<String, usize>) {
     let cover = opf
@@ -616,7 +617,7 @@ fn build_book_documents(
     image_index: &HashMap<String, usize>,
 ) -> Result<Vec<BookDoc>, Box<dyn std::error::Error>> {
     // Read the spine first, keeping each surviving document's manifest href
-    // alongside its body. The href is what makes `../Text/notes.xhtml` mean
+    // alongside its body. The href is what makes one relative link mean
     // different things in different documents, and a file that cannot be read
     // has to drop out of both lists at once or every link after it resolves
     // one document off.
@@ -675,7 +676,7 @@ fn build_book_documents(
 /// Point every cross-document link at the name the export gave its target.
 ///
 /// The exporter flattens the spine into `content_NN.xhtml` in `OEBPS/`, so an
-/// href the source wrote as `../Text/notes.xhtml#n1` names a file the output
+/// href the source wrote as `Text/notes.xhtml#n1` names a file the output
 /// does not contain. epubcheck rejects those as `RSC_007` and a reader shows
 /// them as dead (issue #55).
 ///

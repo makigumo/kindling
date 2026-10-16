@@ -38,12 +38,23 @@ pub struct OPFData {
     /// `language` is just the "en" default. Book builds warn on false,
     /// since the device picks fonts by book language (issue #18).
     pub language_specified: bool,
-    /// The first `<dc:subject>`, if the OPF declares one. A dictionary has
-    /// to reach the device carrying `subject = "Dictionaries"` or the
-    /// firmware files it as an ordinary book and it never appears in the
-    /// lookup popup's dictionary picker. PyGlossary already writes
+    /// Every `<dc:subject>` in document order. A dictionary has to reach the
+    /// device carrying `subject = "Dictionaries"` or the firmware files it as
+    /// an ordinary book and it never appears in the lookup popup's dictionary
+    /// picker. PyGlossary already writes
     /// `<dc:Subject BASICCode="REF008000">Dictionaries</dc:Subject>`, and
     /// kindling used to drop it on the floor.
+    ///
+    /// All of them are kept because an OPF that lists the marker also lists
+    /// other subjects, and which one comes first is the publisher's choice:
+    /// Wadoku's OPF leads with `Reference` and carries `Dictionaries` second,
+    /// so keeping only the first lost the marker. kindlegen emits one EXTH
+    /// 105 per `<dc:subject>`, in order, which is what a dictionary that
+    /// reaches the device has to look like.
+    pub subjects: Vec<String>,
+    /// Convenience accessor for the first `<dc:subject>`; the EXTH writer
+    /// wants the whole list, but callers that only need "some subject" (book
+    /// builds, which emit a single genre) read this.
     pub subject: String,
     pub identifier: String,
     /// Every `<dc:identifier>` value in document order. Used as candidate
@@ -91,6 +102,7 @@ impl OPFData {
             author: String::new(),
             language: String::from("en"),
             language_specified: false,
+            subjects: Vec::new(),
             subject: String::new(),
             identifier: String::new(),
             dc_identifiers: Vec::new(),
@@ -346,12 +358,17 @@ impl OPFData {
                                 self.dc_identifiers.push(text);
                             }
                             "date" => self.date = text,
-                            // First one wins: an OPF may list several
-                            // subjects, and only the first reaches EXTH 105.
+                            // Every subject is kept: kindlegen emits one
+                            // EXTH 105 per `<dc:subject>`, and which one a
+                            // publisher lists first is their choice. An OPF
+                            // that leads with anything other than
+                            // "Dictionaries" (Wadoku leads with "Reference")
+                            // lost the marker when only the first was kept.
                             "subject" => {
                                 if self.subject.is_empty() {
-                                    self.subject = text;
+                                    self.subject = text.clone();
                                 }
+                                self.subjects.push(text);
                             }
                             "type" => self.dc_types.push(text),
                             "DictionaryInLanguage" => self.dict_in_language = text,

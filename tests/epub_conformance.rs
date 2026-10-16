@@ -231,11 +231,12 @@ fn epub2_is_plain_2_0_1_even_from_dictionary_input() {
 //
 // The exporter renames every spine document to `content_NN.xhtml` and writes
 // them flat into `OEBPS/`, so an href the source wrote as
-// `../Text/notes.xhtml#n1` names a file the output does not contain.
+// `Text/notes.xhtml#n1` names a file the output does not contain.
 // epubcheck rejects those as RSC-007 and a reader shows them as dead.
 //
 // The `footnote_links` fixture is built for this: its documents live in
-// `Text/`, they link to each other through `../`, and they reuse the same
+// `Text/`, they link to each other by stepping out of their directory, and
+// they reuse the same
 // fragment names in more than one document, so a resolver that keeps one
 // table of fragments for the whole book sends a link to the wrong file rather
 // than to nowhere, and that has to fail too.
