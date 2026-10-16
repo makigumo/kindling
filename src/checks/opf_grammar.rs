@@ -987,6 +987,7 @@ mod tests {
             original_resolution: None,
             page_progression_direction: None,
             package_version: "3.0".into(),
+            subjects: Vec::new(),
             dc_types: Vec::new(),
             manifest_items: Vec::new(),
             raw_itemrefs: Vec::new(),

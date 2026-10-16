@@ -277,7 +277,8 @@ fn resolves_to_manifest(
 
 /// Collapse `./` and `..` segments in a relative path into a clean string with
 /// forward slashes. Leading `..` are preserved so the result still matches
-/// literal `../` manifest hrefs rather than escaping the manifest root.
+/// literal parent-relative manifest hrefs rather than escaping the manifest
+/// root.
 fn normalize_relative_path(path: &Path) -> String {
     let mut out: Vec<String> = Vec::new();
     for comp in path.components() {
