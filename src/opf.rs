@@ -725,6 +725,19 @@ impl OPFData {
 #[allow(dead_code)]
 pub struct DictionaryEntry {
     pub headword: String,
+    /// The entry's other `<idx:orth>` spellings, in source order.
+    ///
+    /// One `<idx:entry>` routinely declares several orths: the Wadoku
+    /// Japanese-German dictionary carries 70,929 `<idx:orth>` across 14,580
+    /// entries, an average of 4.86 and up to 306 for a single entry, all of
+    /// them ways to reach the same entry. Only the first was read, so
+    /// 51,514 of Wadoku's 63,155 distinct headwords were absent from the
+    /// index and did not resolve on device, while the kindlegen build of the
+    /// same data resolves them.
+    ///
+    /// These share the entry's text span, which is what makes them free: the
+    /// body is located once for the entry, not once per spelling.
+    pub aliases: Vec<String>,
     pub inflections: Vec<String>,
     pub html_content: String,
 }
@@ -799,21 +812,31 @@ pub fn parse_dictionary_html_with_gaps(
         let entry_inner = &content[after_open..close_pos];
         let full_entry = &content[abs_start..close_pos + entry_close.len()];
 
-        // Extract headword: prefer `value=` attribute; otherwise fall back to
-        // the body text of the first `<idx:orth>...</idx:orth>` element.
-        let headword = if let Some(cap) = orth_val_re.captures(entry_inner) {
-            unescape_html(cap.get(1).unwrap().as_str())
-        } else if let Some(hw) = extract_orth_body_text(entry_inner) {
-            hw
-        } else {
-            search_pos = close_pos + entry_close.len();
-            continue;
-        };
+        // Every `<idx:orth>` on the entry is a way to reach it, so all of them
+        // are collected and the first one stays the display headword. Source
+        // order is kept, which is the order the renderer prints them in.
+        let mut orths: Vec<String> = orth_val_re
+            .captures_iter(entry_inner)
+            .map(|cap| unescape_html(cap.get(1).unwrap().as_str()))
+            .filter(|o| !o.is_empty())
+            .collect();
+        orths.dedup();
 
-        if headword.is_empty() {
-            search_pos = close_pos + entry_close.len();
-            continue;
-        }
+        // An entry may declare its headword as the body text of an
+        // `<idx:orth>` instead of a `value=` attribute (the form PyGlossary
+        // emits), which the regex above cannot see.
+        let (headword, aliases) = if orths.is_empty() {
+            match extract_orth_body_text(entry_inner) {
+                Some(hw) if !hw.is_empty() => (hw, Vec::new()),
+                _ => {
+                    search_pos = close_pos + entry_close.len();
+                    continue;
+                }
+            }
+        } else {
+            let headword = orths.remove(0);
+            (headword, orths)
+        };
 
         // Extract inflections
         let inflections: Vec<String> = iform_re
@@ -824,6 +847,7 @@ pub fn parse_dictionary_html_with_gaps(
         gaps.push(content[gap_start..abs_start].to_string());
         entries.push(DictionaryEntry {
             headword,
+            aliases,
             inflections,
             html_content: full_entry.to_string(),
         });
