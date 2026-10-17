@@ -69,9 +69,16 @@
 //! (every ー folded, so no literals remain) comes out one-byte, matching
 //! kindlegen.
 //!
-//! Entries in the orth INDX must be sorted by their zero-skipped weight
-//! sequences (see `sort_key`); ties may appear in any order because the
-//! firmware scans equal-weight ranges.
+//! Entries in the orth INDX must be sorted by the weight sequences the
+//! *firmware* builds (see `device_collation_key`): it decodes every stored
+//! label through ORDT2 and weighs the characters it gets back, because the
+//! 0x28 field that would point it at the file's own weights is 0 in every
+//! build kindling writes. Sorting by the table's ORDT1 weights instead
+//! (`sort_key`) puts a Latin word in a Japanese index wherever its ORDT
+//! symbol happens to sit - 662 of Wadoku's 68,238 label pairs were out of the
+//! device's order that way and the entries behind them could not be found.
+//! Ties may appear in any order because the firmware scans equal-weight
+//! ranges.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1049,9 +1056,15 @@ impl OrdtTables {
         }
     }
 
-    /// Collation key for an encoded label: per-element ORDT1 weights with
-    /// zero (ignorable) weights skipped. Out-of-table literals compare
-    /// after every weighted symbol, by raw code point.
+    /// Collation key for an encoded label as the file itself declares it:
+    /// per-element ORDT1 weights with zero (ignorable) weights skipped.
+    /// Out-of-table literals compare after every weighted symbol, by raw code
+    /// point.
+    ///
+    /// This is the order a reader would use if the INDX header's 0x28 field
+    /// pointed at this table (it does not: kindling writes 0 there, as
+    /// kindlegen does), so it is not the order a label has to be stored in.
+    /// [`device_collation_key`] is.
     pub fn sort_key(&self, label_bytes: &[u8]) -> Vec<u32> {
         let cnt = self.ordt1.len();
         let mut key = Vec::with_capacity(label_bytes.len());
