@@ -27,6 +27,7 @@
 //! | `margin-top` (and `margin`) | `height="…"` on the element itself |
 //! | `margin-bottom` (and `margin`) | a `<div height="…"></div>` after the element |
 //! | `text-align` | `align="…"` on the element itself, only on `p`, `div`, `td`, `tr`, `blockquote` and `h1`–`h6` |
+//! | `display: none` | the element and its contents are removed |
 //!
 //! Each mapping is one kindlegen was measured to make, nesting order included:
 //! for a `<p>` carrying all of them kindlegen writes `<p height="20"
@@ -95,6 +96,30 @@
 //! and the same rule on a `span` gets nothing, which is exactly what kindlegen
 //! does with one class and two elements.
 //!
+//! `display: none` is the one declaration that removes rather than styles, and
+//! the popup has no stylesheet to remove with: the element and its contents go
+//! from the shipped entry, and no marker is left in their place. Measured on
+//! kindlegen 2.9:
+//! it removes the element the rule matches — a class, an element, or the
+//! element's own `style` attribute — and a later `display` that is not `none`
+//! turns the removal back off. Its own output is not reproduced in two ways.
+//! It writes a `<data-AmznRemoved>` marker whose `data-AmznRnd` span count
+//! varies with something that is not the content (one character gives one
+//! span, six give two, six kana give three), which is unreachable from here and
+//! worthless to a reader; and it removes *to the end of the element that
+//! encloses the hidden one* — text after the hidden element inside the same
+//! parent is dropped too, while text after the parent survives
+//! (`in_div` versus `in_ruby`). Only the element the rule names is removed
+//! here. On the real Wadoku sheet both agree: its 752 `<rt class="hidden">`
+//! readings are each the last child of their `<ruby>`, so the two removals have
+//! the same content.
+//!
+//! A descendant selector does not remove anything. Measured, `.a .b {
+//! display: none }` removes a `.b` in kindlegen, because kindlegen evaluates
+//! the whole selector; this compiler resolves such a rule against its leading
+//! compound and leaves the descendant half to the sheet, so removing the
+//! leading compound would delete content kindlegen shows.
+//!
 //! Declarations that are compiled are removed from the stylesheet that ships,
 //! so a reader that *does* apply CSS cannot also apply the inline tag and
 //! double the effect. Anything not compiled, `padding` and the like, stays in
@@ -137,6 +162,13 @@ pub(crate) struct Effect {
     pub height_unset: bool,
     /// The same for a bottom margin and the spacer `div` it becomes.
     pub spacer_unset: bool,
+    /// `display`. `Some(true)` is the one value that compiles to something —
+    /// the element and its contents are removed — and `Some(false)` records a
+    /// `display` that is not `none`, which compiles to nothing but turns an
+    /// earlier removal back off, as the cascade says. The declaration stays in
+    /// the sheet either way, because the book view still lays the element out
+    /// with it.
+    pub hidden: Option<bool>,
 }
 
 impl Effect {
@@ -151,6 +183,7 @@ impl Effect {
             && self.height.is_none()
             && self.spacer.is_none()
             && self.align.is_none()
+            && self.hidden.is_none()
     }
 
     /// Whether this asks for anything at all: content to write, or a margin an
@@ -199,6 +232,9 @@ impl Effect {
         }
         if other.align.is_some() {
             self.align = other.align.clone();
+        }
+        if other.hidden.is_some() {
+            self.hidden = other.hidden;
         }
         self.bold |= other.bold;
         self.italic |= other.italic;
@@ -1041,6 +1077,16 @@ fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<St
                 Some(a) => effect.align = Some(a),
                 None => consumed = false,
             },
+            // The one property whose compiled form is a removal, and the one
+            // that is never taken out of the sheet: `none` decides what the
+            // popup shows by taking the element out of the entry text, while
+            // the book view still lays the element out with the rule. A value
+            // that is not `none` compiles to no markup and is read anyway,
+            // because it is what turns an earlier `none` back off.
+            "display" => {
+                effect.hidden = Some(value.trim().eq_ignore_ascii_case("none"));
+                consumed = false;
+            }
             "font-size" => match size_delta(&value) {
                 Some(d) => effect.size = Some(d),
                 None => consumed = false,
@@ -1217,7 +1263,9 @@ pub(crate) fn compile(css: &str) -> Compiled {
         // `<font>` tags kindlegen 2.9 writes, since dropping the rule dropped
         // `rt`, `.accent`, `i.genus`, `.descr` and `.etym` with it.
         let parts: Vec<&str> = selectors.split(',').collect();
-        let mut parsed: Vec<Selector> = Vec::new();
+        // Each selector this can match, and whether it came from a descendant
+        // selector's leading compound, which must not carry a removal.
+        let mut parsed: Vec<(Selector, bool)> = Vec::new();
         // The parts that were compiled and can carry the declarations this left
         // uncompiled, and the parts the sheet has to keep the whole block for.
         let mut readable: Vec<&str> = Vec::new();
@@ -1225,7 +1273,7 @@ pub(crate) fn compile(css: &str) -> Compiled {
         for part in &parts {
             match read_part(part) {
                 Part::Simple(selector) => {
-                    parsed.push(selector);
+                    parsed.push((selector, false));
                     readable.push(part);
                 }
                 // A descendant selector is compiled against its leading
@@ -1233,7 +1281,7 @@ pub(crate) fn compile(css: &str) -> Compiled {
                 // elements its descendant half names can only be styled from
                 // there, and the compiled effect lands on different ones.
                 Part::Leading(selector) => {
-                    parsed.push(selector);
+                    parsed.push((selector, true));
                     sheet_parts.push(part);
                 }
                 Part::Unreadable => sheet_parts.push(part),
@@ -1251,12 +1299,21 @@ pub(crate) fn compile(css: &str) -> Compiled {
         // compile. A selector list counts if any part can carry `align`.
         let align_expressible = parsed
             .iter()
-            .any(|s| s.element.as_deref().is_none_or(carries_align));
+            .any(|(s, _)| s.element.as_deref().is_none_or(carries_align));
         let (effect, kept) = compile_declarations(block, align_expressible);
 
         if effect.asks_for_something() {
-            for selector in &parsed {
-                effects.insert(selector, &effect);
+            for (selector, from_descendant) in &parsed {
+                // kindlegen evaluates a descendant selector whole and removes
+                // the element it names; this resolves the rule against the
+                // leading compound and leaves the descendant half to the
+                // sheet, so a removal here would delete content kindlegen
+                // shows. Measured with `.a .b { display: none }`.
+                let mut recorded = effect.clone();
+                if *from_descendant {
+                    recorded.hidden = None;
+                }
+                effects.insert(selector, &recorded);
             }
         }
         // The parts that could not be read keep the rule's declarations, whole
@@ -1333,6 +1390,22 @@ pub(crate) fn compile_style_blocks(blocks: &str) -> Compiled {
     }
 }
 
+/// One element [`apply`] has opened and not closed yet.
+struct Open {
+    /// The name a close tag has to match.
+    name: String,
+    /// The markup to write at the close tag.
+    close: String,
+    /// The spacer a bottom margin puts after the close tag.
+    spacer: Option<String>,
+    /// Set on the element a rule hid: the offset its start tag began at, which
+    /// its close tag turns into a drop range covering the whole element.
+    removed_from: Option<usize>,
+    /// Whether this element was opened inside a hidden one, so its close is one
+    /// of the nesting levels the removal has to count down.
+    inside_removal: bool,
+}
+
 /// Wrap the contents of every matching element in the markup its rules ask
 /// for.
 ///
@@ -1348,6 +1421,14 @@ pub(crate) fn compile_style_blocks(blocks: &str) -> Compiled {
 /// replaced by a spacer, the indent, `<div align="left"><tt>` and
 /// `</tt></div>`, with its whitespace spelled out first (see
 /// [`encode_pre_text`]).
+///
+/// The other exception is an element a rule hides. `display: none` is the one
+/// declaration the popup cannot express as markup, so the element and its
+/// contents are left out of the entry altogether: measured on kindlegen 2.9,
+/// the 752 `<rt class="hidden">` readings of the real Wadoku source are gone
+/// from its build and shipped in kindling's, and the popup showed every one of
+/// them. Nothing takes their place — see the module docs on the marker
+/// kindlegen writes, and on its removal reaching past the element.
 pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
     // A stylesheet with nothing in it still has the entries' own `style`
     // attributes to compile, so the scan for one is what decides whether there
@@ -1365,28 +1446,80 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
     // (offset, text) pairs, collected in document order.
     let mut inserts: Vec<(usize, String)> = Vec::new();
     // Source ranges to leave out: the `<pre>` tags themselves, which kindlegen
-    // translates into markup rather than keeping.
+    // translates into markup rather than keeping, and every element a rule
+    // hid, contents and close tag included.
     let mut drops: Vec<(usize, usize)> = Vec::new();
-    // The element each open tag is waiting for, the markup to close it with,
-    // and the spacer its bottom margin puts after it.
-    let mut open_stack: Vec<(String, String, Option<String>)> = Vec::new();
+    // The elements the walk has opened and not closed yet.
+    let mut open_stack: Vec<Open> = Vec::new();
+    // How many elements are open inside a hidden one. Nothing in there is
+    // written, because the whole range is dropped when the hidden element
+    // closes; the count is what tells its close tag apart from theirs.
+    let mut inside_removal = 0usize;
 
     crate::links::for_each_tag(html, |tag, attrs| {
         if tag.closing {
-            if let Some(at) = open_stack.iter().rposition(|(n, _, _)| *n == tag.name) {
-                let (name, close, spacer) = open_stack.remove(at);
-                if name == "pre" {
+            if let Some(at) = open_stack.iter().rposition(|o| o.name == tag.name) {
+                let open = open_stack.remove(at);
+                if open.inside_removal && inside_removal > 0 {
+                    inside_removal -= 1;
+                }
+                // The element a rule hid goes whole: its start tag, everything
+                // inside it, and this close tag. The inserts its subtree asked
+                // for were never collected, so none of them lands in here.
+                if let Some(from) = open.removed_from {
+                    drops.push((from, tag.end));
+                    // A still-open descendant of a malformed hidden element
+                    // cannot end the removal twice, and nothing after the
+                    // removal belongs to it.
+                    inside_removal = 0;
+                }
+                if open.name == "pre" {
                     // The close the pre was opened with replaces this tag.
                     drops.push((tag.start, tag.end));
                 }
-                if !close.is_empty() {
-                    inserts.push((tag.start, close));
+                if !open.close.is_empty() {
+                    inserts.push((tag.start, open.close));
                 }
                 // After the closing tag, so an inner element's spacer lands
                 // inside its parent: measured, kindlegen nests them.
-                if let Some(spacer) = spacer {
+                if let Some(spacer) = open.spacer {
                     inserts.push((tag.end, spacer));
                 }
+            }
+            return;
+        }
+        // Everything inside a hidden element is part of what that element's
+        // close tag drops, so nothing in here writes anything. The elements
+        // are still tracked, because a close has to match the element that is
+        // actually open rather than the one the name suggests.
+        if inside_removal > 0 {
+            if !tag.self_closing {
+                inside_removal += 1;
+                open_stack.push(Open {
+                    name: tag.name.clone(),
+                    close: String::new(),
+                    spacer: None,
+                    removed_from: None,
+                    inside_removal: true,
+                });
+            }
+            return;
+        }
+        let effect = effects.get(&tag.name, attrs);
+        // A hidden element is dropped whole. A self-closing one has no
+        // contents and no close tag, so its own tag is the whole range.
+        if effect.as_ref().is_some_and(|e| e.hidden == Some(true)) {
+            if tag.self_closing {
+                drops.push((tag.start, tag.end));
+            } else {
+                open_stack.push(Open {
+                    name: tag.name.clone(),
+                    close: String::new(),
+                    spacer: None,
+                    removed_from: Some(tag.start),
+                    inside_removal: false,
+                });
+                inside_removal = 1;
             }
             return;
         }
@@ -1403,7 +1536,6 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
             }
             return;
         }
-        let effect = effects.get(&tag.name, attrs);
         // `<pre>` is the one element kindlegen does not keep. MOBI has no
         // `<pre>`, so it says the element in markup instead: a spacer for the
         // top margin (there is no element left to carry `height`), the indent,
@@ -1433,7 +1565,13 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
                 close.push_str("</blockquote>");
             }
             close.push_str("</tt></div>");
-            open_stack.push(("pre".to_string(), close, effect.trailing_spacer()));
+            open_stack.push(Open {
+                name: "pre".to_string(),
+                close,
+                spacer: effect.trailing_spacer(),
+                removed_from: None,
+                inside_removal: false,
+            });
             return;
         }
         let effect = effect.unwrap_or_default();
@@ -1456,17 +1594,29 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
         // `<div class="a">` — used to swallow the outer element's close: the
         // `<blockquote>` was closed at the inner `</div>` and whatever followed
         // it inside the outer element fell outside the indent.
-        open_stack.push((tag.name.clone(), close, effect.trailing_spacer()));
+        open_stack.push(Open {
+            name: tag.name.clone(),
+            close,
+            spacer: effect.trailing_spacer(),
+            removed_from: None,
+            inside_removal: false,
+        });
     });
 
     // Source markup that never closes an element would otherwise leave the
     // tags this opened hanging open into the rest of the book. Close them at
-    // the end, innermost first, with any spacer after its own close.
-    while let Some((_, close, spacer)) = open_stack.pop() {
-        if !close.is_empty() {
-            inserts.push((html.len(), close));
+    // the end, innermost first, with any spacer after its own close. A hidden
+    // element that never closes takes the rest of the entry with it, which is
+    // the only reading left for it.
+    while let Some(open) = open_stack.pop() {
+        if let Some(from) = open.removed_from {
+            drops.push((from, html.len()));
+            continue;
         }
-        if let Some(spacer) = spacer {
+        if !open.close.is_empty() {
+            inserts.push((html.len(), open.close));
+        }
+        if let Some(spacer) = open.spacer {
             inserts.push((html.len(), spacer));
         }
     }
@@ -2254,6 +2404,126 @@ v { margin-left: 0.4em; }",
         assert!(
             !(eff.height.is_some() || eff.spacer.is_some() || eff.indent),
             "{eff:?}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_element_is_removed_with_its_contents() {
+        // The real sheet's `.hidden { display: none }` applies to 752
+        // `<rt class="hidden">` readings, and kindlegen's build ships none of
+        // them: the popup showed every one in kindling. Text after the hidden
+        // element survives here, which is a deliberate divergence — kindlegen
+        // removes to the end of the element that encloses the hidden one, for
+        // content the CSS does not name.
+        let e = effects_of(".hidden { display: none; }");
+        assert_eq!(
+            apply(r#"before<span class="hidden">gone</span>after"#, &e),
+            "beforeafter"
+        );
+        // A subtree goes whole, including an element with styling of its own.
+        let e = effects_of(".hidden { display: none; } .in { font-size: 200%; }");
+        assert_eq!(
+            apply(
+                r#"before<span class="hidden">gone<span class="in">child</span></span>after"#,
+                &e
+            ),
+            "beforeafter"
+        );
+        // The real shape: a hidden reading inside a ruby, with text after it.
+        let e = effects_of(".hidden { display: none; } rt { font-size: .4em; }");
+        assert_eq!(
+            apply(
+                r#"<ruby><rb>x</rb><rt class="hidden">y</rt></ruby> after"#,
+                &e
+            ),
+            "<ruby><rb>x</rb></ruby> after"
+        );
+        // A same-name element above it still closes where it should.
+        let e = effects_of(".hidden { display: none; }");
+        assert_eq!(
+            apply(
+                r#"<div class="a"><span class="hidden">x</span>after</div>"#,
+                &e
+            ),
+            r#"<div class="a">after</div>"#
+        );
+        // Nothing takes the element's place: kindlegen's `<data-AmznRemoved>`
+        // marker counts `data-AmznRnd` spans by something that is not the
+        // content (one character gives one, six give two, six kana give
+        // three), and no reader needs it.
+        assert!(!apply(r#"<span class="hidden">x</span>"#, &e).contains("Removed"));
+        // And it survives the strip pass that follows `apply` in the build, so
+        // the reading is not in the entry text the popup renders.
+        assert!(!shipped(
+            r#"<idx:entry><idx:orth><b>a</b></idx:orth><ruby><rb>x</rb><rt class="hidden">y</rt></ruby></idx:entry>"#,
+            &e
+        )
+        .contains(">y<"));
+    }
+
+    #[test]
+    fn a_hidden_element_that_never_closes_takes_the_rest() {
+        let e = effects_of(".hidden { display: none; }");
+        assert_eq!(apply(r#"<p>a</p><div class="hidden">x"#, &e), "<p>a</p>");
+        // A self-closing one has no contents and no close tag to wait for.
+        assert_eq!(apply(r#"<img class="hidden" alt="x"/>keep"#, &e), "keep");
+    }
+
+    #[test]
+    fn a_later_display_turns_the_removal_off() {
+        // Measured: `.hidden { display: none }` followed by
+        // `.hidden { display: inline }` keeps the element, and the reverse
+        // order removes it.
+        let e = effects_of(".hidden { display: none; } .hidden { display: inline; }");
+        assert_eq!(
+            apply(r#"<span class="hidden">keep</span>"#, &e),
+            r#"<span class="hidden">keep</span>"#
+        );
+        let e = effects_of(".hidden { display: inline; } .hidden { display: none; }");
+        assert_eq!(apply(r#"<span class="hidden">gone</span>"#, &e), "");
+        // An element's own `style="display:none"` removes it with no
+        // stylesheet at all, which is what kindlegen does with it.
+        let e = effects_of("");
+        assert_eq!(
+            apply(r#"<span style="display:none">x</span>after"#, &e),
+            "after"
+        );
+    }
+
+    #[test]
+    fn a_display_declaration_stays_in_the_sheet() {
+        // `display` is the one compiled property whose declaration is not taken
+        // out of the sheet: the book view lays the element out with it, and the
+        // removal only decides what the popup shows.
+        let c = compile(".hidden { display: none; }");
+        assert_eq!(
+            c.effects.get("span", r#" class="hidden""#).unwrap().hidden,
+            Some(true)
+        );
+        assert!(
+            c.residual_css.contains("display: none"),
+            "{:?}",
+            c.residual_css
+        );
+    }
+
+    #[test]
+    fn a_descendant_rule_does_not_remove_its_leading_compound() {
+        // Measured: `.a .b { display: none }` removes a `.b` in kindlegen,
+        // because kindlegen evaluates the whole selector. This resolves the
+        // rule against the leading compound and leaves the descendant half to
+        // the sheet, so a removal here would delete content kindlegen shows.
+        let e = effects_of(".a .b { display: none; }");
+        assert!(e.get("div", r#" class="a""#).is_none());
+        assert_eq!(
+            apply(r#"<div class="a">keep</div>"#, &e),
+            r#"<div class="a">keep</div>"#
+        );
+        // The rule is still in the sheet, which is what can reach a `.b`.
+        assert!(
+            compile(".a .b { display: none; }")
+                .residual_css
+                .contains(".a .b")
         );
     }
 
