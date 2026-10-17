@@ -373,7 +373,7 @@ fn build_dictionary_mobi(
     // help text only ever promised to skip the 30 MB split and the file-count
     // warning. `kindle_limits` now controls exactly that and nothing else
     // (issue #41).
-    let (text_content, entry_needles, pending_links, entry_gap_texts) =
+    let (text_content, entry_needles, pending_links, entry_gap_texts, front_matter_needles) =
         build_text_content_by_letter(
             opf,
             &all_entries,
@@ -385,9 +385,6 @@ fn build_dictionary_mobi(
             &dictionary_nav_points,
             kindle_limits,
         );
-
-    // Insert the guide reference tag
-    let text_content = insert_guide_reference(&text_content);
 
     // Rewrite image src attributes to recindex references
     let text_content = if !href_to_recindex.is_empty() {
@@ -427,6 +424,7 @@ fn build_dictionary_mobi(
         &entry_files,
         &entry_positions,
         &pending_links,
+        &front_matter_needles,
     );
 
     let kf7_ncx_entries = build_dictionary_ncx_entries(&dictionary_nav_points, &text_content);
@@ -2704,7 +2702,18 @@ fn build_text_content(
         body_contents.push(body);
     }
 
-    let head = first_head.unwrap_or_else(|| "<head><guide></guide></head>".to_string());
+    // The OPF's guide, in the head. A MOBI6 reader follows the `filepos` a
+    // guide item carries and ignores its href, so a guide written from hrefs
+    // alone jumps nowhere; kindlegen writes one reference per item, in OPF
+    // order, each with the item's own title and type, and leaves the ten X's
+    // it starts with when the href names nothing a reader can reach (a table
+    // of contents that lives in the NCX, for example). A book whose OPF has
+    // no guide gets an empty one, which is what kindlegen writes there too.
+    let (guide_block, guide_links) = build_guide_block(opf, &documents);
+    let (head, head_guide_at) = head_with_guide(
+        &first_head.unwrap_or_else(|| "<head></head>".to_string()),
+        &guide_block,
+    );
     const SEPARATOR: &str = "<mbp:pagebreak/>";
     let merged_body = body_contents.join(SEPARATOR);
     let combined = format!(
@@ -2733,6 +2742,36 @@ fn build_text_content(
         .collect();
 
     let mut bytes = combined.into_bytes();
+
+    // The guide's placeholders, patched the way the body's are: a reference to
+    // a document lands where a link to that document lands, and one naming a
+    // fragment lands on the element that carries it. The head is written
+    // before the bodies and nothing shifts it, so the block's own offset is
+    // arithmetic. A reference nothing resolves keeps its `filepos=XXXXXXXXXX`,
+    // which is inert in the reader and what kindlegen leaves behind, so it is
+    // not counted in the warning below.
+    for link in &guide_links {
+        let resolved = match &link.target {
+            Some((file, None)) => doc_start.get(*file).copied(),
+            Some((file, Some(fragment))) => anchor_offsets
+                .get(*file)
+                .and_then(|m| m.get(fragment.as_str()))
+                .copied()
+                .or_else(|| {
+                    wrapper_anchors
+                        .get(*file)
+                        .filter(|w| w.contains(fragment.as_str()))
+                        .and_then(|_| doc_start.get(*file).copied())
+                }),
+            None => None,
+        };
+        if let Some(offset) = resolved {
+            let at = "<html>".len() + head_guide_at + link.digits;
+            let digits = format!("{:0width$}", offset, width = FILEPOS_DIGITS);
+            bytes[at..at + FILEPOS_DIGITS].copy_from_slice(digits.as_bytes());
+        }
+    }
+
     let mut unresolved = 0usize;
     for (i, pending) in body_links.iter().enumerate() {
         for link in pending {
@@ -2816,6 +2855,109 @@ fn replace_hrefs_with_filepos(
     (out, pending)
 }
 
+/// The `<guide>` block for the text blob's `<head>`, and the placeholder
+/// targets that still need their `filepos` filled in.
+///
+/// A MOBI6 reader navigates a guide item by the `filepos` it carries and
+/// ignores the `href` entirely, so a guide written from the OPF's hrefs alone
+/// jumps nowhere. kindlegen writes one `<reference>` per OPF guide item, in
+/// OPF order, with the item's own `title` and `type`, and that is what this
+/// does: Wadoku's OPF names its table of contents plus every entry file (one
+/// `text` reference per kana group), and the device's guide menu is that list.
+///
+/// Each reference's `filepos` starts as ten `X`s, the same inert, same-width
+/// marker an unresolvable cross-reference gets, and the ones that name a
+/// document in the spine are filled in afterwards. The `digits` field of each
+/// returned target is where that reference's ten digits sit relative to the
+/// block's first byte: the book path patches them arithmetically, because
+/// everything before its merged bodies is fixed-width, while the dictionary
+/// path scans for its placeholders, because the image rewrite and the record
+/// padding move every offset after them.
+fn build_guide_block(
+    opf: &OPFData,
+    documents: &std::collections::HashMap<String, usize>,
+) -> (String, Vec<PendingFilepos>) {
+    if opf.guide.is_empty() {
+        // What every dictionary without a `<guide>` in its OPF has always
+        // carried. kindlegen writes the same empty element for a book whose
+        // OPF has no guide, so the book path writes it too.
+        return ("<guide></guide>".to_string(), Vec::new());
+    }
+    let mut block = String::from("<guide>");
+    let mut pending = Vec::with_capacity(opf.guide.len());
+    for item in &opf.guide {
+        let entry = format!(
+            "<reference title=\"{}\" type=\"{}\"  filepos={} />",
+            escape_xml_attribute(&item.title),
+            escape_xml_attribute(&item.type_),
+            "X".repeat(FILEPOS_DIGITS)
+        );
+        let digits = block.len() + entry.len() - " />".len() - FILEPOS_DIGITS;
+        block.push_str(&entry);
+        // A guide href is written against the package document, not against a
+        // content file, so it resolves with an empty containing document.
+        pending.push(PendingFilepos {
+            digits,
+            target: match links::resolve(
+                "",
+                0,
+                &item.href,
+                documents,
+                &std::collections::HashMap::new(),
+            ) {
+                links::Resolution::Internal { file, fragment } => Some((file, fragment)),
+                _ => None,
+            },
+        });
+    }
+    block.push_str("</guide>");
+    (block, pending)
+}
+
+/// Put `guide_block` at the front of a document's `<head>`, making a head to
+/// hold it when there is none, and report where the block landed.
+///
+/// The front is where kindlegen puts it: its MOBI6 head carries the guide as
+/// the head's first child, measured on its builds of the parity book, of a
+/// book whose source head held a `<meta>`, a `<title>` and a stylesheet link
+/// (kindlegen drops all three), and of the Wadoku dictionary. A source head
+/// keeps its own content here, so the block goes immediately after the head's
+/// opening tag rather than after that content. The reported offset is what
+/// lets the caller patch the block's placeholders without scanning for them.
+fn head_with_guide(head: &str, guide_block: &str) -> (String, usize) {
+    let insert_at = head
+        .find("<head")
+        .and_then(|open| head[open..].find('>').map(|close| open + close + 1))
+        .or_else(|| head.find("</head>"))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(head.len() + guide_block.len());
+    out.push_str(&head[..insert_at]);
+    out.push_str(guide_block);
+    out.push_str(&head[insert_at..]);
+    (out, insert_at)
+}
+
+/// Escape the four characters that cannot appear raw in a double-quoted XML
+/// attribute value, so a title carrying a `"` or an `&` survives into the
+/// guide.
+///
+/// An apostrophe is left as it is, and deliberately: `&apos;` is an XHTML
+/// entity with no HTML counterpart, and a MOBI6 head is HTML, so a title
+/// spelled `Don't` would reach the guide menu as `Don&apos;t`.
+fn escape_xml_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Fill in the `filepos` digits of a dictionary's cross-references.
 ///
 /// A dictionary's entries are merged into one blob, but its links were
@@ -2841,6 +2983,7 @@ fn resolve_dictionary_links(
     entry_files: &[usize],
     entry_positions: &[(usize, usize)],
     pending: &[PendingFilepos],
+    front_matter_needles: &[(usize, Box<[u8]>)],
 ) -> Vec<u8> {
     if pending.is_empty() {
         return text;
@@ -2850,6 +2993,22 @@ fn resolve_dictionary_links(
     // Per source file: fragment name -> absolute offset in the blob.
     let mut per_file: Vec<std::collections::HashMap<String, usize>> = Vec::new();
     let mut file_start: Vec<Option<usize>> = Vec::new();
+    // A document with no dictionary entries became one front-matter section,
+    // so its start is the position of that section's own opening bytes. Found
+    // by content for the same reason the placeholders are: everything after an
+    // image rewrite or a padding byte has moved.
+    let mut front_matter_start: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    {
+        let mut search_from = 0usize;
+        for (file, needle) in front_matter_needles {
+            if let Some(rel) = find_bytes(&text[search_from..], needle) {
+                let at = search_from + rel;
+                front_matter_start.insert(*file, at);
+                search_from = at + needle.len();
+            }
+        }
+    }
     let ensure = |v: &mut Vec<std::collections::HashMap<String, usize>>,
                   s: &mut Vec<Option<usize>>,
                   i: usize| {
@@ -2912,10 +3071,23 @@ fn resolve_dictionary_links(
         cursor = at + FILEPOS_DIGITS;
 
         let resolved = match &link.target {
-            Some((file, None)) => file_start.get(*file).copied().flatten(),
-            Some((file, Some(fragment))) => {
-                per_file.get(*file).and_then(|m| m.get(fragment).copied())
-            }
+            Some((file, None)) => file_start
+                .get(*file)
+                .copied()
+                .flatten()
+                .or_else(|| front_matter_start.get(file).copied()),
+            Some((file, Some(fragment))) => per_file
+                .get(*file)
+                .and_then(|m| m.get(fragment).copied())
+                .or_else(|| {
+                    // A fragment inside a front-matter document: the anchor
+                    // survived that cleanup, so look for it from the
+                    // document's own start rather than leaving the reference
+                    // inert.
+                    let start = front_matter_start.get(file).copied()?;
+                    let at = anchor_offset_in(&bytes, start, fragment)?;
+                    Some(at)
+                }),
             None => None,
         };
         match resolved {
@@ -2934,6 +3106,22 @@ fn resolve_dictionary_links(
         );
     }
     bytes
+}
+
+/// The offset of an anchor named `fragment` at or after `start`, as the
+/// position of its `id=`/`name=` attribute, or `None` when the document does
+/// not carry one.
+fn anchor_offset_in(text: &[u8], start: usize, fragment: &str) -> Option<usize> {
+    if start >= text.len() {
+        return None;
+    }
+    for attr in ["id", "name"] {
+        let needle = format!("{attr}=\"{fragment}\"");
+        if let Some(rel) = find_bytes(&text[start..], needle.as_bytes()) {
+            return Some(start + rel);
+        }
+    }
+    None
 }
 
 /// The `id` on an entry's `<idx:entry>` open tag, which the strip removes.
@@ -3158,9 +3346,15 @@ fn build_dictionary_ncx_entries(
 
 /// What `build_text_content_by_letter` returns: the merged body text, the
 /// per-entry headword needles, the link placeholders still waiting to be
-/// patched with real file positions, and the gap text that sits between
-/// entries.
-type AssembledDictionaryText = (Vec<u8>, Vec<Box<[u8]>>, Vec<PendingFilepos>, Vec<String>);
+/// patched with real file positions, the gap text that sits between entries,
+/// and the opening bytes of each front-matter document with its spine index.
+type AssembledDictionaryText = (
+    Vec<u8>,
+    Vec<Box<[u8]>>,
+    Vec<PendingFilepos>,
+    Vec<String>,
+    Vec<(usize, Box<[u8]>)>,
+);
 
 /// Build text content for a dictionary, splitting at entry boundaries to stay
 /// under Amazon's per-HTML-file size limit.
@@ -3442,18 +3636,33 @@ fn build_text_content_by_letter(
     // did compile are gone from it, or the book view would apply the rule and
     // the inline tag both and render the effect twice.
     let style_block = defer_escaped_colon_rules(&compiled_css.residual_css);
+    let (guide_block, guide_links) = build_guide_block(opf, &documents);
+    // The guide is the head's first child, the way kindlegen writes it; the
+    // style block kindling compiles the source's CSS into follows it.
     let combined = format!(
-        "<html><head>{}<guide></guide></head><body>{}  <mbp:pagebreak/></body></html>",
-        style_block, merged_body
+        "<html><head>{}{}</head><body>{}  <mbp:pagebreak/></body></html>",
+        guide_block, style_block, merged_body
     );
-    // Document order: front matter, then entries. The patch pass walks the
-    // placeholders in the finished blob in the same order.
-    front_matter_links.extend(entry_links);
+    // Document order in the finished blob: the guide (in the head), then front
+    // matter, then entries. The patch pass walks the placeholders in the same
+    // order, scanning for them rather than trusting an offset.
+    let mut pending_links = guide_links;
+    pending_links.extend(front_matter_links);
+    pending_links.extend(entry_links);
+    // Where each front-matter document begins, taken from its own opening
+    // bytes: a document with no entries is one section, and its start is what
+    // a link or a guide reference to the document itself has to land on.
+    let front_matter_needles: Vec<(usize, Box<[u8]>)> = front_matter_files
+        .iter()
+        .zip(front_matter_sections.iter())
+        .map(|(file, section)| (*file, entry_needle(section)))
+        .collect();
     (
         combined.into_bytes(),
         entry_needles,
-        front_matter_links,
+        pending_links,
         stripped_gaps,
+        front_matter_needles,
     )
 }
 
@@ -4369,38 +4578,6 @@ fn percent_decode(s: &str) -> String {
             result.push(b as char);
         }
     }
-    result
-}
-
-/// Insert the guide reference tag with the correct filepos.
-fn insert_guide_reference(text_bytes: &[u8]) -> Vec<u8> {
-    let empty_guide = b"<guide></guide>";
-
-    let guide_pos = match find_bytes(text_bytes, empty_guide) {
-        Some(pos) => pos,
-        None => return text_bytes.to_vec(),
-    };
-
-    let first_b = match find_bytes(text_bytes, b"<b>") {
-        Some(pos) => pos,
-        None => return text_bytes.to_vec(),
-    };
-
-    // The reference tag template has a fixed-width filepos (10 digits)
-    let ref_template_zero =
-        b"<guide><reference title=\"IndexName\" type=\"index\"  filepos=0000000000 /></guide>";
-    let insert_delta = ref_template_zero.len() - empty_guide.len();
-
-    let filepos = first_b + insert_delta;
-    let full_guide = format!(
-        "<guide><reference title=\"IndexName\" type=\"index\"  filepos={:010} /></guide>",
-        filepos
-    );
-
-    let mut result = Vec::with_capacity(text_bytes.len() + insert_delta);
-    result.extend_from_slice(&text_bytes[..guide_pos]);
-    result.extend_from_slice(full_guide.as_bytes());
-    result.extend_from_slice(&text_bytes[guide_pos + empty_guide.len()..]);
     result
 }
 
