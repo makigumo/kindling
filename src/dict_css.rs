@@ -185,12 +185,23 @@ impl Effect {
     /// then `<b>`, `<i>`, `<u>`. Its own output for a `<p>` holding all of them
     /// is `<p bgcolor="#eee"><blockquote><font size="+3" color="red"><b><i><u>…`.
     fn markup(&self) -> (String, String) {
+        let (mut open, mut close) = self.wrapping_markup();
+        if self.indent {
+            open.insert_str(0, "<blockquote>");
+            close.push_str("</blockquote>");
+        }
+        (open, close)
+    }
+
+    /// Everything but the indent, which is outermost and belongs to the element
+    /// rather than to its contents: one `<font>` carrying size and colour, then
+    /// `<b>`, `<i>`, `<u>`.
+    ///
+    /// Split out for `<pre>`, whose indent wraps the generated wrapper instead
+    /// of the contents, while these go inside it (see [`apply`]).
+    fn wrapping_markup(&self) -> (String, String) {
         let mut open = String::new();
         let mut close = String::new();
-        if self.indent {
-            open.push_str("<blockquote>");
-            close.insert_str(0, "</blockquote>");
-        }
         // One `<font>` carries both faces, `size` before `color`, which is how
         // kindlegen writes `font-size:200%;color:red`.
         let mut font = String::new();
@@ -1111,15 +1122,30 @@ pub(crate) fn compile_style_blocks(blocks: &str) -> Compiled {
 /// carries an id stays where a link expects to find it. Nothing else in the
 /// markup moves, which matters because dictionary entry offsets are measured
 /// on these bytes afterwards.
+///
+/// The exception is `<pre>`, which kindlegen does not ship at all: it is
+/// replaced by a spacer, the indent, `<div align="left"><tt>` and
+/// `</tt></div>`, with its whitespace spelled out first (see
+/// [`encode_pre_text`]).
 pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
     // A stylesheet with nothing in it still has the entries' own `style`
     // attributes to compile, so the scan for one is what decides whether there
-    // is any work at all.
-    if html.is_empty() || (effects.is_empty() && !might_carry_style(html)) {
+    // is any work at all. A `<pre>` is work on its own: kindlegen transliterates
+    // it whether or not any rule reaches it.
+    if html.is_empty()
+        || (effects.is_empty() && !might_carry_style(html) && !might_contain_pre(html))
+    {
         return Cow::Borrowed(html);
     }
+    // The whitespace kindlegen writes in place of `<pre>` text changes these
+    // bytes, so it is done first and everything else works on the result.
+    let encoded = encode_pre_text(html);
+    let html: &str = &encoded;
     // (offset, text) pairs, collected in document order.
     let mut inserts: Vec<(usize, String)> = Vec::new();
+    // Source ranges to leave out: the `<pre>` tags themselves, which kindlegen
+    // translates into markup rather than keeping.
+    let mut drops: Vec<(usize, usize)> = Vec::new();
     // The element each open tag is waiting for, the markup to close it with,
     // and the spacer its bottom margin puts after it.
     let mut open_stack: Vec<(String, String, Option<String>)> = Vec::new();
@@ -1127,7 +1153,11 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
     crate::links::for_each_tag(html, |tag, attrs| {
         if tag.closing {
             if let Some(at) = open_stack.iter().rposition(|(n, _, _)| *n == tag.name) {
-                let (_, close, spacer) = open_stack.remove(at);
+                let (name, close, spacer) = open_stack.remove(at);
+                if name == "pre" {
+                    // The close the pre was opened with replaces this tag.
+                    drops.push((tag.start, tag.end));
+                }
                 if !close.is_empty() {
                     inserts.push((tag.start, close));
                 }
@@ -1140,9 +1170,52 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
             return;
         }
         if tag.self_closing {
+            // A `<pre/>` has no contents for a wrapper to hold, so kindlegen
+            // writes its spacer and no more.
+            if tag.name == "pre" {
+                let top = effects
+                    .get("pre", attrs)
+                    .and_then(|e| e.height)
+                    .unwrap_or_else(|| "0".to_string());
+                drops.push((tag.start, tag.end));
+                inserts.push((tag.start, format!("<div height=\"{top}\"></div>")));
+            }
             return;
         }
-        let Some(effect) = effects.get(&tag.name, attrs) else {
+        let effect = effects.get(&tag.name, attrs);
+        // `<pre>` is the one element kindlegen does not keep. MOBI has no
+        // `<pre>`, so it says the element in markup instead: a spacer for the
+        // top margin (there is no element left to carry `height`), the indent,
+        // then `<div align="left"><tt>`. Measured against kindlegen's own
+        // output, including a `<pre>` no rule touches.
+        if tag.name == "pre" {
+            let effect = effect.unwrap_or_default();
+            drops.push((tag.start, tag.end));
+            let top = effect.height.as_deref().unwrap_or("0");
+            let mut open = format!("<div height=\"{top}\"></div>");
+            if effect.indent {
+                open.push_str("<blockquote>");
+            }
+            open.push_str("<div align=\"left\"><tt>");
+            inserts.push((tag.start, open));
+            // Size, colour, bold, italic and underline go inside the `<tt>`,
+            // where kindlegen puts them; the indent wraps the wrapper instead.
+            let (wrapping_open, mut close) = effect.wrapping_markup();
+            if !wrapping_open.is_empty() {
+                inserts.push((tag.end, wrapping_open));
+            }
+            // kindlegen's own nesting is crossed here: it closes the
+            // `<blockquote>` before the `<div>` and `<tt>` it opened inside it,
+            // so `</blockquote></tt></div>` is what it writes. Kept as measured,
+            // since a parser closes the same elements either way.
+            if effect.indent {
+                close.push_str("</blockquote>");
+            }
+            close.push_str("</tt></div>");
+            open_stack.push(("pre".to_string(), close, effect.trailing_spacer()));
+            return;
+        }
+        let Some(effect) = effect else {
             return;
         };
         // `bgcolor` belongs on the element itself, so it goes just inside the
@@ -1177,25 +1250,161 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
         }
     }
 
-    if inserts.is_empty() {
-        return Cow::Borrowed(html);
+    if inserts.is_empty() && drops.is_empty() {
+        return encoded;
     }
     // A stable sort keeps two insertions at the same offset in the order they
     // were found, which is what makes the nesting come out right.
     inserts.sort_by_key(|(at, _)| *at);
+    drops.sort_by_key(|(from, _)| *from);
 
     let mut out = String::with_capacity(html.len() + inserts.len() * 12);
     let mut cursor = 0usize;
+    let mut next_drop = 0usize;
     for (at, text) in inserts {
         if at < cursor || at > html.len() {
             continue;
         }
-        out.push_str(&html[cursor..at]);
+        copy_upto(&mut out, html, cursor, at, &drops, &mut next_drop);
         out.push_str(&text);
         cursor = at;
     }
-    out.push_str(&html[cursor..]);
+    copy_upto(&mut out, html, cursor, html.len(), &drops, &mut next_drop);
     Cow::Owned(out)
+}
+
+/// Copy `html[from..to]` to `out`, leaving out the ranges in `drops` that fall
+/// inside it.
+fn copy_upto(
+    out: &mut String,
+    html: &str,
+    from: usize,
+    to: usize,
+    drops: &[(usize, usize)],
+    next_drop: &mut usize,
+) {
+    let mut at = from;
+    while *next_drop < drops.len() && drops[*next_drop].1 <= at {
+        *next_drop += 1;
+    }
+    while *next_drop < drops.len() && drops[*next_drop].0 < to {
+        let (start, end) = drops[*next_drop];
+        if start > at {
+            out.push_str(&html[at..start]);
+        }
+        at = at.max(end);
+        *next_drop += 1;
+        while *next_drop < drops.len() && drops[*next_drop].1 <= at {
+            *next_drop += 1;
+        }
+    }
+    if at < to {
+        out.push_str(&html[at..to]);
+    }
+}
+
+/// Whether the markup has a `<pre>` for [`apply`] to transliterate.
+///
+/// Cheap enough to run on every entry: the full scan only happens when the four
+/// bytes are actually there.
+fn might_contain_pre(html: &str) -> bool {
+    html.as_bytes()
+        .windows(4)
+        .any(|w| w.eq_ignore_ascii_case(b"<pre"))
+}
+
+/// Encode the whitespace of `<pre>` contents the way kindlegen does.
+///
+/// MOBI has no `<pre>` and the popup has no stylesheet, so the whitespace has to
+/// be spelled in markup: a newline becomes `<br/>`, a tab becomes
+/// `&nbsp; &nbsp; ` and a carriage return is dropped. A run of spaces alternates
+/// a plain space with `&nbsp;` so that a collapsing reader cannot eat it.
+///
+/// The phase of that alternation is measured, not derived. The first space of a
+/// run is `&nbsp;` when the run follows a tag or the start of the element, and a
+/// plain space when it follows text; from there it alternates. So two spaces at
+/// an element's start are `&nbsp;&nbsp;`, two after a word are ` &nbsp;`, and a
+/// single space at an element's start is a lone `&nbsp;` — a run of one, where a
+/// toggle would write a plain space that collapses away. A tab or a newline
+/// puts the next run back at the start-of-element phase; a form feed or any
+/// other character does not, and is written as it is.
+fn encode_pre_text(html: &str) -> Cow<'_, str> {
+    if !might_contain_pre(html) {
+        return Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    // Whether the last thing written inside the `<pre>` was a tag or the
+    // element's own start, which is what decides the next run's phase.
+    let mut after_tag = true;
+    crate::links::for_each_tag(html, |tag, _attrs| {
+        let gap = &html[cursor..tag.start];
+        if depth == 0 {
+            out.push_str(gap);
+        } else {
+            encode_pre_run(gap, &mut after_tag, &mut out);
+        }
+        out.push_str(&html[tag.start..tag.end]);
+        if tag.name == "pre" {
+            if tag.closing {
+                depth = depth.saturating_sub(1);
+            } else if !tag.self_closing {
+                depth += 1;
+            }
+        }
+        after_tag = true;
+        cursor = tag.end;
+    });
+    let tail = &html[cursor..];
+    if depth == 0 {
+        out.push_str(tail);
+    } else {
+        encode_pre_run(tail, &mut after_tag, &mut out);
+    }
+    Cow::Owned(out)
+}
+
+/// Encode one run of `<pre>` text, which is everything between two tags.
+fn encode_pre_run(text: &str, after_tag: &mut bool, out: &mut String) {
+    // How many spaces the run has written so far, which is the phase of the
+    // alternation.
+    let mut run = 0usize;
+    for c in text.chars() {
+        match c {
+            // A carriage return is dropped; `\r\n` leaves the newline's
+            // `<br/>` behind, which is why kindlegen's output has one for a
+            // CRLF line ending and none for a lone CR. It still ends whatever
+            // run it sits in, and puts the next one at the after-text phase:
+            // measured, `"><space><CR><space>"` writes `&nbsp; `, not
+            // `&nbsp;&nbsp;`.
+            '\r' => {
+                run = 0;
+                *after_tag = false;
+            }
+            '\n' => {
+                out.push_str("<br/>");
+                run = 0;
+                *after_tag = true;
+            }
+            '\t' => {
+                out.push_str("&nbsp; &nbsp; ");
+                run = 0;
+                *after_tag = false;
+            }
+            ' ' => {
+                let nbsp = run % 2 == 1 || (run == 0 && *after_tag);
+                out.push_str(if nbsp { "&nbsp;" } else { " " });
+                run += 1;
+                *after_tag = false;
+            }
+            c => {
+                out.push(c);
+                run = 0;
+                *after_tag = false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1278,6 +1487,155 @@ mod tests {
             apply("<p>COMBO</p>", &effects_of(css)),
             r##"<p bgcolor="#eee"><blockquote><font size="+3" color="red"><b><i><u>COMBO</u></i></b></font></blockquote></p>"##
         );
+    }
+
+    /// A `<pre>` is the one element kindlegen does not keep: MOBI has no
+    /// `<pre>` and the popup no stylesheet, so it is replaced by a spacer for
+    /// the top margin, the indent, and `<div align="left"><tt>`. Its whitespace
+    /// is spelled out at the same time. Every expectation below is kindlegen's
+    /// own output for the same source.
+    #[test]
+    fn a_pre_becomes_a_spacer_and_a_tt_wrapper() {
+        // No stylesheet and no `style` attribute: the element still goes.
+        assert_eq!(
+            apply("<pre>x</pre>", &effects_of("")),
+            r#"<div height="0"></div><div align="left"><tt>x</tt></div>"#
+        );
+        // The tags go, the id goes with them, and the text stays.
+        assert_eq!(
+            apply(r#"<pre id="k" class="c">x</pre>"#, &effects_of("")),
+            r#"<div height="0"></div><div align="left"><tt>x</tt></div>"#
+        );
+        // A `<pre/>` has no contents for a wrapper to hold, so only the spacer
+        // is written.
+        assert_eq!(
+            apply("<pre/>x", &effects_of("")),
+            r#"<div height="0"></div>x"#
+        );
+    }
+
+    #[test]
+    fn a_pre_carries_its_margins_as_spacers_around_the_wrapper() {
+        // The top margin cannot go on the element, because there is no element
+        // left to carry it. kindlegen's own nesting is crossed here:
+        // `</blockquote>` closes before the `<div>` and `<tt>` it was opened
+        // outside of, and that is what it writes.
+        assert_eq!(
+            apply(
+                r#"<pre style="margin:20px 1em 30px 1em">x</pre>"#,
+                &effects_of("")
+            ),
+            r#"<div height="20"></div><blockquote><div align="left"><tt>x</blockquote></tt></div><div height="30"></div>"#
+        );
+    }
+
+    #[test]
+    fn a_pre_wraps_its_contents_inside_the_tt() {
+        // Size, colour, bold, italic and underline go inside the `<tt>`, where
+        // kindlegen puts them.
+        assert_eq!(
+            apply(
+                r#"<pre style="font-size:260%;font-weight:bold;color:red">x</pre>"#,
+                &effects_of("")
+            ),
+            r#"<div height="0"></div><div align="left"><tt><font size="+3" color="red"><b>x</b></font></tt></div>"#
+        );
+    }
+
+    #[test]
+    fn a_pre_nested_in_another_element_wraps_where_it_stands() {
+        assert_eq!(
+            apply("<div><pre>x</pre></div>", &effects_of("")),
+            r#"<div><div height="0"></div><div align="left"><tt>x</tt></div></div>"#
+        );
+    }
+
+    #[test]
+    fn an_unclosed_pre_is_closed_at_the_end() {
+        // Source markup that forgets `</pre>` must not leave the wrapper open
+        // into the rest of the book.
+        assert_eq!(
+            apply("<pre>x", &effects_of("")),
+            r#"<div height="0"></div><div align="left"><tt>x</tt></div>"#
+        );
+    }
+
+    #[test]
+    fn pre_whitespace_is_spelled_out() {
+        // A run of spaces alternates a plain space with `&nbsp;` so a
+        // collapsing reader cannot eat it, and the phase comes from what the
+        // run follows: two spaces at the element's start are `&nbsp;&nbsp;`,
+        // two after a word are ` &nbsp;`, and a single space at the element's
+        // start is one `&nbsp;`.
+        for (body, expected) in [
+            (" a", "&nbsp;a"),
+            ("  a", "&nbsp;&nbsp;a"),
+            ("   a", "&nbsp;&nbsp; a"),
+            ("a b", "a b"),
+            ("a  b", "a &nbsp;b"),
+            ("a   b", "a &nbsp; b"),
+            ("a  ", "a &nbsp;"),
+            // A tab is invariant: it always writes nbsp, space, nbsp, space.
+            ("a\tb", "a&nbsp; &nbsp; b"),
+            ("\ta", "&nbsp; &nbsp; a"),
+            // A newline is a `<br/>`, and puts the next run back at the
+            // start-of-element phase.
+            ("a\nb", "a<br/>b"),
+            ("a\n\nb", "a<br/><br/>b"),
+            ("\n  a", "<br/>&nbsp;&nbsp;a"),
+            ("a \nb", "a <br/>b"),
+            // A carriage return is dropped, but it still ends a run.
+            ("a\rb", "ab"),
+            (" \r ", "&nbsp; "),
+            ("a\r\nb", "a<br/>b"),
+        ] {
+            let html = format!("<pre>{body}</pre>");
+            assert_eq!(
+                apply(&html, &effects_of("")),
+                format!(r#"<div height="0"></div><div align="left"><tt>{expected}</tt></div>"#),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_whitespace_is_encoded_around_nested_elements() {
+        // The encoding is per text run, and a tag ends the run: two spaces
+        // after a nested element start at the element-start phase, and the
+        // tab inside one is written the same way.
+        assert_eq!(
+            apply("<pre>a <span>b</span>  c</pre>", &effects_of("")),
+            concat!(
+                r#"<div height="0"></div><div align="left"><tt>a <span>b</span>"#,
+                "&nbsp;&nbsp;c</tt></div>"
+            )
+        );
+        assert_eq!(
+            apply("<pre><span>a\tb</span></pre>", &effects_of("")),
+            concat!(
+                r#"<div height="0"></div><div align="left"><tt><span>"#,
+                "a&nbsp; &nbsp; b</span></tt></div>"
+            )
+        );
+    }
+
+    #[test]
+    fn only_pre_is_transliterated() {
+        // The monospace elements beside it are left exactly as written: this
+        // is `<pre>`'s rewrite alone, measured element by element.
+        for element in [
+            "tt",
+            "code",
+            "kbd",
+            "samp",
+            "var",
+            "listing",
+            "xmp",
+            "plaintext",
+        ] {
+            let html = format!("<{element}>x</{element}>");
+            assert_eq!(apply(&html, &effects_of("")), html, "{element}");
+        }
     }
 
     #[test]
