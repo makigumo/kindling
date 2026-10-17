@@ -26,6 +26,7 @@
 //! | `margin-left` | `<blockquote>` around the contents |
 //! | `margin-top` (and `margin`) | `height="…"` on the element itself |
 //! | `margin-bottom` (and `margin`) | a `<div height="…"></div>` after the element |
+//! | `text-align` | `align="…"` on the element itself, only on `p`, `div`, `td`, `tr`, `blockquote` and `h1`–`h6` |
 //!
 //! Each mapping is one kindlegen was measured to make, nesting order included:
 //! for a `<p>` carrying all of them kindlegen writes `<p height="20"
@@ -53,6 +54,46 @@
 //! way the cascade would: a class selector beats a bare element selector, more
 //! classes beat fewer, and a selector that also names an element beats one that
 //! does not. Rules of equal specificity keep source order, later winning.
+//!
+//! An element's own `style="…"` attribute is compiled too, and it is the most
+//! specific declaration there is, so it is folded on last and wins over every
+//! rule that matched. Without that, an entry that styles an element inline
+//! loses the styling entirely, because `strip_idx_markup` takes `style`
+//! attributes out of the shipped entries (issue #6: the library-search preview
+//! bails on them) — the declarations reach neither the popup nor the sheet.
+//! Measured against kindlegen 2.9, the attribute resolves to exactly the tags
+//! and nesting the same declarations get from a rule: `style="font-size:260%"`
+//! is `<font size="+3">`, `style="color:red"` is `<font color="red">`, and one
+//! attribute holding all of them gives `<span height="20" bgcolor="#eee">
+//! <blockquote><font size="+3" color="red"><b><i>…`, inline on the entry
+//! wrapper itself included. A declaration it cannot compile — `padding-left: 2em`
+//! — produces no markup and takes the attribute down with it, as kindlegen does,
+//! so nothing about it reaches the reader either way. The one place this is
+//! deliberately not kindlegen is the degenerate case: kindlegen writes a
+//! `style` attribute that holds no declaration at all (`style=""`, `style=";"`)
+//! back verbatim, and kindling strips it with every other attribute, which is
+//! what the preview needs and what costs nothing to render.
+//!
+//! `text-align` becomes the element's own `align` attribute, but only on the
+//! elements kindlegen writes one for. Measured one element at a time on
+//! kindlegen 2.9: `p`, `div`, `td`, `tr`, `blockquote` and `h1`–`h6` carry the
+//! attribute, while `th`, `li`, `table`, every inline element and an element
+//! name no stylesheet knows (`<foo>`) get nothing. That is a whitelist, not
+//! "anything that is not inline". The value is written through as it was
+//! declared, the way a colour is (`center`, `CENTER`, `justify`, even `foo`),
+//! and a trailing `!important` is dropped — kindlegen drops it from every
+//! property, `color` and `font-size` included. An element that already carries
+//! an `align` attribute keeps it: kindlegen does not write a second one, and
+//! a second `align` is invalid markup anyway.
+//!
+//! Because which elements can carry the attribute is only known while `apply`
+//! walks the markup, the residual sheet is decided more coarsely: a rule naming
+//! an element outside the whitelist (`span`, `li`, `table`) keeps its
+//! `text-align` declaration, since there is nothing it could compile to; a
+//! class rule compiles, because the element that carries the class is not known
+//! until it is matched. A class rule that ends up on a `p` gets the attribute,
+//! and the same rule on a `span` gets nothing, which is exactly what kindlegen
+//! does with one class and two elements.
 //!
 //! Declarations that are compiled are removed from the stylesheet that ships,
 //! so a reader that *does* apply CSS cannot also apply the inline tag and
@@ -83,6 +124,9 @@ pub(crate) struct Effect {
     /// A bottom margin, as the value of a spacer `<div>` written after the
     /// element.
     pub spacer: Option<String>,
+    /// `text-align`, verbatim, for the element's own `align` attribute. Only
+    /// some elements carry one; see [`carries_align`].
+    pub align: Option<String>,
 }
 
 impl Effect {
@@ -96,6 +140,7 @@ impl Effect {
             && !self.indent
             && self.height.is_none()
             && self.spacer.is_none()
+            && self.align.is_none()
     }
 
     /// Fold `other` over this, `other` winning.
@@ -122,6 +167,9 @@ impl Effect {
         }
         if other.spacer.is_some() {
             self.spacer = other.spacer.clone();
+        }
+        if other.align.is_some() {
+            self.align = other.align.clone();
         }
         self.bold |= other.bold;
         self.italic |= other.italic;
@@ -175,24 +223,35 @@ impl Effect {
 
     /// The attributes to add to the element's own start tag, if any.
     ///
-    /// Two declarations that are not wrapped around the contents, because
+    /// Three declarations are not wrapped around the contents, because
     /// kindlegen puts them on the element itself: a top margin becomes
-    /// `height`, and `background-color` becomes `bgcolor`. Measured, in that
-    /// order however the declarations were written — `<span
-    /// style="background-color:#eee;margin-top:20px">` and the reverse both
-    /// ship as `<span height="20" bgcolor="#eee">` — so these have to land
-    /// before the `>` that closes the start tag. The `bgcolor` half is also the
-    /// reason the IDA work found the writer reading a colour out of its style
-    /// struct in the branch that emits `bgcolor`.
-    fn start_attributes(&self) -> Option<String> {
-        let mut attrs = String::new();
+    /// `height`, `text-align` becomes `align`, and `background-color` becomes
+    /// `bgcolor`. Measured, in that order however the declarations were written
+    /// — `<p style="background-color:#eee;margin-top:20px;text-align:center">`
+    /// and the reverse both ship as
+    /// `<p height="20" align="center" bgcolor="#eee">` — so these have to
+    /// land before the `>` that closes the start tag. The `bgcolor` half is
+    /// also the reason the IDA work found the writer reading a colour out of
+    /// its style struct in the branch that emits `bgcolor`.
+    ///
+    /// `align` needs two things the other two do not: the element has to be one
+    /// kindlegen writes the attribute on ([`carries_align`]), and it must not
+    /// already have an `align` of its own, which kindlegen leaves alone rather
+    /// than overriding with the stylesheet's value.
+    fn start_attributes(&self, element: &str, attrs: &str) -> Option<String> {
+        let mut out = String::new();
         if let Some(h) = &self.height {
-            attrs.push_str(&format!(" height=\"{}\"", h));
+            out.push_str(&format!(" height=\"{}\"", h));
+        }
+        if let Some(a) = &self.align {
+            if carries_align(element) && !has_attribute(attrs, "align") {
+                out.push_str(&format!(" align=\"{}\"", a));
+            }
         }
         if let Some(c) = &self.background {
-            attrs.push_str(&format!(" bgcolor=\"{}\"", c));
+            out.push_str(&format!(" bgcolor=\"{}\"", c));
         }
-        (!attrs.is_empty()).then_some(attrs)
+        (!out.is_empty()).then_some(out)
     }
 
     /// The spacer `kindlegen` writes after an element with a bottom margin.
@@ -318,6 +377,22 @@ fn is_class_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The elements kindlegen writes a legacy `align` attribute on.
+///
+/// Measured one element at a time on kindlegen 2.9, and it is a short list:
+/// `p`, `div`, `td`, `tr`, `blockquote` and `h1`–`h6`. Every other element was
+/// left alone, including the ones that are also block-level in CSS (`li`,
+/// `table`, `th`, `section`, `pre`) and, of course, the inline ones. An element
+/// name no stylesheet knows (`<foo>`) gets nothing either, which is what makes
+/// this a whitelist rather than a test for "not inline".
+///
+/// `element` is the name `for_each_tag` reports, which is already lowercased,
+/// and every selector that reaches here is lowercased by `parse_selector`.
+fn carries_align(element: &str) -> bool {
+    matches!(element, "p" | "div" | "td" | "tr" | "blockquote")
+        || matches!(element.as_bytes(), [b'h', b'1'..=b'6'])
+}
+
 /// A rule keyed by a class selector, kept in source order.
 struct ClassRule {
     /// The element the selector requires, as in `span.def`.
@@ -391,46 +466,69 @@ impl Effects {
         }
     }
 
-    /// The effect an element should carry, if any rule matches it.
+    /// The effect an element should carry, if any rule matches it or its own
+    /// `style` attribute asks for one.
     ///
     /// `attrs` is the element's raw attribute text. It is only parsed when a
-    /// class rule exists, so a stylesheet of element selectors alone costs
+    /// class rule exists or a `style` attribute might, so a stylesheet of
+    /// element selectors alone over markup with no inline styles still costs
     /// nothing extra on the way through a dictionary's half a million entries.
     fn get(&self, element: &str, attrs: &str) -> Option<Effect> {
         let mut effect = self.elements.get(element).cloned();
-        if self.classes.is_empty() {
+
+        if self.classes.is_empty() && !might_carry_style(attrs) {
             return effect;
         }
-        let classes = class_names(attrs);
-        if classes.is_empty() {
-            return effect;
+        let (classes, style) = attribute_values(attrs);
+
+        if !self.classes.is_empty() && !classes.is_empty() {
+            // Everything that matches, weakest first: a class selector beats a
+            // bare element selector, and one requiring more classes beats one
+            // requiring fewer. Source order decides between equal specificity,
+            // which a stable sort preserves.
+            let mut matched: Vec<&ClassRule> = self
+                .classes
+                .iter()
+                .filter(|r| {
+                    r.element.as_deref().is_none_or(|e| e == element)
+                        && r.classes.iter().all(|c| classes.contains(c))
+                })
+                .collect();
+            matched.sort_by_key(|r| (r.classes.len(), r.element.is_some()));
+
+            for rule in matched {
+                match &mut effect {
+                    Some(e) => e.merge(&rule.effect),
+                    None => effect = Some(rule.effect.clone()),
+                }
+            }
         }
 
-        // Everything that matches, weakest first: a class selector beats a bare
-        // element selector, and one requiring more classes beats one requiring
-        // fewer. Source order decides between equal specificity, which a stable
-        // sort preserves.
-        let mut matched: Vec<&ClassRule> = self
-            .classes
-            .iter()
-            .filter(|r| {
-                r.element.as_deref().is_none_or(|e| e == element)
-                    && r.classes.iter().all(|c| classes.contains(c))
-            })
-            .collect();
-        matched.sort_by_key(|r| (r.classes.len(), r.element.is_some()));
-
-        for rule in matched {
-            match &mut effect {
-                Some(e) => e.merge(&rule.effect),
-                None => effect = Some(rule.effect.clone()),
+        // The element's own `style` attribute is the most specific declaration
+        // there is, so it goes on last and wins over everything that matched.
+        // Measured: kindlegen resolves an inline `font-size: 260%` into
+        // `<font size="+3">` even when a rule for the same element asked for
+        // 150%, and an inline `font-weight: bold` beside an element's own
+        // `color` rule gives `<font color="…"><b>`.
+        if let Some(style) = style {
+            // An inline declaration has no sheet to fall back into, so whether
+            // the element could carry an `align` is not a reason to refuse it;
+            // `start_attributes` decides what actually ships.
+            let (own, _) = compile_declarations(style, true);
+            if !own.is_empty() {
+                match &mut effect {
+                    Some(e) => e.merge(&own),
+                    None => effect = Some(own),
+                }
             }
         }
         effect
     }
 }
 
-/// The tokens of an element's `class` attribute, lowercased.
+/// The two attribute values the compiler can read, taken in one pass over an
+/// element's attribute list: the `class` tokens, lowercased, and the raw value
+/// of an element's own `style` attribute.
 ///
 /// This is a scanner rather than a search for `class=` because that string
 /// turns up inside other attributes' values; it walks the attribute list the
@@ -440,10 +538,14 @@ impl Effects {
 /// case-sensitive. Element names here are folded the same way, and a sheet
 /// written as `.Def` against markup that says `class="Def"` agrees either way;
 /// folding only stops a sheet and its markup that disagree in case from
-/// silently doing nothing.
-fn class_names(attrs: &str) -> Vec<String> {
+/// silently doing nothing. Attribute *names* are folded for the same reason: a
+/// document may spell either one `STYLE=`. A `style` attribute written twice
+/// keeps the first, which is not worth a rule because the markup is malformed
+/// either way.
+fn attribute_values(attrs: &str) -> (Vec<String>, Option<&str>) {
     let bytes = attrs.as_bytes();
     let mut out: Vec<String> = Vec::new();
+    let mut style: Option<&str> = None;
     let mut i = 0usize;
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
@@ -498,9 +600,84 @@ fn class_names(attrs: &str) -> Vec<String> {
                     .split_whitespace()
                     .map(|t| t.to_ascii_lowercase()),
             );
+        } else if name.eq_ignore_ascii_case("style") && style.is_none() {
+            style = Some(&attrs[value_start..value_end]);
         }
     }
-    out
+    (out, style)
+}
+
+/// Whether an attribute list could hold a `style` attribute.
+///
+/// A case-insensitive substring test, used to skip the attribute walk for the
+/// element that has no `style` at all, which is nearly all of them. It scans
+/// bytes rather than allocating a lowercased copy, and cannot reject a real
+/// attribute: an attribute name is written literally, with no escapes and no
+/// entities, so a `style` attribute always contains those five bytes in some
+/// case.
+fn might_carry_style(attrs: &str) -> bool {
+    attrs
+        .as_bytes()
+        .windows(5)
+        .any(|w| w.eq_ignore_ascii_case(b"style"))
+}
+
+/// Whether an attribute list already has an attribute by this name.
+///
+/// Walks the list the way [`attribute_values`] does — name, then the value it
+/// may be followed by, skipped whole — so `data-align="x"` and `title='align'`
+/// are not mistaken for the attribute itself. Only reached when an effect wants
+/// to write `align`, so the extra walk costs nothing on the entries that do not
+/// ask for one.
+fn has_attribute(attrs: &str, wanted: &str) -> bool {
+    let bytes = attrs.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &attrs[name_start..i];
+        if name.eq_ignore_ascii_case(wanted) {
+            return true;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            // A valueless attribute; the next iteration reads the next name.
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 /// What `compile` produced: the effects to inline, and the stylesheet left
@@ -556,11 +733,31 @@ fn declarations(block: &str) -> Vec<(String, String, String)> {
             let (name, value) = d.split_once(':')?;
             Some((
                 name.trim().to_ascii_lowercase(),
-                value.trim().to_string(),
+                without_important(value.trim()).to_string(),
                 d.to_string(),
             ))
         })
         .collect()
+}
+
+/// Drop a trailing `!important` from a declaration's value.
+///
+/// Measured: kindlegen drops it from every property it compiles —
+/// `color:red !important` ships as `<font color="red">` and
+/// `text-align:center !important` as `align="center"` — so this is done once
+/// for the whole declaration list rather than in one property's branch. The
+/// original text of an uncompiled declaration, `!important` included, is what
+/// goes back into the sheet.
+fn without_important(value: &str) -> &str {
+    let trimmed = value.trim_end();
+    let Some(bang) = trimmed.rfind('!') else {
+        return trimmed;
+    };
+    if trimmed[bang + 1..].trim().eq_ignore_ascii_case("important") {
+        trimmed[..bang].trim_end()
+    } else {
+        trimmed
+    }
 }
 
 /// Split `selectors { body }` apart, counting braces rather than scanning for
@@ -587,15 +784,17 @@ fn matching_block(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// A colour declaration's value, ready to sit inside an attribute.
+/// A declaration's value, ready to sit inside an attribute.
 ///
 /// kindlegen passes the value through untranslated — measured: `red`, `#ff0000`
 /// and even `rgb(255,0,0)` and `transparent` all reach the shipped text as
-/// written — so nothing is normalised or validated against a colour table here.
+/// written, and so do `text-align`'s `center`, `CENTER`, `justify` and `foo` —
+/// so nothing is normalised or validated here.
+///
 /// A value carrying a quote or an angle bracket is refused instead, because it
 /// would close the attribute and let the rest of the declaration escape into
 /// the markup.
-fn color_value(value: &str) -> Option<String> {
+fn attribute_value(value: &str) -> Option<String> {
     let v = value.trim();
     if v.is_empty() || v.contains(['"', '\'', '<', '>']) {
         return None;
@@ -674,6 +873,116 @@ fn margin_sides(value: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
     }
 }
 
+/// Compile one declaration list — the body of a rule, or the value of an
+/// element's own `style` attribute — into the effect it asks for, plus the
+/// text of every declaration it could not compile.
+///
+/// The two callers differ only in what they do with the leftovers: a rule puts
+/// them back into the stylesheet it ships, while an inline style has no sheet
+/// to put them in and drops them with the attribute. Measured, kindlegen does
+/// the same: an element whose style holds only `padding-left: 2em` ships with
+/// no attribute and no markup, so nothing about that declaration reaches the
+/// reader either way.
+///
+/// `align_expressible` says whether the declarations belong to something that
+/// can become an `align` attribute — a rule naming an element kindlegen aligns,
+/// or a class rule, whose element is not known until it is matched. When it is
+/// false, `text-align` is left in the leftovers rather than silently dropped.
+fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<String>) {
+    let mut effect = Effect::default();
+    let mut kept: Vec<String> = Vec::new();
+    for (prop, value, original) in declarations(block) {
+        let mut consumed = true;
+        match prop.as_str() {
+            // Only an element kindlegen writes `align` on can express this.
+            // A rule for one that cannot keeps the declaration in the sheet,
+            // where the book view still applies it; a class rule passes `true`
+            // because the element it lands on is not known yet.
+            "text-align" if align_expressible => match attribute_value(&value) {
+                Some(a) => effect.align = Some(a),
+                None => consumed = false,
+            },
+            "font-size" => match size_delta(&value) {
+                Some(d) => effect.size = Some(d),
+                None => consumed = false,
+            },
+            "font-weight" => {
+                let bold = value == "bold"
+                    || value == "bolder"
+                    || value.parse::<u32>().map(|n| n >= 600).unwrap_or(false);
+                if bold {
+                    effect.bold = true;
+                } else {
+                    consumed = false;
+                }
+            }
+            "font-style" => {
+                if value == "italic" || value == "oblique" {
+                    effect.italic = true;
+                } else {
+                    consumed = false;
+                }
+            }
+            "text-decoration" | "text-decoration-line" => {
+                if value.split_whitespace().any(|w| w == "underline") {
+                    effect.underline = true;
+                } else {
+                    consumed = false;
+                }
+            }
+            "color" => match attribute_value(&value) {
+                Some(c) => effect.color = Some(c),
+                None => consumed = false,
+            },
+            "background-color" => match attribute_value(&value) {
+                Some(c) => effect.background = Some(c),
+                None => consumed = false,
+            },
+            "margin-top" => match height_value(&value) {
+                Some(h) => effect.height = Some(h),
+                None => consumed = false,
+            },
+            "margin-bottom" => match height_value(&value) {
+                Some(h) => effect.spacer = Some(h),
+                None => consumed = false,
+            },
+            "margin-left" => {
+                if height_value(&value).is_some() {
+                    effect.indent = true;
+                } else {
+                    consumed = false;
+                }
+            }
+            // All three vertical and horizontal sides come out of the one
+            // declaration, so it is consumed if any of them was expressed.
+            "margin" => {
+                let (top, bottom, left) = margin_sides(&value);
+                let mut expressed = false;
+                if let Some(h) = top.and_then(height_value) {
+                    effect.height = Some(h);
+                    expressed = true;
+                }
+                if let Some(h) = bottom.and_then(height_value) {
+                    effect.spacer = Some(h);
+                    expressed = true;
+                }
+                if left.and_then(height_value).is_some() {
+                    effect.indent = true;
+                    expressed = true;
+                }
+                if !expressed {
+                    consumed = false;
+                }
+            }
+            _ => consumed = false,
+        }
+        if !consumed {
+            kept.push(original);
+        }
+    }
+    (effect, kept)
+}
+
 /// Compile a stylesheet into inline effects plus whatever is left of it.
 ///
 /// Later rules win over earlier ones for the same selector, which is the
@@ -714,89 +1023,14 @@ pub(crate) fn compile(css: &str) -> Compiled {
             continue;
         };
 
-        let mut effect = Effect::default();
-        let mut kept: Vec<String> = Vec::new();
-        for (prop, value, original) in declarations(block) {
-            let mut consumed = true;
-            match prop.as_str() {
-                "font-size" => match size_delta(&value) {
-                    Some(d) => effect.size = Some(d),
-                    None => consumed = false,
-                },
-                "font-weight" => {
-                    let bold = value == "bold"
-                        || value == "bolder"
-                        || value.parse::<u32>().map(|n| n >= 600).unwrap_or(false);
-                    if bold {
-                        effect.bold = true;
-                    } else {
-                        consumed = false;
-                    }
-                }
-                "font-style" => {
-                    if value == "italic" || value == "oblique" {
-                        effect.italic = true;
-                    } else {
-                        consumed = false;
-                    }
-                }
-                "text-decoration" | "text-decoration-line" => {
-                    if value.split_whitespace().any(|w| w == "underline") {
-                        effect.underline = true;
-                    } else {
-                        consumed = false;
-                    }
-                }
-                "color" => match color_value(&value) {
-                    Some(c) => effect.color = Some(c),
-                    None => consumed = false,
-                },
-                "background-color" => match color_value(&value) {
-                    Some(c) => effect.background = Some(c),
-                    None => consumed = false,
-                },
-                "margin-top" => match height_value(&value) {
-                    Some(h) => effect.height = Some(h),
-                    None => consumed = false,
-                },
-                "margin-bottom" => match height_value(&value) {
-                    Some(h) => effect.spacer = Some(h),
-                    None => consumed = false,
-                },
-                "margin-left" => {
-                    if height_value(&value).is_some() {
-                        effect.indent = true;
-                    } else {
-                        consumed = false;
-                    }
-                }
-                // All three vertical and horizontal sides come out of the one
-                // declaration, so it is consumed if any of them was expressed.
-                "margin" => {
-                    let (top, bottom, left) = margin_sides(&value);
-                    let mut expressed = false;
-                    if let Some(h) = top.and_then(height_value) {
-                        effect.height = Some(h);
-                        expressed = true;
-                    }
-                    if let Some(h) = bottom.and_then(height_value) {
-                        effect.spacer = Some(h);
-                        expressed = true;
-                    }
-                    if left.and_then(height_value).is_some() {
-                        effect.indent = true;
-                        expressed = true;
-                    }
-                    if !expressed {
-                        consumed = false;
-                    }
-                }
-                _ => consumed = false,
-            }
-            if !consumed {
-                kept.push(original);
-            }
-        }
+        // A selector that names an element cannot be any other element, so the
+        // whole rule's `text-align` is either expressible or is not. A class
+        // selector does not name one, so it may land on a `p` and has to
+        // compile. A selector list counts if any part can carry `align`.
+        let align_expressible = parsed
+            .iter()
+            .any(|s| s.element.as_deref().is_none_or(carries_align));
+        let (effect, kept) = compile_declarations(block, align_expressible);
 
         if !effect.is_empty() {
             for selector in &parsed {
@@ -870,12 +1104,18 @@ pub(crate) fn compile_style_blocks(blocks: &str) -> Compiled {
 /// Wrap the contents of every matching element in the markup its rules ask
 /// for.
 ///
+/// An element's own `style` attribute is read in the same pass, so a dictionary
+/// whose styling is entirely inline is compiled even with no stylesheet at all.
+///
 /// Insertions go inside the element rather than around it, so an element that
 /// carries an id stays where a link expects to find it. Nothing else in the
 /// markup moves, which matters because dictionary entry offsets are measured
 /// on these bytes afterwards.
 pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
-    if effects.is_empty() || html.is_empty() {
+    // A stylesheet with nothing in it still has the entries' own `style`
+    // attributes to compile, so the scan for one is what decides whether there
+    // is any work at all.
+    if html.is_empty() || (effects.is_empty() && !might_carry_style(html)) {
         return Cow::Borrowed(html);
     }
     // (offset, text) pairs, collected in document order.
@@ -908,7 +1148,7 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
         // `bgcolor` belongs on the element itself, so it goes just inside the
         // start tag's `>`. Self-closing elements were skipped above, which is
         // what makes the last byte of this span that `>`.
-        if let Some(extra) = effect.start_attributes() {
+        if let Some(extra) = effect.start_attributes(&tag.name, attrs) {
             if tag.end > tag.start && html.as_bytes().get(tag.end - 1) == Some(&b'>') {
                 inserts.push((tag.end - 1, extra));
             }
@@ -988,6 +1228,27 @@ mod tests {
             .get(element, "")
             .map(|e| e.indent)
             .unwrap_or(false)
+    }
+
+    /// The `class` tokens an attribute list carries, as the compiler reads
+    /// them.
+    fn classes_of(attrs: &str) -> Vec<String> {
+        attribute_values(attrs).0
+    }
+
+    /// The value of an attribute list's `style` attribute, as the compiler
+    /// reads it.
+    fn style_of(attrs: &str) -> Option<String> {
+        attribute_values(attrs).1.map(str::to_string)
+    }
+
+    /// The markup an entry actually ships: the compiler's insertions, then the
+    /// strip pass that runs straight after it in the build, which is what takes
+    /// the `class` and `style` attributes off the tags. Those are the bytes the
+    /// lookup popup renders, so they are the ones worth comparing against
+    /// kindlegen's.
+    fn shipped(html: &str, effects: &Effects) -> String {
+        crate::mobi::strip_idx_markup(&apply(html, effects))
     }
 
     #[test]
@@ -1352,27 +1613,59 @@ v { margin-left: 0.4em; }",
     #[test]
     fn class_names_reads_the_attribute_wherever_it_sits() {
         assert_eq!(
-            class_names(r#" class="def and more""#),
+            classes_of(r#" class="def and more""#),
             ["def", "and", "more"]
         );
-        assert_eq!(class_names(r#" class='def'"#), ["def"]);
-        assert_eq!(class_names(r#" CLASS="Def""#), ["def"]);
-        assert_eq!(class_names(" class=def"), ["def"]);
+        assert_eq!(classes_of(r#" class='def'"#), ["def"]);
+        assert_eq!(classes_of(r#" CLASS="Def""#), ["def"]);
+        assert_eq!(classes_of(" class=def"), ["def"]);
         assert_eq!(
-            class_names(r#" id="x" class="def" style="color:red""#),
+            classes_of(r#" id="x" class="def" style="color:red""#),
             ["def"]
         );
         assert_eq!(
-            class_names(r#" id="a" title="class=no""#),
+            classes_of(r#" id="a" title="class=no""#),
             Vec::<String>::new()
         );
-        assert_eq!(class_names(r#" data-class="no""#), Vec::<String>::new());
-        assert_eq!(class_names(""), Vec::<String>::new());
+        assert_eq!(classes_of(r#" data-class="no""#), Vec::<String>::new());
+        assert_eq!(classes_of(""), Vec::<String>::new());
     }
 
     #[test]
     fn class_names_skips_a_value_that_contains_a_quote() {
-        assert_eq!(class_names(r#" alt="a \"b" class="def""#), ["def"]);
+        assert_eq!(classes_of(r#" alt="a \"b" class="def""#), ["def"]);
+    }
+
+    #[test]
+    fn the_style_attribute_is_read_wherever_it_sits() {
+        // The value, not the whole attribute: `style="…"` quotes included in
+        // the slice would reach `declarations` as part of every declaration.
+        assert_eq!(
+            style_of(r#" style="color:red""#).as_deref(),
+            Some("color:red")
+        );
+        assert_eq!(
+            style_of(r#" style='color:red'"#).as_deref(),
+            Some("color:red")
+        );
+        assert_eq!(
+            style_of(r#" STYLE="color:red""#).as_deref(),
+            Some("color:red")
+        );
+        assert_eq!(
+            style_of(r#" style = "color:red""#).as_deref(),
+            Some("color:red")
+        );
+        assert_eq!(
+            style_of(r#" class="def" style="color:red" id="k""#).as_deref(),
+            Some("color:red")
+        );
+        // Nothing else named `style`, and no attribute at all.
+        assert_eq!(style_of(r#" title="style=red""#), None);
+        assert_eq!(style_of(r#" data-style="color:red""#), None);
+        assert_eq!(style_of(""), None);
+        // An empty value is still a value; only a missing attribute is `None`.
+        assert_eq!(style_of(r#" style="""#).as_deref(), Some(""));
     }
 
     #[test]
@@ -1524,6 +1817,180 @@ v { margin-left: 0.4em; }",
     }
 
     #[test]
+    fn compiles_an_elements_own_inline_style() {
+        // Measured against kindlegen 2.9: one `style` attribute holding every
+        // property comes back as the same tags, in the same nesting, that the
+        // same declarations get from a rule.
+        let html = concat!(
+            r#"<span style="font-size:260%;font-weight:bold;font-style:italic;"#,
+            r#"color:red;margin-left:1em;background-color:#eee;"#,
+            r#"margin-top:20px;margin-bottom:20px">x</span>"#
+        );
+        assert_eq!(
+            shipped(html, &Effects::default()),
+            concat!(
+                r##"<span height="20" bgcolor="#eee"><blockquote>"##,
+                r##"<font size="+3" color="red"><b><i>x</i></b></font>"##,
+                r##"</blockquote></span><div height="20"></div>"##
+            )
+        );
+    }
+
+    #[test]
+    fn an_inline_style_compiles_one_property_at_a_time() {
+        // Each of these is the markup kindlegen 2.9 writes for the same inline
+        // declaration, read off one probe at a time.
+        for (style, expected) in [
+            ("font-style:italic", "<span><i>x</i></span>"),
+            ("font-weight:bold", "<span><b>x</b></span>"),
+            ("text-decoration:underline", "<span><u>x</u></span>"),
+            ("color:red", r#"<span><font color="red">x</font></span>"#),
+            ("font-size:260%", r#"<span><font size="+3">x</font></span>"#),
+            ("margin-left:1em", "<span><blockquote>x</blockquote></span>"),
+            (
+                "background-color:#eee",
+                r##"<span bgcolor="#eee">x</span>"##,
+            ),
+            ("margin-top:20px", r#"<span height="20">x</span>"#),
+            (
+                "margin-bottom:20px",
+                r#"<span>x</span><div height="20"></div>"#,
+            ),
+            // Four sides: top becomes the height, left the blockquote, bottom
+            // the spacer, and right has no legacy form at all.
+            (
+                "margin:20px 1em 30px 1em",
+                r##"<span height="20"><blockquote>x</blockquote></span><div height="30"></div>"##,
+            ),
+        ] {
+            let html = format!(r#"<span style="{style}">x</span>"#);
+            assert_eq!(shipped(&html, &Effects::default()), expected, "{style}");
+        }
+    }
+
+    #[test]
+    fn an_inline_style_with_no_stylesheet_is_still_compiled() {
+        // A dictionary whose styling is all inline ships no `<style>` block, so
+        // there are no rules to compile and the attribute is all there is.
+        let effects = Effects::default();
+        assert!(effects.is_empty());
+        assert_eq!(
+            shipped(
+                r#"<div class="sense" style="margin-left:1em">s</div>"#,
+                &effects
+            ),
+            "<div><blockquote>s</blockquote></div>"
+        );
+    }
+
+    #[test]
+    fn an_inline_style_beats_every_rule_that_matched() {
+        // Inline declarations are the most specific there are: measured,
+        // kindlegen resolves an inline `font-size:260%` to `<font size="+3">`
+        // over a sheet rule asking for 150%, and over the same class rule.
+        for css in ["span { font-size: 150%; }", ".def { font-size: 150%; }"] {
+            assert_eq!(
+                shipped(
+                    r#"<span class="def" style="font-size:260%">x</span>"#,
+                    &effects_of(css)
+                ),
+                r#"<span><font size="+3">x</font></span>"#,
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_class_rule_and_an_inline_style_both_apply() {
+        // Different properties, so neither has anything to override: measured,
+        // kindlegen writes `<b><i>x</i></b>` for this pair of declarations.
+        assert_eq!(
+            shipped(
+                r#"<span class="def" style="font-style:italic">x</span>"#,
+                &effects_of(".def { font-weight: bold; }")
+            ),
+            "<span><b><i>x</i></b></span>"
+        );
+    }
+
+    #[test]
+    fn an_inline_declaration_the_popup_cannot_use_compiles_to_nothing() {
+        // Measured: kindlegen ships `<span>x</span>` for all three of these,
+        // with no markup and no attribute, so nothing was compiled and nothing
+        // was lost with the declarations.
+        let e = Effects::default();
+        for style in [
+            "padding-left:2em;text-align:center",
+            "font-size:12pt",
+            "margin:0.3em 0",
+        ] {
+            let html = format!(r#"<span style="{style}">x</span>"#);
+            assert_eq!(shipped(&html, &e), "<span>x</span>", "{style}");
+        }
+    }
+
+    #[test]
+    fn one_uncompilable_inline_declaration_does_not_sink_the_rest() {
+        // Measured: `<span style="font-style:italic;padding-left:2em">` ships as
+        // `<span><i>x</i></span>`.
+        assert_eq!(
+            shipped(
+                r#"<span style="font-style:italic;padding-left:2em">x</span>"#,
+                &Effects::default()
+            ),
+            "<span><i>x</i></span>"
+        );
+    }
+
+    #[test]
+    fn an_inline_style_is_read_through_quotes_and_whitespace() {
+        let e = Effects::default();
+        // Measured on kindlegen: a single-quoted value, and one written with
+        // spaces around every colon and separator plus a capitalised property
+        // and a trailing semicolon, both compile to the same markup a tidy
+        // declaration list does.
+        assert_eq!(
+            shipped(r#"<span id="k" style='color:blue'>x</span>"#, &e),
+            r#"<span id="k"><font color="blue">x</font></span>"#
+        );
+        assert_eq!(
+            shipped(
+                r#"<span id="k" style="  Color : red ; font-style: italic ; ">x</span>"#,
+                &e
+            ),
+            r#"<span id="k"><font color="red"><i>x</i></font></span>"#
+        );
+        // An unrelated attribute whose value mentions `style` is not one.
+        assert_eq!(
+            apply(r#"<span title="style=red">x</span>"#, &e),
+            r#"<span title="style=red">x</span>"#
+        );
+    }
+
+    #[test]
+    fn an_inline_style_on_the_entry_wrapper_wraps_the_whole_entry() {
+        // Measured: a `style` on `<idx:entry>` itself reaches the entry's
+        // contents, so kindlegen writes `<i><b>alpha</b><span>x</span></i>`.
+        let out = shipped(
+            concat!(
+                r#"<idx:entry name="ja" style="font-style:italic">"#,
+                r#"<idx:orth value="alpha"><b>alpha</b></idx:orth><span>x</span>"#,
+                "</idx:entry>"
+            ),
+            &Effects::default(),
+        );
+        // The entry wrapper is gone and the `<i>` opens ahead of the headword
+        // and closes after the last element, holding everything that was inside
+        // the entry, which is where kindlegen puts it. The space between the
+        // headword and the span is not this feature's doing: the strip pass
+        // puts a separator back between a headword and the text that follows,
+        // which kindling has always done and kindlegen does not.
+        assert!(out.contains("<i><b>alpha</b>"), "{out}");
+        assert!(out.contains("<span>x</span></i>"), "{out}");
+        assert!(!out.contains("style="), "{out}");
+    }
+
+    #[test]
     fn reads_a_class_off_a_real_element() {
         // `for_each_tag` reports the attribute text between the name and the
         // `>`, which is what the scanner is fed here.
@@ -1533,6 +2000,298 @@ v { margin-left: 0.4em; }",
         assert_eq!(
             apply(r#"<span class="x">t</span>"#, &e),
             r#"<span class="x"><font size="+2">t</font></span>"#
+        );
+    }
+
+    #[test]
+    fn the_elements_that_carry_align_are_the_measured_ones() {
+        // kindlegen 2.9, one element at a time: a short whitelist rather than
+        // every block-level name, and nothing for a name it does not know.
+        for element in [
+            "p",
+            "div",
+            "td",
+            "tr",
+            "blockquote",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+        ] {
+            assert!(carries_align(element), "<{element}> should carry align");
+        }
+        for element in [
+            "span", "b", "li", "ul", "ol", "table", "th", "pre", "section", "address", "caption",
+            "foo", "h7", "td2", "idx:orth",
+        ] {
+            assert!(!carries_align(element), "<{element}> should get nothing");
+        }
+    }
+
+    #[test]
+    fn text_align_becomes_the_elements_own_align_attribute() {
+        // The whole shape of this mapping, measured one element at a time.
+        for element in ["p", "div", "td", "tr", "blockquote", "h1", "h2", "h6"] {
+            let html = format!(r##"<{element} style="text-align:center">x</{element}>"##);
+            assert_eq!(
+                shipped(&html, &Effects::default()),
+                format!(r##"<{element} align="center">x</{element}>"##),
+                "<{element}>"
+            );
+        }
+        // Elements kindlegen writes no attribute on, inline and block alike.
+        for element in ["span", "b", "li", "ul", "table", "th", "section", "foo"] {
+            let html = format!(r##"<{element} style="text-align:center">x</{element}>"##);
+            assert_eq!(
+                shipped(&html, &Effects::default()),
+                format!("<{element}>x</{element}>"),
+                "<{element}>"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_align_value_is_written_through_verbatim() {
+        // No validation and no lowercasing: kindlegen ships `CENTER`, `start`,
+        // `inherit` and even a value that is not a keyword at all as written.
+        for value in [
+            "left",
+            "right",
+            "center",
+            "justify",
+            "start",
+            "end",
+            "inherit",
+            "none",
+            "CENTER",
+            "Center",
+            "foo",
+            "-moz-center",
+        ] {
+            let html = format!(r#"<p style="text-align:{value}">x</p>"#);
+            assert_eq!(
+                shipped(&html, &Effects::default()),
+                format!(r#"<p align="{value}">x</p>"#),
+                "{value}"
+            );
+        }
+        // A value that would close the attribute is refused, like a colour.
+        let c = compile(r#"p { text-align: center" onclick="x; }"#);
+        assert!(c.effects.is_empty());
+        assert!(c.residual_css.contains("onclick"));
+    }
+
+    #[test]
+    fn a_trailing_important_is_dropped_from_every_property() {
+        // Measured: kindlegen compiles `color:red !important` to
+        // `<font color="red">` and `text-align:center !important` to
+        // `align="center"`, so the marker never reaches the attribute.
+        assert_eq!(
+            shipped(
+                r#"<span style="color:red !important;font-size:260% !important">x</span>"#,
+                &Effects::default()
+            ),
+            r#"<span><font size="+3" color="red">x</font></span>"#
+        );
+        assert_eq!(
+            shipped(
+                r#"<p style="text-align:center !important">x</p>"#,
+                &Effects::default()
+            ),
+            r#"<p align="center">x</p>"#
+        );
+        for (value, expected) in [
+            ("center !important", "center"),
+            ("center!important", "center"),
+            ("center ! IMPORTANT", "center"),
+            ("center  !important  ", "center"),
+            ("center", "center"),
+            ("center !importantx", "center !importantx"),
+            ("!important", ""),
+        ] {
+            assert_eq!(without_important(value), expected, "{value:?}");
+        }
+        // An uncompiled declaration goes back into the sheet as written.
+        let c = compile("p { text-align: center !important; padding-left: 2em; }");
+        assert!(c.residual_css.contains("padding-left: 2em"));
+        assert!(!c.residual_css.contains("text-align"));
+    }
+
+    #[test]
+    fn an_align_the_element_already_has_is_left_alone() {
+        // Measured: kindlegen does not write a second attribute, quoted,
+        // unquoted or empty alike, and still applies the rest of the style.
+        for attrs in [
+            r#" align="left""#,
+            r#" align='left'"#,
+            " align=left",
+            r#" align="""#,
+            r#" ALIGN="center""#,
+        ] {
+            let html = format!(r#"<p{attrs} style="text-align:center;font-weight:bold">x</p>"#);
+            let expected = format!(r#"<p{attrs}><b>x</b></p>"#);
+            assert_eq!(shipped(&html, &Effects::default()), expected, "{attrs}");
+        }
+        // The same through a class rule.
+        assert_eq!(
+            shipped(
+                r#"<p align="left" class="x">x</p>"#,
+                &effects_of(".x { text-align: center; }")
+            ),
+            r#"<p align="left">x</p>"#
+        );
+    }
+
+    #[test]
+    fn has_attribute_reads_the_name_not_the_value() {
+        assert!(has_attribute(r#" align="left""#, "align"));
+        assert!(has_attribute(" align=left", "align"));
+        assert!(has_attribute(r#" align="""#, "align"));
+        assert!(has_attribute(r#" class="x" ALIGN="center""#, "align"));
+        assert!(!has_attribute(r#" data-align="x""#, "align"));
+        assert!(!has_attribute(r#" title="align=left""#, "align"));
+        assert!(!has_attribute(r#" class="align""#, "align"));
+        assert!(!has_attribute("", "align"));
+    }
+
+    #[test]
+    fn text_align_from_a_rule_reaches_its_element() {
+        assert_eq!(
+            shipped("<p>x</p>", &effects_of("p { text-align: center; }")),
+            r#"<p align="center">x</p>"#
+        );
+        // A rule that names an element kindlegen cannot align compiles to
+        // nothing, and stays in the sheet so the book view keeps it.
+        let c = compile("span { text-align: center; }");
+        assert!(c.effects.is_empty());
+        assert!(c.residual_css.contains("text-align: center"));
+        // A class rule is resolved against whatever carries the class: the
+        // same rule aligns the `p` and leaves the `span` alone, which is what
+        // kindlegen writes for one class and two elements.
+        assert_eq!(
+            shipped(
+                r#"<p class="x">p</p><span class="x">s</span>"#,
+                &effects_of(".x { text-align: center; }")
+            ),
+            r#"<p align="center">p</p><span>s</span>"#
+        );
+        assert_eq!(
+            shipped(
+                r#"<table><tr><td class="x">x</td></tr></table>"#,
+                &effects_of(".x { text-align: center; }")
+            ),
+            r#"<table><tr><td align="center">x</td></tr></table>"#
+        );
+    }
+
+    #[test]
+    fn a_rule_for_an_element_that_cannot_align_keeps_the_declaration() {
+        for css in [
+            "span { text-align: center; }",
+            "li { text-align: center; }",
+            "table { text-align: center; }",
+            "th { text-align: center; }",
+            "span.def { text-align: center; }",
+        ] {
+            let c = compile(css);
+            assert!(
+                c.residual_css.contains(css),
+                "{css:?} should stay in the sheet, got {:?}",
+                c.residual_css
+            );
+        }
+        // A rule that can reach an aligning element is compiled whole, even
+        // when another selector in the list cannot.
+        for css in [
+            "p { text-align: center; }",
+            ".def { text-align: center; }",
+            "p, span { text-align: center; }",
+            "td.def { text-align: center; }",
+        ] {
+            let c = compile(css);
+            assert_eq!(c.residual_css.trim(), "", "{css:?} should compile away");
+        }
+        // The rest of a rule that could not compile still leaves.
+        let c = compile("li { font-weight: bold; text-align: center; }");
+        assert!(c.effects.get("li", "").unwrap().bold);
+        assert!(c.residual_css.contains("text-align: center"));
+        assert!(!c.residual_css.contains("font-weight"));
+    }
+
+    #[test]
+    fn an_inline_text_align_beats_a_rule_and_everything_the_element_carries() {
+        // Measured: a `left` rule with an inline `center` ships
+        // `align="center"`.
+        assert_eq!(
+            shipped(
+                r#"<p style="text-align:center">x</p>"#,
+                &effects_of("p { text-align: left; }")
+            ),
+            r#"<p align="center">x</p>"#
+        );
+        // Two declarations of the same property: the later one wins, inline
+        // and in a rule alike.
+        assert_eq!(
+            shipped(
+                r#"<p style="text-align:left;text-align:right">x</p>"#,
+                &Effects::default()
+            ),
+            r#"<p align="right">x</p>"#
+        );
+        assert_eq!(
+            shipped(
+                "<p>x</p>",
+                &effects_of("p { text-align: left; text-align: right; }")
+            ),
+            r#"<p align="right">x</p>"#
+        );
+    }
+
+    #[test]
+    fn align_sits_between_height_and_bgcolor() {
+        // Measured, and independent of declaration order:
+        // `<p height="20" align="center" bgcolor="#eee">`.
+        for style in [
+            "background-color:#eee;margin-top:20px;text-align:center",
+            "text-align:center;background-color:#eee;margin-top:20px",
+        ] {
+            let html = format!(r#"<p style="{style}">x</p>"#);
+            assert_eq!(
+                shipped(&html, &Effects::default()),
+                r##"<p height="20" align="center" bgcolor="#eee">x</p>"##,
+                "{style}"
+            );
+        }
+        // The alignment is on the element, so the wrapping tags go inside it.
+        assert_eq!(
+            shipped(
+                r#"<p style="text-align:center;font-weight:bold;margin-bottom:20px">x</p>"#,
+                &Effects::default()
+            ),
+            concat!(
+                r##"<p align="center"><b>x</b></p>"##,
+                r##"<div height="20"></div>"##
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrapping_effect_is_untouched_by_the_align_whitelist() {
+        // `text-align` on a span does nothing, but its other declarations must
+        // still compile where they can.
+        let e = Effects::default();
+        assert_eq!(
+            shipped(
+                r#"<span style="text-align:center;font-style:italic">x</span>"#,
+                &e
+            ),
+            "<span><i>x</i></span>"
+        );
+        assert_eq!(
+            shipped(r#"<div style="text-align:center"><span>x</span></div>"#, &e),
+            r#"<div align="center"><span>x</span></div>"#
         );
     }
 }
