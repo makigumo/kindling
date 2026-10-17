@@ -6440,159 +6440,149 @@ fn build_lookup_terms(
     }
 
     let mut sorted_labels: Vec<String> = terms.keys().cloned().collect();
-    match &gen_ordt {
-        Some(tables) if generated => {
-            // Sort by ORDT collation key (the order Kindle's lookup
-            // expects); ties broken by encoded bytes, then by the label text
-            // for labels cut to the same bytes, so every build writes one
-            // order. Equal keys are fine on-device: the firmware scans
-            // equal-weight ranges.
-            let sort_keys: HashMap<&String, Vec<u32>> = label_bytes_map
-                .iter()
-                .map(|(label, bytes)| (label, tables.sort_key(bytes)))
-                .collect();
-            sorted_labels.sort_by(|a, b| {
-                sort_keys[a]
-                    .cmp(&sort_keys[b])
-                    .then_with(|| label_bytes_map[a].cmp(&label_bytes_map[b]))
-                    .then_with(|| a.cmp(b))
-            });
+    {
+        // The order the firmware searches in, whatever form the labels are
+        // stored in: plain UTF-16, an exact table's symbols, or a generated
+        // kana/literal table. The Kindle decodes each stored label through
+        // ORDT2 and weighs the *characters* it gets back
+        // (see `ordt::device_collation_key`), so a generated table's ORDT1
+        // weight order is NOT the lookup order - a Latin letter in a
+        // Japanese dictionary is a low code point to the firmware ("E.T."
+        // and "r" sort between the digits and the kana), while its ORDT
+        // symbol can sit anywhere in the table. Sorting a Japanese
+        // dictionary by its symbol numbers put 1,120 of 68,238 label pairs
+        // out of the firmware's order and hid the entries behind them
+        // (Wadoku on a Kindle Basic 5); kindlegen's own build is out of it
+        // 430 times. A label sorted anywhere
+        // else can be missed, and so can neighbors the search steps over:
+        // "T-shirt" sorted with its hyphen as a low letter hid "tabacco",
+        // Romanian "școală" sorted as "scoala" hid "copil", "из-под" in
+        // byte order hid "изба", and "Zebra" in byte order hid "apple".
+        //
+        // The Kindle returns every label with the word's key, in stored
+        // order, and opens the one spelled exactly like the word, else the
+        // first one equal to it ignoring case (German books compare the
+        // case of every letter too, and Danish books the case of `a`, `c`,
+        // `d`, `e`, `i`, `o` and `y`), else a prefix match, else the first
+        // of them. So among equal keys the order decides what opens for a
+        // word spelled like none of them. The order is:
+        //
+        // 1. A label the Kindle rewrites when it is tapped (see
+        //    `lookup::kindle_rewrites_label`). Such a label never equals
+        //    the word it is looked up by, so it opens for its own spelling
+        //    only as the first of its run, while a label the Kindle keeps
+        //    is still found by its exact spelling wherever it is stored. In
+        //    a Norwegian dictionary "-aren" is looked up as "aren", and
+        //    now opens itself rather than "åren".
+        // 2. More apostrophes (', ’ or ʼ): a tapped "Дем’янюка" is looked
+        //    up as "Дем'янюка", which equals neither "Дем’янюка" nor
+        //    "Демянюка" in that comparison, and "donʼt" equals neither
+        //    "don't" nor "dont", so they would otherwise open "Демянюка"
+        //    and "dont".
+        // 3. Outside Danish dictionaries, fewer accented Latin letters. A
+        //    word that equals none of the labels then opens the plain one:
+        //    in a Norwegian dictionary "FØRER" opens "fører" rather than
+        //    "fôrer", and in a German book a sentence-initial "Schlagen"
+        //    opens "schlagen" rather than "Schlägen". Most books ignore the
+        //    case of accented letters in that comparison, so an accented
+        //    label still opens for its own spelling in capitals. A German
+        //    book compares case, so there "ABSCHLÄGE" equals none of the
+        //    labels and opens "abschlage" rather than "Abschläge". In a
+        //    Danish dictionary, where `å` is a letter of its own, counting
+        //    accents made capitalized words such as "ÅRET" open a different
+        //    word.
+        // 4. Fewer capital letters, so a sentence-initial "If" opens "if"
+        //    rather than "IF". In a German or Danish dictionary only a label
+        //    with no lowercase letter moves back: there a word in capitals
+        //    equals neither twin and opens the first, and "HAUS" should
+        //    open "Haus" rather than "haus". Capitals do not count for
+        //    rewritten labels: "A.I." and "a.i." are both looked up without
+        //    the last period, so only the first opens, and "A.I." opens for
+        //    its own spelling, as it did in 0.45.1.
+        // 5. Fewer units that weigh nothing.
+        // 6. The spelling without `ß`, `æ`, `œ` or `ĳ` ("DASS" opens
+        //    "dass" rather than "daß" in a German book).
+        // 7. The units that weigh nothing, compared in code order, so
+        //    "andr-" comes before "Andr." and opens for its own spelling,
+        //    as it did in 0.45.1.
+        // 8. Encoded bytes. Labels stored as the same bytes, such as two
+        //    cut to the same 254 bytes, are then ordered by their text, so
+        //    every build of a dictionary writes the same file.
+        //
+        // The keys and the other counts that come from the stored label
+        // use the units as stored, cut to the entry writer's 254 bytes,
+        // since that is what the Kindle compares.
+        struct Order {
+            key: Vec<u16>,
+            rewritten: bool,
+            apostrophes: usize,
+            accented: usize,
+            capitals: usize,
+            skipped: Vec<u16>,
+            pairs: usize,
         }
-        _ => {
-            // Every other dictionary, whether its labels are exact-table
-            // symbols or plain UTF-16: the order the Kindle 4 and the
-            // Paperwhite 4 search in, by the weights they give each stored
-            // unit (see `ordt::device_collation_key`). A label sorted anywhere
-            // else can be missed, and so can neighbors the search steps over:
-            // "T-shirt" sorted with its hyphen as a low letter hid "tabacco",
-            // Romanian "școală" sorted as "scoala" hid "copil", "из-под" in
-            // byte order hid "изба", and "Zebra" in byte order hid "apple".
-            //
-            // The Kindle returns every label with the word's key, in stored
-            // order, and opens the one spelled exactly like the word, else the
-            // first one equal to it ignoring case (German books compare the
-            // case of every letter too, and Danish books the case of `a`, `c`,
-            // `d`, `e`, `i`, `o` and `y`), else a prefix match, else the first
-            // of them. So among equal keys the order decides what opens for a
-            // word spelled like none of them. The order is:
-            //
-            // 1. A label the Kindle rewrites when it is tapped (see
-            //    `lookup::kindle_rewrites_label`). Such a label never equals
-            //    the word it is looked up by, so it opens for its own spelling
-            //    only as the first of its run, while a label the Kindle keeps
-            //    is still found by its exact spelling wherever it is stored. In
-            //    a Norwegian dictionary "-aren" is looked up as "aren", and
-            //    now opens itself rather than "åren".
-            // 2. More apostrophes (', ’ or ʼ): a tapped "Дем’янюка" is looked
-            //    up as "Дем'янюка", which equals neither "Дем’янюка" nor
-            //    "Демянюка" in that comparison, and "donʼt" equals neither
-            //    "don't" nor "dont", so they would otherwise open "Демянюка"
-            //    and "dont".
-            // 3. Outside Danish dictionaries, fewer accented Latin letters. A
-            //    word that equals none of the labels then opens the plain one:
-            //    in a Norwegian dictionary "FØRER" opens "fører" rather than
-            //    "fôrer", and in a German book a sentence-initial "Schlagen"
-            //    opens "schlagen" rather than "Schlägen". Most books ignore the
-            //    case of accented letters in that comparison, so an accented
-            //    label still opens for its own spelling in capitals. A German
-            //    book compares case, so there "ABSCHLÄGE" equals none of the
-            //    labels and opens "abschlage" rather than "Abschläge". In a
-            //    Danish dictionary, where `å` is a letter of its own, counting
-            //    accents made capitalized words such as "ÅRET" open a different
-            //    word.
-            // 4. Fewer capital letters, so a sentence-initial "If" opens "if"
-            //    rather than "IF". In a German or Danish dictionary only a label
-            //    with no lowercase letter moves back: there a word in capitals
-            //    equals neither twin and opens the first, and "HAUS" should
-            //    open "Haus" rather than "haus". Capitals do not count for
-            //    rewritten labels: "A.I." and "a.i." are both looked up without
-            //    the last period, so only the first opens, and "A.I." opens for
-            //    its own spelling, as it did in 0.45.1.
-            // 5. Fewer units that weigh nothing.
-            // 6. The spelling without `ß`, `æ`, `œ` or `ĳ` ("DASS" opens
-            //    "dass" rather than "daß" in a German book).
-            // 7. The units that weigh nothing, compared in code order, so
-            //    "andr-" comes before "Andr." and opens for its own spelling,
-            //    as it did in 0.45.1.
-            // 8. Encoded bytes. Labels stored as the same bytes, such as two
-            //    cut to the same 254 bytes, are then ordered by their text, so
-            //    every build of a dictionary writes the same file.
-            //
-            // The keys and the other counts that come from the stored label
-            // use the units as stored, cut to the entry writer's 254 bytes,
-            // since that is what the Kindle compares.
-            struct Order {
-                key: Vec<u16>,
-                rewritten: bool,
-                apostrophes: usize,
-                accented: usize,
-                capitals: usize,
-                skipped: Vec<u16>,
-                pairs: usize,
-            }
-            let language = (locale_code(dict_lang) & 0xFF) as u8;
-            // Danish (0x06) and German (0x07).
-            let case_compared = matches!(language, 0x06 | 0x07);
-            let danish = language == 0x06;
-            let orders: HashMap<&String, Order> = label_bytes_map
-                .iter()
-                .map(|(label, bytes)| {
-                    let stored = &bytes[..bytes.len().min(indx::MAX_INDX_LABEL_BYTES)];
-                    let units: Vec<u16> = match &gen_ordt {
-                        Some(tables) => tables.stored_units(stored),
-                        None => stored
-                            .chunks_exact(2)
-                            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                            .collect(),
-                    };
-                    // The letters a label spells as a marker and its second
-                    // letter count as the letters they are stored as.
-                    let text = crate::ordt::marker_pairs_joined(label);
-                    let rewritten = crate::lookup::kindle_rewrites_label(&units, language);
-                    let capitals = if rewritten {
+        let language = (locale_code(dict_lang) & 0xFF) as u8;
+        // Danish (0x06) and German (0x07).
+        let case_compared = matches!(language, 0x06 | 0x07);
+        let danish = language == 0x06;
+        let orders: HashMap<&String, Order> = label_bytes_map
+            .iter()
+            .map(|(label, bytes)| {
+                let stored = &bytes[..bytes.len().min(indx::MAX_INDX_LABEL_BYTES)];
+                let units: Vec<u16> = match &gen_ordt {
+                    Some(tables) => tables.stored_units(stored),
+                    None => stored
+                        .chunks_exact(2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect(),
+                };
+                // The letters a label spells as a marker and its second
+                // letter count as the letters they are stored as.
+                let text = crate::ordt::marker_pairs_joined(label);
+                let rewritten = crate::lookup::kindle_rewrites_label(&units, language);
+                let capitals = if rewritten {
+                    0
+                } else if case_compared {
+                    usize::from(
+                        text.chars().any(char::is_uppercase)
+                            && !text.chars().any(char::is_lowercase),
+                    )
+                } else {
+                    text.chars().filter(|c| c.is_uppercase()).count()
+                };
+                let order = Order {
+                    key: crate::ordt::device_collation_key(&units),
+                    rewritten,
+                    apostrophes: text
+                        .chars()
+                        .filter(|c| matches!(c, '\'' | '\u{2019}' | '\u{2BC}'))
+                        .count(),
+                    accented: if danish {
                         0
-                    } else if case_compared {
-                        usize::from(
-                            text.chars().any(char::is_uppercase)
-                                && !text.chars().any(char::is_lowercase),
-                        )
                     } else {
-                        text.chars().filter(|c| c.is_uppercase()).count()
-                    };
-                    let order = Order {
-                        key: crate::ordt::device_collation_key(&units),
-                        rewritten,
-                        apostrophes: text
-                            .chars()
-                            .filter(|c| matches!(c, '\'' | '\u{2019}' | '\u{2BC}'))
-                            .count(),
-                        accented: if danish {
-                            0
-                        } else {
-                            accented_letter_count(&text)
-                        },
-                        capitals,
-                        skipped: crate::ordt::skipped_units(&units),
-                        pairs: crate::ordt::one_letter_pair_count(label),
-                    };
-                    (label, order)
-                })
-                .collect();
-            sorted_labels.sort_by(|a, b| {
-                let (oa, ob) = (&orders[a], &orders[b]);
-                oa.key
-                    .cmp(&ob.key)
-                    .then_with(|| ob.rewritten.cmp(&oa.rewritten))
-                    .then_with(|| ob.apostrophes.cmp(&oa.apostrophes))
-                    .then_with(|| oa.accented.cmp(&ob.accented))
-                    .then_with(|| oa.capitals.cmp(&ob.capitals))
-                    .then_with(|| oa.skipped.len().cmp(&ob.skipped.len()))
-                    .then_with(|| oa.pairs.cmp(&ob.pairs))
-                    .then_with(|| oa.skipped.cmp(&ob.skipped))
-                    .then_with(|| label_bytes_map[a].cmp(&label_bytes_map[b]))
-                    .then_with(|| a.cmp(b))
-            });
-        }
+                        accented_letter_count(&text)
+                    },
+                    capitals,
+                    skipped: crate::ordt::skipped_units(&units),
+                    pairs: crate::ordt::one_letter_pair_count(label),
+                };
+                (label, order)
+            })
+            .collect();
+        sorted_labels.sort_by(|a, b| {
+            let (oa, ob) = (&orders[a], &orders[b]);
+            oa.key
+                .cmp(&ob.key)
+                .then_with(|| ob.rewritten.cmp(&oa.rewritten))
+                .then_with(|| ob.apostrophes.cmp(&oa.apostrophes))
+                .then_with(|| oa.accented.cmp(&ob.accented))
+                .then_with(|| oa.capitals.cmp(&ob.capitals))
+                .then_with(|| oa.skipped.len().cmp(&ob.skipped.len()))
+                .then_with(|| oa.pairs.cmp(&ob.pairs))
+                .then_with(|| oa.skipped.cmp(&ob.skipped))
+                .then_with(|| label_bytes_map[a].cmp(&label_bytes_map[b]))
+                .then_with(|| a.cmp(b))
+        });
     }
 
     let lookup_terms = sorted_labels
@@ -7004,13 +6994,14 @@ mod punctuated_label_order_tests {
     }
 
     #[test]
-    fn generated_ordt_ties_keep_encoded_byte_order() {
-        // Japanese, Chinese, Korean and Arabic-script dictionaries sort by the
-        // generated table's weights with ties in encoded byte order (then
-        // label text for labels stored as the same bytes), and none of the
-        // other tie rules. In a kana table every ASCII letter shares one weight
-        // and `%`, `_` and `-` weigh nothing; in a literal table `%` and `_`
-        // weigh nothing.
+    fn generated_ordt_labels_sort_by_device_weight() {
+        // Japanese, Chinese, Korean and Arabic-script dictionaries keep their
+        // generated ORDT table for label *encoding* but sort by the weights the
+        // firmware gives the decoded characters, not by the table's symbol
+        // numbers: a Latin letter in a Japanese table is a low letter to the
+        // Kindle, not the high symbol index its first appearance earned it.
+        // `%`, `_` and `-` weigh nothing at all, so the labels of one key order
+        // by the skipped units in code order.
         let ascii = |labels: Vec<String>| -> Vec<String> {
             labels.into_iter().filter(|l| l.is_ascii()).collect()
         };
@@ -7022,11 +7013,11 @@ mod punctuated_label_order_tests {
                     strict,
                     fold
                 )),
-                ["a%b", "a-b", "ab", "ba"]
+                ["ab", "a%b", "a-b", "ba"]
             );
             assert_eq!(
                 ascii(sorted_in(&["ab", "a_b", "a%b", "水"], "zh", strict, fold)),
-                ["a%b", "a_b", "ab"]
+                ["ab", "a%b", "a_b"]
             );
         }
     }

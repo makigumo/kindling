@@ -267,19 +267,19 @@ fn check_generated_ordt(code: &str, c: &Lang, parsed: &ParsedMobi, idx: usize, p
         assert_eq!(kl, rl, "{code}: headword labels vs kindlegen");
     }
 
-    // Entries are in non-decreasing collation order under the rebuilt table
-    // (built above from the same headwords in document order).
-    let keys: Vec<Vec<u32>> = indx
+    // Entries are in the order a Kindle searches them. The generated table's
+    // own ORDT1 weights are NOT that order: the firmware decodes each stored
+    // label through ORDT2 and weighs the characters it gets back, so a Latin
+    // letter in a Japanese index is a low letter to the device whatever
+    // symbol number the table gave it (see `ordt::device_collation_key`).
+    // Sorting by the symbol numbers instead put 662 of Wadoku's 68,238 label
+    // pairs out of the device's order and hid the entries behind them.
+    let units: Vec<Vec<u16>> = indx
         .entries
         .iter()
-        .map(|e| tables.sort_key(&e.label))
+        .map(|e| tables.stored_units(&e.label))
         .collect();
-    for i in 1..keys.len() {
-        assert!(
-            keys[i - 1] <= keys[i],
-            "{code}: entries out of collation order at {i}"
-        );
-    }
+    check_device_order(code, &units);
 }
 
 /// True if a code's headwords are dominantly in a script the static Greek
@@ -386,7 +386,10 @@ fn check_device_order(code: &str, labels: &[Vec<u16>]) {
 /// weighs as its lowercase base letter; ASCII punctuation, the Latin-1 signs,
 /// the letters the Kindle passes over and General Punctuation weigh nothing;
 /// the no-break space weighs as a space and ¹²³ as digits; Greek, Cyrillic
-/// and every other unit weigh as themselves.
+/// and Han weigh as themselves; katakana and halfwidth kana fold onto
+/// hiragana; the prolonged sound mark and the kana marks weigh nothing; and a
+/// composed Hangul syllable weighs nothing either (the weights the firmware's
+/// `UnicodeUtils.A` returns, read out of MobipocketCoreReader.jar).
 fn device_key(units: &[u16]) -> (Vec<u16>, usize) {
     const LETTERS: &[(char, &str)] = &[
         ('a', "AaÀÁÂÃÄÅàáâãäåĀāĂăĄąǍǎǞǟǠǡǺǻǼȀȁȂȃɐ"),
@@ -432,6 +435,27 @@ fn device_key(units: &[u16]) -> (Vec<u16>, usize) {
                 .map_or(0, |&(base, _)| base as u16),
             0x2000..=0x206F => 0,
             0x0370..=0x052F | 0x1F00..=0x1FFF => unit,
+            // Hiragana weighs as itself, except the small kana that fold
+            // onto a full one and ゟ.
+            0x3041..=0x3093 => unit,
+            0x3094 => 0x3046,
+            0x3095 => 0x3042,
+            0x3096 => 0x3044,
+            0x3097 => 0x3046,
+            0x3098 => 0x3048,
+            0x309F => 0x304A,
+            0x3001..=0x3040 | 0x3099..=0x309E | 0x30A0 | 0x30FB..=0x30FF => 0,
+            // Katakana folds onto the matching hiragana, ヴ ヵ ヶ included.
+            0x30A1..=0x30F3 => unit - 0x60,
+            0x30F4 => 0x3046,
+            0x30F5 => 0x304B,
+            0x30F6 => 0x3051,
+            0x30F7..=0x30FA => unit - 0x68,
+            // A composed Hangul syllable weighs nothing.
+            0xAC00..=0xD7A3 => 0,
+            // Han, Arabic, and every other unit, weighs as itself.
+            0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => unit,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => unit,
             _ => panic!("U+{unit:04X} is outside what this key covers; extend it"),
         };
         if weight == 0 {
