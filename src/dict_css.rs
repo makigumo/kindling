@@ -127,6 +127,16 @@ pub(crate) struct Effect {
     /// `text-align`, verbatim, for the element's own `align` attribute. Only
     /// some elements carry one; see [`carries_align`].
     pub align: Option<String>,
+    /// An `unset` that takes a left margin away, so an indent an earlier rule
+    /// asked for does not survive it. Measured: it is what keeps kindlegen from
+    /// indenting the 21,890 `.subheadword` elements of the real Wadoku build,
+    /// whose `.subheadword .sense { margin-left: unset }` follows the rule that
+    /// asks for the indent.
+    pub indent_unset: bool,
+    /// The same for a top margin and the `height` attribute it becomes.
+    pub height_unset: bool,
+    /// The same for a bottom margin and the spacer `div` it becomes.
+    pub spacer_unset: bool,
 }
 
 impl Effect {
@@ -143,15 +153,30 @@ impl Effect {
             && self.align.is_none()
     }
 
+    /// Whether this asks for anything at all: content to write, or a margin an
+    /// `unset` takes away.
+    fn asks_for_something(&self) -> bool {
+        !self.is_empty() || self.clears_a_margin()
+    }
+
+    /// Whether this takes a margin away, which is worth recording under a
+    /// selector that already carries one and worth nothing under one that does
+    /// not.
+    fn clears_a_margin(&self) -> bool {
+        self.indent_unset || self.height_unset || self.spacer_unset
+    }
+
     /// Fold `other` over this, `other` winning.
     ///
     /// This is how two rules that both match an element are combined, so
     /// `other` is the more specific one (or the later of two equals): it
     /// replaces a size or a colour it declares and turns on the attributes it
-    /// asks for, leaving alone everything it says nothing about. A declaration
-    /// that turns a property *off* is not compiled at all — `font-weight:
-    /// normal` stays in the sheet — so there is nothing here that relaxes a
-    /// flag.
+    /// asks for, leaving alone everything it says nothing about.
+    ///
+    /// An `unset` is the one declaration that can turn a margin *off*, so it is
+    /// the one that relaxes what an earlier rule asked for: `margin-left: unset`
+    /// after `margin-left: 10px` leaves no indent, which is what kindlegen does
+    /// with the real sheet's `.subheadword` and its `.subheadword .sense`.
     fn merge(&mut self, other: &Effect) {
         if other.size.is_some() {
             self.size = other.size;
@@ -164,9 +189,13 @@ impl Effect {
         }
         if other.height.is_some() {
             self.height = other.height.clone();
+        } else if other.height_unset {
+            self.height = None;
         }
         if other.spacer.is_some() {
             self.spacer = other.spacer.clone();
+        } else if other.spacer_unset {
+            self.spacer = None;
         }
         if other.align.is_some() {
             self.align = other.align.clone();
@@ -174,7 +203,11 @@ impl Effect {
         self.bold |= other.bold;
         self.italic |= other.italic;
         self.underline |= other.underline;
-        self.indent |= other.indent;
+        if other.indent {
+            self.indent = true;
+        } else if other.indent_unset {
+            self.indent = false;
+        }
     }
 
     /// The markup to open and close around an element's contents. Closing
@@ -370,6 +403,58 @@ fn parse_selector(selector: &str) -> Option<Selector> {
     })
 }
 
+/// What one part of a selector list asks of the markup.
+#[derive(Debug)]
+enum Part {
+    /// A simple selector, matched as written.
+    Simple(Selector),
+    /// A descendant selector, compiled against its leading compound. Measured
+    /// on kindlegen 2.9: `.a .b` indents a `.a` even when the entry holds no
+    /// `.b` at all, `span .b` marks every `span`, and `div.a .b` reaches a
+    /// `div.a` — so the compound before the space is what the rule acts on, and
+    /// the elements the descendant half names are left to the sheet.
+    Leading(Selector),
+    /// A selector nothing here can read, not even a leading compound: an id, an
+    /// attribute, a pseudo-class, the universal selector, or a combinator other
+    /// than the descendant one. Measured: `.a + .b`, `.a > .b` and `a.ref > *`
+    /// all produce nothing at all in kindlegen, so a child or sibling
+    /// combinator is not read as its leading compound the way a space is.
+    Unreadable,
+}
+
+/// Read one part of a selector list.
+fn read_part(part: &str) -> Part {
+    let text = without_comments(part);
+    if let Some(selector) = parse_selector(&text) {
+        return Part::Simple(selector);
+    }
+    match leading_compound(&text) {
+        Some(lead) => Part::Leading(lead),
+        None => Part::Unreadable,
+    }
+}
+
+/// The leading compound of a descendant selector, when it is a simple selector
+/// this can match.
+///
+/// It is everything before the first whitespace, and `None` comes back when that
+/// compound itself carries something unsupported — `#x .b` names an id — or when
+/// the whitespace is not a descendant combinator but the start of `>`, `+` or
+/// `~`. A compound of several classes reads as one selector here, since this
+/// matches what a document says (`.a.master` against `class="a master"`), even
+/// though kindlegen 2.9 was measured not to match such a compound at all; that
+/// only ever compiles rules kindlegen leaves alone.
+fn leading_compound(text: &str) -> Option<Selector> {
+    let text = text.trim();
+    let at = text.find(char::is_whitespace)?;
+    let lead = &text[..at];
+    let rest = text[at..].trim_start();
+    if lead.ends_with(['>', '+', '~']) || rest.starts_with(['>', '+', '~']) {
+        return None;
+    }
+    parse_selector(lead)
+}
+
 /// True for a name the tag scanner could report as an element: a letter
 /// followed by letters, digits, `-`, `_` or the colon of `idx:orth`.
 fn is_element_name(name: &str) -> bool {
@@ -429,8 +514,26 @@ impl Effects {
         self.elements.is_empty() && self.classes.is_empty()
     }
 
+    /// Whether a rule is already recorded under this selector.
+    fn holds(&self, selector: &Selector) -> bool {
+        match &selector.element {
+            Some(name) if selector.classes.is_empty() => self.elements.contains_key(name),
+            _ => self
+                .classes
+                .iter()
+                .any(|r| r.element == selector.element && r.classes == selector.classes),
+        }
+    }
+
     /// Record one compiled rule under the selector that asked for it.
     fn insert(&mut self, selector: &Selector, effect: &Effect) {
+        // A rule that only clears a margin is worth recording under a selector
+        // that already has one, and worth no entry at all under a selector that
+        // has none: there is no margin to take away. Skipping it keeps a sheet
+        // of pure `unset`s from costing the entry walk.
+        if effect.is_empty() && !self.holds(selector) {
+            return;
+        }
         match &selector.element {
             Some(name) if selector.classes.is_empty() => {
                 self.elements
@@ -526,7 +629,7 @@ impl Effects {
             // the element could carry an `align` is not a reason to refuse it;
             // `start_attributes` decides what actually ships.
             let (own, _) = compile_declarations(style, true);
-            if !own.is_empty() {
+            if own.asks_for_something() {
                 match &mut effect {
                     Some(e) => e.merge(&own),
                     None => effect = Some(own),
@@ -895,6 +998,20 @@ fn margin_sides(value: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
     }
 }
 
+/// Whether a declaration's value is the CSS keyword that takes the property
+/// away rather than asking for it.
+///
+/// `unset` is the one that matters, because it is the one the real sheet uses —
+/// `.subheadword .sense { margin-left: unset }` — and the one kindlegen was
+/// measured to honour, leaving the 21,890 `.subheadword` elements of the real
+/// Wadoku build unindented where kindling kept the indent its other rule asked
+/// for. Only `unset` is read this way: a value that is merely not a length —
+/// `auto`, `0`, `0.4em`, `calc(…)` — is left alone rather than taken for a
+/// reset, and stays in the sheet where it always did.
+fn unsets(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("unset")
+}
+
 /// Compile one declaration list — the body of a rule, or the value of an
 /// element's own `style` attribute — into the effect it asks for, plus the
 /// text of every declaration it could not compile.
@@ -960,14 +1077,29 @@ fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<St
                 Some(c) => effect.background = Some(c),
                 None => consumed = false,
             },
+            "margin-top" if unsets(&value) => {
+                effect.height = None;
+                effect.height_unset = true;
+                consumed = false;
+            }
             "margin-top" => match height_value(&value) {
                 Some(h) => effect.height = Some(h),
                 None => consumed = false,
             },
+            "margin-bottom" if unsets(&value) => {
+                effect.spacer = None;
+                effect.spacer_unset = true;
+                consumed = false;
+            }
             "margin-bottom" => match height_value(&value) {
                 Some(h) => effect.spacer = Some(h),
                 None => consumed = false,
             },
+            "margin-left" if unsets(&value) => {
+                effect.indent = false;
+                effect.indent_unset = true;
+                consumed = false;
+            }
             "margin-left" => {
                 if height_value(&value).is_some() {
                     effect.indent = true;
@@ -980,16 +1112,29 @@ fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<St
             "margin" => {
                 let (top, bottom, left) = margin_sides(&value);
                 let mut expressed = false;
+                if unsets(&value) {
+                    // `margin: unset` is every side at once, so it clears every
+                    // margin an earlier rule asked for.
+                    effect.height = None;
+                    effect.height_unset = true;
+                    effect.spacer = None;
+                    effect.spacer_unset = true;
+                    effect.indent = false;
+                    effect.indent_unset = true;
+                }
                 if let Some(h) = top.and_then(height_value) {
                     effect.height = Some(h);
+                    effect.height_unset = false;
                     expressed = true;
                 }
                 if let Some(h) = bottom.and_then(height_value) {
                     effect.spacer = Some(h);
+                    effect.spacer_unset = false;
                     expressed = true;
                 }
                 if left.and_then(height_value).is_some() {
                     effect.indent = true;
+                    effect.indent_unset = false;
                     expressed = true;
                 }
                 if !expressed {
@@ -1073,15 +1218,25 @@ pub(crate) fn compile(css: &str) -> Compiled {
         // `rt`, `.accent`, `i.genus`, `.descr` and `.etym` with it.
         let parts: Vec<&str> = selectors.split(',').collect();
         let mut parsed: Vec<Selector> = Vec::new();
+        // The parts that were compiled and can carry the declarations this left
+        // uncompiled, and the parts the sheet has to keep the whole block for.
         let mut readable: Vec<&str> = Vec::new();
-        let mut unusable: Vec<&str> = Vec::new();
+        let mut sheet_parts: Vec<&str> = Vec::new();
         for part in &parts {
-            match parse_selector(&without_comments(part)) {
-                Some(selector) => {
+            match read_part(part) {
+                Part::Simple(selector) => {
                     parsed.push(selector);
                     readable.push(part);
                 }
-                None => unusable.push(part),
+                // A descendant selector is compiled against its leading
+                // compound, but the rule still has to reach the sheet: the
+                // elements its descendant half names can only be styled from
+                // there, and the compiled effect lands on different ones.
+                Part::Leading(selector) => {
+                    parsed.push(selector);
+                    sheet_parts.push(part);
+                }
+                Part::Unreadable => sheet_parts.push(part),
             }
         }
         if parsed.is_empty() {
@@ -1099,7 +1254,7 @@ pub(crate) fn compile(css: &str) -> Compiled {
             .any(|s| s.element.as_deref().is_none_or(carries_align));
         let (effect, kept) = compile_declarations(block, align_expressible);
 
-        if !effect.is_empty() {
+        if effect.asks_for_something() {
             for selector in &parsed {
                 effects.insert(selector, &effect);
             }
@@ -1108,8 +1263,8 @@ pub(crate) fn compile(css: &str) -> Compiled {
         // block and all: nothing else can style the elements they name. The
         // parts that were compiled have theirs removed below, so no element is
         // ever reachable by both a compiled tag and the sheet's own rule.
-        if !unusable.is_empty() && !effect.is_empty() {
-            residual.push_str(&unusable.join(","));
+        if !sheet_parts.is_empty() && !effect.is_empty() {
+            residual.push_str(&sheet_parts.join(","));
             residual.push('{');
             residual.push_str(block);
             residual.push_str(";}");
@@ -1985,9 +2140,98 @@ v { margin-left: 0.4em; }",
         assert!(c.residual_css.contains("#id"));
         assert!(c.residual_css.contains("font-weight: bold"));
         // A rule with nothing readable in it is kept exactly as it arrived.
-        let c = compile("p b, #id { font-weight: bold; }");
+        let c = compile("#id, [data-x] { font-weight: bold; }");
         assert!(c.effects.is_empty());
-        assert_eq!(c.residual_css, "p b, #id { font-weight: bold; }");
+        assert_eq!(c.residual_css, "#id, [data-x] { font-weight: bold; }");
+    }
+
+    #[test]
+    fn a_descendant_selector_compiles_against_its_leading_compound() {
+        // Measured on kindlegen 2.9: `.a .b` indents a `.a` even when the entry
+        // holds no `.b` at all, so the compound before the space is what the
+        // rule acts on.
+        let e = effects_of(".a .b { margin-left: 1em; }  ");
+        assert!(e.get("div", r#" class="a""#).unwrap().indent);
+        assert!(e.get("span", r#" class="b""#).is_none());
+        // A leading element, an element-qualified class and a class in an
+        // inline style all reach their leading compound.
+        let e = effects_of("span .b { font-size: .4em; } div.a .b { color: red; }");
+        assert_eq!(e.get("span", "").unwrap().size, Some(-3));
+        assert_eq!(e.get("div", r#" class="a""#).unwrap().color.as_deref(), Some("red"));
+        // The rule stays in the sheet, because the elements the descendant half
+        // names can only be styled from there.
+        let c = compile("div.a .b { margin-left: 1em; }".to_string().as_str());
+        assert!(c.residual_css.contains(".b"));
+    }
+
+    #[test]
+    fn only_a_descendant_combinator_reads_as_its_leading_compound() {
+        // Measured: `.a + .b`, `.a > .b` and `a.ref > *` produce nothing at all
+        // in kindlegen, while `a.ref *` produces what `a.ref` asks for.
+        for css in [
+            ".a + .b { margin-left: 1em; }",
+            ".a > .b { margin-left: 1em; }",
+            "a.ref > * { font-style: italic; }",
+        ] {
+            let e = effects_of(css);
+            assert!(e.get("div", r#" class="a""#).is_none(), "{css:?}");
+            assert!(e.get("a", r#" class="ref""#).is_none(), "{css:?}");
+        }
+        let e = effects_of("a.ref * { font-style: italic; }");
+        assert!(e.get("a", r#" class="ref""#).unwrap().italic);
+        // A leading compound that carries an id is one this cannot match.
+        let e = effects_of("#x .b { margin-left: 1em; }");
+        assert!(e.is_empty());
+        // A compound of several classes does match here, against the class
+        // attribute that spells them.
+        let e = effects_of(".a.master .b { font-style: italic; }");
+        assert!(e.get("div", r#" class="a master""#).unwrap().italic);
+    }
+
+    #[test]
+    fn an_unset_margin_takes_away_the_one_an_earlier_rule_asked_for() {
+        // The real sheet's pair: `.subheadword { margin-left: 10px }` and
+        // `.subheadword .sense { margin-left: unset }`. kindlegen leaves those
+        // 21,890 elements unindented, and the `unset` is why.
+        let e = effects_of(
+            ".subheadword { margin-left: 10px; } \
+             .subheadword .sense { margin-left: unset; }",
+        );
+        assert!(!e.get("div", r#" class="subheadword""#).unwrap().indent);
+        // The other order keeps it, which is source order deciding as usual.
+        let e = effects_of(
+            ".subheadword .sense { margin-left: unset; } \
+             .subheadword { margin-left: 10px; }",
+        );
+        assert!(e.get("div", r#" class="subheadword""#).unwrap().indent);
+        // An `unset` under a selector that never had a margin adds nothing, and
+        // does not make the entry walk run either.
+        let c = compile(".related { margin-left: unset; }");
+        assert!(c.effects.is_empty());
+        assert!(c.residual_css.contains("margin-left: unset"));
+        // An inline `unset` beats a rule the same way.
+        let e = effects_of(".a { margin-left: 1em; }".to_string().as_str());
+        assert!(
+            !apply(r#"<div class="a" style="margin-left: unset">x</div>"#, &e)
+                .contains("blockquote")
+        );
+        // The three sides and the shorthand all clear.
+        let e = effects_of(
+            "div { margin: 20px 1em 30px; } \
+             div { margin-top: unset; margin-bottom: unset; }",
+        );
+        let eff = e.get("div", "").unwrap();
+        assert!(
+            eff.height.is_none() && eff.spacer.is_none() && eff.indent,
+            "{eff:?}"
+        );
+        // And the shorthand clears all three sides at once.
+        let e = effects_of("div { margin: 20px 1em 30px; } div { margin: unset; }");
+        let eff = e.get("div", "").unwrap();
+        assert!(
+            !(eff.height.is_some() || eff.spacer.is_some() || eff.indent),
+            "{eff:?}"
+        );
     }
 
     #[test]
