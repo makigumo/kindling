@@ -86,6 +86,26 @@ pub struct OPFData {
     /// OEB 1.x `<x-metadata><EmbeddedCover>cover.png</EmbeddedCover>` cover
     /// href, used by kindlegen as a legacy alternative to Method 1 / Method 2.
     pub embedded_cover_href: Option<String>,
+    /// Every `<guide><reference .../></guide>` item, in document order.
+    ///
+    /// A MOBI6 reader navigates by the `filepos` the guide carries, so these
+    /// are the jump targets kindlegen writes into the `<head>` of the text
+    /// blob. Wadoku's OPF names its table of contents plus every entry file
+    /// (one `text` reference per kana group), which is what the device's
+    /// guide menu lists.
+    pub guide: Vec<GuideReference>,
+}
+
+/// One `<guide><reference type="..." title="..." href="..."/>` item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideReference {
+    /// The reference's `type` (`toc`, `text`, `cover`, ...), which is the key
+    /// the firmware looks a guide item up by.
+    pub type_: String,
+    /// The reference's display title, verbatim from the OPF.
+    pub title: String,
+    /// The href the reference points at, as written in the OPF.
+    pub href: String,
 }
 
 impl OPFData {
@@ -121,6 +141,7 @@ impl OPFData {
             package_version: String::new(),
             dc_types: Vec::new(),
             embedded_cover_href: None,
+            guide: Vec::new(),
         };
 
         // Clean the XML for parsing - strip namespace prefixes that may be unbound
@@ -137,6 +158,7 @@ impl OPFData {
         let mut in_metadata = false;
         let mut in_manifest = false;
         let mut in_spine = false;
+        let mut in_guide = false;
         let mut current_tag = String::new();
         let mut package_unique_identifier_id = String::new();
         let mut current_identifier_id = String::new();
@@ -170,6 +192,47 @@ impl OPFData {
                         }
                         "metadata" => in_metadata = true,
                         "manifest" => in_manifest = true,
+                        "guide" => in_guide = true,
+                        "reference" if in_guide => {
+                            // A guide item without an href points nowhere, so
+                            // it is not a jump target the reader could use.
+                            // kindlegen drops those too.
+                            let mut type_ = String::new();
+                            let mut title = String::new();
+                            let mut href = String::new();
+                            for attr in e.attributes().flatten() {
+                                // The type and the title are written into the
+                                // MOBI's head verbatim, so they are unescaped
+                                // here and escaped again on the way out; a
+                                // title spelled `Preface &amp; Notes` reached
+                                // the device as `Preface &amp;amp; Notes`
+                                // before that. The href is left as the package
+                                // document spells it, because the manifest's
+                                // hrefs are, and resolution compares the two.
+                                let text = |raw: &[u8]| match attr.unescape_value() {
+                                    Ok(v) => v.to_string(),
+                                    // A stray `&` or an entity this crate does
+                                    // not know: keep the bytes and let the
+                                    // writer escape them.
+                                    Err(_) => String::from_utf8_lossy(raw).to_string(),
+                                };
+                                match attr.key.as_ref() {
+                                    b"type" => {
+                                        type_ = text(&attr.value);
+                                    }
+                                    b"title" => {
+                                        title = text(&attr.value);
+                                    }
+                                    b"href" => {
+                                        href = String::from_utf8_lossy(&attr.value).to_string();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !href.is_empty() {
+                                self.guide.push(GuideReference { type_, title, href });
+                            }
+                        }
                         "spine" => {
                             in_spine = true;
                             // Check for page-progression-direction attribute
@@ -388,6 +451,7 @@ impl OPFData {
                         "metadata" => in_metadata = false,
                         "manifest" => in_manifest = false,
                         "spine" => in_spine = false,
+                        "guide" => in_guide = false,
                         "identifier" => current_identifier_id.clear(),
                         _ => {}
                     }

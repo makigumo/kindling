@@ -5929,6 +5929,125 @@ mod tests {
         println!("  \u{2713} CSS <style> block preserved in dictionary text output");
     }
 
+    #[test]
+    fn test_dict_guide_references_get_filepos_targets() {
+        // A MOBI6 reader jumps by a guide reference's `filepos` and ignores its
+        // href, so a guide written from the OPF's hrefs - or with one
+        // hardcoded `title="IndexName" type="index"` reference - navigates
+        // nowhere. kindlegen writes one reference per OPF guide item, in OPF
+        // order, each pointing at the byte offset of the document its href
+        // names.
+        let dir = TempDir::new("dict_guide_refs");
+        fs::write(
+            dir.path().join("front.html"),
+            r#"<html><head><title>Front</title></head><body><h1>Frontmatter</h1></body></html>"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("dict.html"),
+            r#"<html><head></head><body><idx:entry><idx:orth value="apfel">apfel</idx:orth><b>apfel</b> ein Obst<hr/></idx:entry></body></html>"#,
+        )
+        .unwrap();
+
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Guide Dict</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">de</dc:language>
+    <dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">Tester</dc:creator>
+    <x-metadata>
+      <DictionaryInLanguage>ja</DictionaryInLanguage>
+      <DictionaryOutLanguage>de</DictionaryOutLanguage>
+      <DefaultLookupIndex>default</DefaultLookupIndex>
+    </x-metadata>
+  </metadata>
+  <manifest>
+    <item id="front" href="front.html" media-type="application/xhtml+xml"/>
+    <item id="dict" href="dict.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="front"/>
+    <itemref idref="dict"/>
+  </spine>
+  <guide>
+    <reference type="toc" title="Inhaltsverzeichnis" href="front.html"/>
+    <reference type="text" title="apfel" href="dict.html"/>
+    <reference type="text" title="nowhere" href="outside.html"/>
+  </guide>
+</package>"#;
+        let opf_path = dir.path().join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let blob = extract_text_from_uncompressed_mobi(&data).into_bytes();
+
+        // The guide is written as kindlegen writes it: the OPF's own titles
+        // and types, in OPF order.
+        let guide_start = |blob: &[u8], pat: &[u8]| {
+            blob.windows(pat.len())
+                .position(|w| w == pat)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "guide reference {} missing from the blob",
+                        String::from_utf8_lossy(pat)
+                    )
+                })
+        };
+        let toc = guide_start(
+            &blob,
+            b"<reference title=\"Inhaltsverzeichnis\" type=\"toc\"  filepos=",
+        );
+        let apfel = guide_start(&blob, b"<reference title=\"apfel\" type=\"text\"  filepos=");
+        let nowhere = guide_start(
+            &blob,
+            b"<reference title=\"nowhere\" type=\"text\"  filepos=",
+        );
+        assert!(toc < apfel && apfel < nowhere, "references keep OPF order");
+
+        // Read the ten digits that follow a `filepos=`, and follow the
+        // resolved ones like a reader does: the byte at that offset has to be
+        // the start of the document the OPF named.
+        const FILEPOS: &[u8] = b"filepos=";
+        let target_of = |at: usize| -> String {
+            let i = blob[at..]
+                .windows(FILEPOS.len())
+                .position(|w| w == FILEPOS)
+                .map(|p| p + at + FILEPOS.len())
+                .expect("a guide reference without a filepos attribute");
+            String::from_utf8_lossy(&blob[i..i + 10]).to_string()
+        };
+        let parse_target = |at: usize, which: &str| -> usize {
+            let digits = target_of(at);
+            digits.parse().unwrap_or_else(|_| {
+                panic!(
+                    "{which} reference not resolved; guide is {:?}",
+                    String::from_utf8_lossy(&blob[toc..(toc + 320).min(blob.len())])
+                )
+            })
+        };
+        let toc_target = parse_target(toc, "toc");
+        let apfel_target = parse_target(apfel, "text");
+        assert!(
+            String::from_utf8_lossy(&blob[toc_target..toc_target + 40])
+                .starts_with("<h1>Frontmatter</h1>"),
+            "the toc reference must land on the front-matter document, got {:?}",
+            String::from_utf8_lossy(&blob[toc_target..toc_target + 40])
+        );
+        assert!(
+            String::from_utf8_lossy(&blob[apfel_target..apfel_target + 12]).contains("apfel"),
+            "the text reference must land on the entry, got {:?}",
+            String::from_utf8_lossy(&blob[apfel_target..apfel_target + 40])
+        );
+        // A reference naming a document that is not in the spine keeps the
+        // inert, same-width marker an unresolved cross-reference gets.
+        assert_eq!(
+            target_of(nowhere),
+            "XXXXXXXXXX",
+            "a reference outside the spine must not claim a position"
+        );
+        println!("  \u{2713} Dict guide: 3 OPF references, targets resolve to their documents");
+    }
+
     /// The lookup popup applies no stylesheet, so styling a dictionary through
     /// CSS alone renders every entry in the reader's default face (issue #57).
     /// The rules that have a legacy tag to compile to are resolved into the

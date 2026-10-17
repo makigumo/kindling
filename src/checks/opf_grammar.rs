@@ -992,6 +992,7 @@ mod tests {
             manifest_items: Vec::new(),
             raw_itemrefs: Vec::new(),
             embedded_cover_href: None,
+            guide: Vec::new(),
         };
         // Construct via public API. We fall back to from_opf_path so we get
         // the real caches; if parse fails for any reason the unit tests that

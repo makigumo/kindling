@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Guide Items Test Book</dc:title>
+    <dc:language>en</dc:language>
+    <dc:creator>Kindling Test Suite</dc:creator>
+    <dc:identifier id="BookId">kindling-guide-items</dc:identifier>
+    <meta name="cover" content="cover-img"/>
+  </metadata>
+  <manifest>
+    <item id="cover-img" href="cover.jpg" media-type="image/jpeg" properties="coverimage"/>
+    <item id="doc1" href="doc1.html" media-type="application/xhtml+xml"/>
+    <item id="doc2" href="doc2.html" media-type="application/xhtml+xml"/>
+    <item id="ncx" href="content.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="doc1"/>
+    <itemref idref="doc2"/>
+  </spine>
+</package>

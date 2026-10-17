@@ -289,6 +289,177 @@ fn legacy_mobi_marks_a_link_it_cannot_resolve_as_dead() {
 }
 
 // ---------------------------------------------------------------------------
+// MOBI6 / KF7: the guide
+// ---------------------------------------------------------------------------
+
+/// One `<reference .../>` in the head of a merged MOBI6 blob.
+#[derive(Debug)]
+struct GuideRef {
+    title: String,
+    type_: String,
+    /// Byte offset the reference points at, or `None` while it still holds
+    /// the ten-`X` placeholder kindlegen leaves for a reference it cannot
+    /// resolve.
+    target: Option<usize>,
+}
+
+/// Every guide reference in the blob, in stored order.
+fn kf7_guide(blob: &str) -> Vec<GuideRef> {
+    let Some(open) = blob.find("<guide>") else {
+        return Vec::new();
+    };
+    let close = blob[open..]
+        .find("</guide>")
+        .map(|i| open + i)
+        .unwrap_or(blob.len());
+    let mut out = Vec::new();
+    let mut from = open;
+    while let Some(rel) = blob[from..close].find("<reference ") {
+        let at = from + rel;
+        let tag_end = blob[at..]
+            .find("/>")
+            .map(|i| at + i)
+            .expect("unterminated reference");
+        let tag = &blob[at..tag_end];
+        let attr = |name: &str| -> String {
+            let key = format!("{name}=\"");
+            let start = tag
+                .find(&key)
+                .unwrap_or_else(|| panic!("{tag:?} has no {name}"))
+                + key.len();
+            let rest = &tag[start..];
+            rest[..rest.find('"').expect("unterminated attribute")].to_string()
+        };
+        let value =
+            &tag[tag.find("filepos=").expect("reference without filepos") + "filepos=".len()..];
+        out.push(GuideRef {
+            title: attr("title"),
+            type_: attr("type"),
+            target: value[..10].parse::<usize>().ok(),
+        });
+        from = tag_end;
+    }
+    out
+}
+
+/// Build `tests/fixtures/<dir>/content.opf` as a legacy dual-format `.mobi`
+/// and return the parsed file with its KF7 text blob as a string.
+fn build_guide_fixture(dir: &str, slot: &str) -> (ParsedMobi, String) {
+    let opf = fixture_dir(dir).join("content.opf");
+    let tmp = std::env::temp_dir().join("kindling_links").join(slot);
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    let out = tmp.join("out.mobi");
+
+    let run = Command::new(kindling_bin())
+        .arg("build")
+        .arg(&opf)
+        .arg("-o")
+        .arg(&out)
+        .arg("--no-validate")
+        .arg("--legacy-mobi")
+        .output()
+        .expect("failed to spawn kindling-cli");
+    assert!(
+        run.status.success(),
+        "build {} failed: {:?}\n--stderr--\n{}",
+        opf.display(),
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let raw = fs::read(&out).unwrap_or_else(|e| panic!("read {}: {e}", out.display()));
+    let parsed = parse_mobi_file(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", out.display()));
+    let blob =
+        String::from_utf8(extract_text_blob(&parsed, &parsed.kf7)).expect("KF7 blob is UTF-8");
+    (parsed, blob)
+}
+
+#[test]
+fn legacy_mobi_writes_the_opf_guide_with_resolved_filepos_targets() {
+    let (_parsed, blob) = build_guide_fixture("guide_items", "guide_items");
+
+    // kindlegen's MOBI6 head carries the guide as its first child, and a
+    // MOBI6 reader builds the guide menu from it. Before this the book path
+    // wrote no guide at all, so "Go To" was empty in a legacy `.mobi`.
+    assert!(
+        blob.starts_with("<html><head><guide>"),
+        "the guide must be the head's first child: {:?}",
+        &blob[..60]
+    );
+
+    let refs = kf7_guide(&blob);
+    let items: Vec<(&str, &str)> = refs
+        .iter()
+        .map(|r| (r.title.as_str(), r.type_.as_str()))
+        .collect();
+    assert_eq!(
+        items,
+        vec![
+            ("Table of Contents", "toc"),
+            ("First Chapter", "text"),
+            ("Deep Anchor", "text"),
+            // The OPF spells this title `Preface &amp; Notes`; the head
+            // carries exactly one level of escaping, so what the reader
+            // shows is `Preface & Notes`.
+            ("Preface &amp; Notes", "faq"),
+        ],
+        "every OPF guide item, in OPF order, with its own title and type"
+    );
+
+    // An entity in the title is unescaped when the package is read and
+    // escaped once on the way into the head. `&amp;amp;` is what a title
+    // escaped twice shows the reader instead of `&`.
+    assert!(
+        blob.contains(r#"title="Preface &amp; Notes""#),
+        "the title must be escaped exactly once"
+    );
+    assert!(
+        !blob.contains("&amp;amp;"),
+        "a title must not be escaped twice"
+    );
+
+    // The NCX is not a content document, so there is no byte to jump to.
+    // kindlegen leaves the reference's ten X's in place, and so does this.
+    assert_eq!(refs[0].target, None, "the NCX reference cannot resolve");
+
+    // Every other reference lands where a link to the same place lands: the
+    // document itself for a bare href, and the element carrying the fragment
+    // for `#anchor` — not the start of the document that holds it.
+    let first = refs[1].target.expect("doc1.html must resolve");
+    assert_eq!(element_text(&blob, first), "First Chapter");
+    let anchor = refs[2].target.expect("doc2.html#anchor must resolve");
+    assert!(
+        blob[anchor..].starts_with(r#"<h2 id="anchor">"#),
+        "the fragment must land on its own element: {:?}",
+        &blob[anchor..anchor + 30]
+    );
+    assert_eq!(element_text(&blob, anchor), "Deep Anchor");
+    let second = refs[3].target.expect("doc2.html must resolve");
+    assert_eq!(element_text(&blob, second), "Second Chapter");
+    assert!(
+        second < anchor,
+        "the document reference must land on the document's start ({second}), \
+         before the anchor inside it ({anchor})"
+    );
+}
+
+#[test]
+fn legacy_mobi_writes_an_empty_guide_when_the_opf_has_none() {
+    let (_parsed, blob) = build_guide_fixture("guide_no_guide", "guide_none");
+
+    // kindlegen writes `<guide></guide>` for a book whose package declares no
+    // guide, so its absence here would be a difference from the reference
+    // build rather than a correctness win.
+    assert!(
+        blob.starts_with("<html><head><guide></guide>"),
+        "an empty guide still belongs in the head: {:?}",
+        &blob[..60]
+    );
+    assert!(kf7_guide(&blob).is_empty());
+    assert_eq!(blob.matches("<reference").count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // KF8: kindle:pos
 // ---------------------------------------------------------------------------
 
