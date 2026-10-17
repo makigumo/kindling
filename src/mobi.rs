@@ -2471,12 +2471,24 @@ fn extract_css_content(
     }
 
     // Source 2: <link href="*.css"> scanned from the spine HTML, each link
-    // resolved against the document it was found in.
+    // resolved against the document it was found in. A link naming no file is
+    // reported, because the styling it carries is then simply absent from the
+    // build; the report is de-duplicated by href, since a book whose every
+    // chapter links the same missing sheet has one missing sheet.
     let link_re = Regex::new(r#"(?i)<link\b[^>]*\bhref\s*=\s*"([^"]+\.css)"[^>]*>"#).unwrap();
+    let mut warned_hrefs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, part) in html_parts.iter().enumerate() {
         let document = spine_docs.get(i).map(|p| p.as_path());
         for caps in link_re.captures_iter(part) {
             let href = caps.get(1).unwrap().as_str();
+            if let Some(doc) = document {
+                if !is_external_href(href)
+                    && linked_stylesheet_path(doc, &opf.base_dir, &percent_decode(href)).is_none()
+                    && warned_hrefs.insert(href.to_string())
+                {
+                    warn_missing_stylesheet(doc, &opf.base_dir, href);
+                }
+            }
             take_css(
                 href,
                 document,
@@ -2523,6 +2535,46 @@ fn package_relative_dir(path: &Path, base_dir: &Path) -> Option<String> {
         Some((dir, _)) => dir.to_string(),
         None => String::new(),
     })
+}
+
+/// Whether a stylesheet `href` names something outside the package.
+///
+/// An absolute URL, a protocol-relative one and a `data:` payload are not
+/// missing files: nothing inside the package could satisfy them, and calling
+/// them missing would put a warning on every EPUB that links a web font.
+/// A scheme is a letter followed by letters, digits, `+`, `-` or `.`
+/// (RFC 3986); anything else is a path that happens to contain a colon.
+fn is_external_href(href: &str) -> bool {
+    let href = href.trim();
+    if href.starts_with("//") {
+        return true;
+    }
+    match href.split_once(':') {
+        Some((scheme, _)) => {
+            !scheme.is_empty()
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Report a linked stylesheet that names no file at all.
+///
+/// Nothing of it reaches the build, so the chapter that linked it ships with
+/// the reader's default styling and no other sign that a stylesheet was
+/// expected. Naming the href and the document that links it is what makes it
+/// findable; the document is named by its path inside the package, which is
+/// what a message can be acted on from.
+fn warn_missing_stylesheet(document: &Path, base_dir: &Path, href: &str) {
+    let from =
+        package_relative(document, base_dir).unwrap_or_else(|| document.display().to_string());
+    eprintln!(
+        "Warning: linked stylesheet {href} not found (from {from}); \
+         its styling is not in the build"
+    );
 }
 
 /// The file an HTML document's stylesheet `href` names, when it is on disk.
@@ -3140,6 +3192,9 @@ fn build_text_content_by_letter(
     let mut dict_styles: Vec<String> = Vec::new();
     let mut seen_style_blocks: HashSet<String> = HashSet::new();
     let mut seen_css_paths: HashSet<std::path::PathBuf> = HashSet::new();
+    // Links that named no file, so the same missing sheet is reported once
+    // however many files link it.
+    let mut warned_hrefs: HashSet<String> = HashSet::new();
     let mut has_frameset = false;
     let body_re = Regex::new(r"(?s)<body[^>]*>(.*?)</body>").unwrap();
     let style_re = Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap();
@@ -3186,6 +3241,12 @@ fn build_text_content_by_letter(
                         let Some(css_path) =
                             linked_stylesheet_path(html_path, &opf.base_dir, &decoded)
                         else {
+                            // A dictionary takes its whole stylesheet from this
+                            // scan, so a link naming nothing costs it every rule
+                            // in that sheet and says so now.
+                            if !is_external_href(&href) && warned_hrefs.insert(href.clone()) {
+                                warn_missing_stylesheet(html_path, &opf.base_dir, &href);
+                            }
                             continue;
                         };
                         let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
@@ -4867,6 +4928,40 @@ mod record_split_tests {
             msg.contains("65536"),
             "message should name the record count: {msg}"
         );
+    }
+
+    /// Only a `href` that could name a file inside the package is reported when
+    /// it resolves to nothing: a stylesheet on the web is not a missing file,
+    /// and reporting it would put a warning on every EPUB that links a webfont.
+    #[test]
+    fn only_a_local_href_can_name_a_missing_stylesheet() {
+        for href in [
+            "https://example.com/style.css",
+            "HTTPS://EXAMPLE.COM/style.css",
+            "http://example.com/style.css",
+            "//example.com/style.css",
+            "data:text/css,p%7B%7D",
+            "kindle:flow:0001",
+            // A colon in the first segment is a scheme, whatever it spells
+            // (RFC 3986), so this is not a path either.
+            "weird:name/style.css",
+        ] {
+            assert!(is_external_href(href), "{href:?} is outside the package");
+        }
+        for href in [
+            "style.css",
+            "styles/style.css",
+            "../style.css",
+            "./style.css",
+            "a.b/style.css",
+            "style.css?v=1#x",
+            "content/ch1%20copy/style.css",
+        ] {
+            assert!(
+                !is_external_href(href),
+                "{href:?} names a file in the package"
+            );
+        }
     }
 
     /// A non-breaking space is the character you reach for precisely when you

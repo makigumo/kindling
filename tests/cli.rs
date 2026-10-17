@@ -887,6 +887,102 @@ mod validate {
     }
 
     #[test]
+    fn build_reports_a_linked_stylesheet_that_names_no_file() {
+        // A `<link rel="stylesheet">` naming a file that is not anywhere costs
+        // the book that chapter's styling, and used to do it without a word:
+        // the sheet is not read, nothing of it reaches the build, and the
+        // reader quietly falls back to its defaults. One warning, naming the
+        // sheet and the document that links it, is the only sign there is.
+        let tmp = TempDir::new("missing_css");
+        let mut content = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+"#,
+        );
+        for i in 1..=4 {
+            content.push_str(&format!(
+                "    <item id=\"c{i}\" href=\"content/ch{i}.html\" media-type=\"application/xhtml+xml\"/>\n"
+            ));
+        }
+        content.push_str("  </manifest>\n  <spine>\n");
+        for i in 1..=4 {
+            content.push_str(&format!("    <itemref idref=\"c{i}\"/>\n"));
+        }
+        content.push_str("  </spine>\n</package>\n");
+        std::fs::write(tmp.path().join("content.opf"), content).unwrap();
+        std::fs::create_dir_all(tmp.path().join("content")).unwrap();
+        // Two chapters link a sheet that is not there, in a directory that says
+        // which document the link is relative to; the third links a stylesheet
+        // on the web, which is not a missing file, and the fourth links a sheet
+        // that is there, which must stay quiet.
+        for (i, href) in [
+            (1, "missing.css"),
+            (2, "missing.css"),
+            (3, "https://example.invalid/web.css"),
+            (4, "present.css"),
+        ] {
+            std::fs::write(
+                tmp.path().join("content").join(format!("ch{i}.html")),
+                format!(
+                    r#"<html><head><title>C{i}</title><link rel="stylesheet" type="text/css" href="{href}"/></head><body><p>text</p></body></html>"#
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("content").join("present.css"),
+            "p { padding: 41px; }",
+        )
+        .unwrap();
+        let out = run_build(&[
+            tmp.path().join("content.opf").to_str().unwrap(),
+            "--no-validate",
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "a missing sheet is a warning, not a failed build\n{}",
+            dump(&out)
+        );
+        assert!(
+            stderr.contains("linked stylesheet missing.css not found"),
+            "the missing sheet must be named\n{}",
+            dump(&out)
+        );
+        assert!(
+            stderr.contains("content/ch1.html"),
+            "the document that links it must be named, as a path inside the package\n{}",
+            dump(&out)
+        );
+        assert_eq!(
+            stderr.matches("missing.css").count(),
+            1,
+            "two chapters linking one missing sheet is one missing sheet\n{}",
+            dump(&out)
+        );
+        assert!(
+            !stderr.contains("web.css"),
+            "a stylesheet on the web is not a missing file\n{}",
+            dump(&out)
+        );
+        assert!(
+            !stderr.contains("present.css"),
+            "a link that resolves must stay quiet\n{}",
+            dump(&out)
+        );
+        // The book itself still builds, and its chapters still ship.
+        let built = std::fs::read(tmp.path().join("content.azw3"))
+            .or_else(|_| std::fs::read(tmp.path().join("content.mobi")))
+            .expect("the build must still write its output");
+        assert!(!built.is_empty(), "the built file must not be empty");
+    }
+
+    #[test]
     fn build_pyglossary_oeb1x_dict_succeeds() {
         // Regression for issue #3: PyGlossary emits an OEB 1.x OPF
         // (`<dc-metadata>` / `<x-metadata>` with capitalized Dublin Core
