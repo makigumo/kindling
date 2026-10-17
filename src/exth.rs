@@ -626,6 +626,7 @@ pub fn build_exth(
     headword_chars: &HashSet<u32>,
     creator_tag: bool,
     cover_offset: Option<u32>,
+    resource_count: u32,
 ) -> Vec<u8> {
     let mut records: Vec<Vec<u8>> = Vec::new();
 
@@ -756,8 +757,14 @@ pub fn build_exth(
     // Dictionary in-memory flag
     records.push(exth_record(547, b"InMemory"));
 
-    // EXTH 125 (value 1)
-    records.push(exth_record(125, &1u32.to_be_bytes()));
+    // EXTH 125 (kf8_count_resources_fonts): the number of resource records
+    // (images and embedded fonts) in this section, as `build_book_exth` writes
+    // it. This used to be a hardcoded 1 whatever the dictionary shipped: a
+    // Wadoku build with two image records claimed one, and a text-only
+    // dictionary claimed one it did not have. kindlegen writes the real count
+    // (its Wadoku carries three images plus a RESC record, so 4), and nothing
+    // in the reader needs the number to be 1, so it is the real count now.
+    records.push(exth_record(125, &resource_count.to_be_bytes()));
 
     // Assemble EXTH
     let record_data: Vec<u8> = records.iter().flat_map(|r| r.iter().copied()).collect();
@@ -842,6 +849,7 @@ mod tests {
             &chars,
             false,
             None,
+            0,
         );
         let records = parse_exth_records(&exth);
         let got: Vec<String> = find_all_records(&records, 105)
@@ -874,6 +882,7 @@ mod tests {
             &chars,
             false,
             None,
+            0,
         );
         let records = parse_exth_records(&exth);
         let got: Vec<String> = find_all_records(&records, 105)
@@ -901,6 +910,7 @@ mod tests {
             &chars,
             false,
             None,
+            0,
         );
         let records = parse_exth_records(&exth);
         assert_eq!(
@@ -1264,6 +1274,7 @@ mod tests {
             &chars,
             false,
             None,
+            0,
         );
         assert_eq!(&exth[0..4], b"EXTH");
         let records = parse_exth_records(&exth);
