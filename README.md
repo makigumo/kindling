@@ -627,7 +627,7 @@ EXTH records are type-length-value metadata entries in Record 0, following the M
 | 113 | ASIN | Books, comics | UTF-8 string | Written only alongside a 501. The pair names the device-side cover file (`system/thumbnails/thumbnail_<113>_<501>_portrait.jpg`), which is what the lock screen shows. Value is a UUID the EPUB already publishes, or one derived from its metadata so rebuilds stay stable (issue #26) |
 | 121 | KF8 boundary | Books | u32 BE | Record index of KF8 Record 0 |
 | 122 | Fixed layout | Books | `"true"` | Present only for fixed-layout content |
-| 125 | (unknown) | Both | u32 BE | 1 for dictionaries, 21 for books |
+| 125 | Resource records | Both | u32 BE | The number of resource records the section writes: a dictionary counts its image records (2 in the Wadoku build — its cover and its logo image — where kindlegen's 3 images plus a RESC make 4), a book its image records plus any embedded fonts (2 in the `clean_book` and `simple_book` fixtures, which is a cover and its thumbnail, where kindlegen's `simple_book` reference writes 3). A dictionary used to write a fixed 1 whatever it shipped |
 | 131 | (unknown) | Both | u32 BE = 0 | |
 | 201 | Cover offset | Books | u32 BE | Image record offset for cover |
 | 202 | Thumbnail offset | Books | u32 BE | Image record offset for thumbnail |

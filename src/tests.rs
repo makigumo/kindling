@@ -9006,18 +9006,46 @@ p { margin: 0.3em 0; }
     }
 
     #[test]
-    fn test_dict_exth_125_value_1() {
-        let dir = TempDir::new("dict_exth_125");
+    fn test_dict_exth_125_is_real_resource_count() {
+        // EXTH 125 (kf8_count_resources_fonts) counts the section's resource
+        // records, as it does for books. It used to be a hardcoded 1 for every
+        // dictionary: a text-only dictionary claimed a resource it did not
+        // ship, and Wadoku's two image records claimed one. kindlegen writes
+        // the real count.
+        let value_125 = |rec0: &[u8]| {
+            let exth = parse_exth_records(rec0);
+            let entries = exth.get(&125).expect("Dict EXTH 125 should be present");
+            u32::from_be_bytes([entries[0][0], entries[0][1], entries[0][2], entries[0][3]])
+        };
+
+        let dir = TempDir::new("dict_exth_125_plain");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
         let (_, _, offsets) = parse_palmdb(&data);
         let rec0 = get_record(&data, &offsets, 0);
-        let exth = parse_exth_records(rec0);
+        let val = value_125(rec0);
+        assert_eq!(
+            val, 0,
+            "a dictionary with no images or fonts must claim 0 resources, got {}",
+            val
+        );
 
-        let entries = exth.get(&125).expect("Dict EXTH 125 should be present");
-        let val = u32::from_be_bytes([entries[0][0], entries[0][1], entries[0][2], entries[0][3]]);
-        assert_eq!(val, 1, "Dict EXTH 125 should be 1, got {}", val);
-        println!("  \u{2713} Dict EXTH 125: {}", val);
+        let dir = TempDir::new("dict_exth_125_cover");
+        let jpeg = make_test_jpeg();
+        let opf = create_dict_fixture_with_cover(dir.path(), &[("word", &["words"])], &jpeg);
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        let val = value_125(rec0);
+        assert_eq!(
+            val, 1,
+            "a dictionary with one image record must claim one resource, got {}",
+            val
+        );
+        println!(
+            "  \u{2713} Dict EXTH 125: no images = 0, one cover = {}",
+            val
+        );
     }
 
     #[test]
