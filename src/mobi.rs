@@ -1179,6 +1179,11 @@ fn build_book_mobi(
     // id of the i-th spine HTML file. Used to rewrite internal `<a href>`
     // links to `kindle:pos:fid:...` and to label the per-section NCX nodes.
     let mut spine_hrefs = opf.get_content_html_hrefs();
+    // The same list as paths, aligned the same way (both are built from
+    // `spine_items` with the same filter), which is what lets a stylesheet
+    // link be resolved against the document that writes it. The three lists
+    // move together wherever one of them does.
+    let mut spine_paths = opf.get_content_html_paths();
 
     // Drop a leading bare cover page from the reading flow (matches
     // kindlegen): the Kindle renders the metadata cover full-page, so an
@@ -1192,6 +1197,7 @@ fn build_book_mobi(
         eprintln!("Dropping in-spine cover page (cover renders full-page from metadata)");
         html_parts.remove(0);
         spine_hrefs.remove(0);
+        spine_paths.remove(0);
     }
 
     // Kindle publishing limits checks for books
@@ -1233,7 +1239,8 @@ fn build_book_mobi(
         }
     }
 
-    let (css_content, css_basenames) = extract_css_content(opf, &html_parts, &font_embeds);
+    let (css_content, css_basenames) =
+        extract_css_content(opf, &html_parts, &spine_paths, &font_embeds);
     let css_content = if strip_font_css {
         let stripped = crate::fonts::strip_font_locking_css(&css_content);
         if stripped != css_content {
@@ -2381,13 +2388,22 @@ fn build_html_parts(opf: &OPFData) -> Vec<String> {
 ///     from every xhtml `<head>` but never declare it in the manifest, so
 ///     a manifest-only walk silently drops the styling.
 ///
-/// CSS files are resolved relative to `opf.base_dir` and de-duplicated by
-/// canonical path so a stylesheet shared by every part is concatenated
-/// once. Manifest CSS comes first, then link-discovered CSS in first-seen
-/// order, joined with `\n` (matching the previous behavior).
+/// Manifest CSS is resolved relative to `opf.base_dir`, which is what a
+/// manifest href means, and de-duplicated by canonical path so a stylesheet
+/// shared by every part is concatenated once. Manifest CSS comes first, then
+/// link-discovered CSS in first-seen order, joined with `\n` (matching the
+/// previous behavior).
+///
+/// A link is resolved against the document that writes it, the way the file it
+/// names is meant, with the package root tried second — see
+/// [`linked_stylesheet_path`]. `spine_docs` is the spine HTML in the same order
+/// as `html_parts`, so each part knows where it came from; a part with no path
+/// (which a caller can no longer produce, but the signature allows) falls back
+/// to the package-relative reading.
 fn extract_css_content(
     opf: &OPFData,
     html_parts: &[String],
+    spine_docs: &[std::path::PathBuf],
     font_embeds: &std::collections::HashMap<String, (usize, String)>,
 ) -> (String, std::collections::HashSet<String>) {
     let mut css_parts: Vec<String> = Vec::new();
@@ -2399,11 +2415,18 @@ fn extract_css_content(
         std::collections::HashSet::new();
 
     let take_css = |href: &str,
+                    document: Option<&Path>,
                     css_parts: &mut Vec<String>,
                     extracted: &mut std::collections::HashSet<String>,
                     seen: &mut std::collections::HashSet<std::path::PathBuf>| {
         let decoded = percent_decode(href);
-        let css_path = opf.base_dir.join(&decoded);
+        // A manifest href is package-relative; a link is relative to the file
+        // that writes it, which is what `linked_stylesheet_path` handles. Both
+        // forms land on the same path when the two agree, and the canonical
+        // path below is what keeps a sheet shared by every part to one copy.
+        let css_path = document
+            .and_then(|doc| linked_stylesheet_path(doc, &opf.base_dir, &decoded))
+            .unwrap_or_else(|| opf.base_dir.join(&decoded));
         let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
         if !seen.insert(key) {
             return;
@@ -2411,14 +2434,20 @@ fn extract_css_content(
         if let Ok(content) = std::fs::read_to_string(&css_path) {
             // Rewrite @font-face src urls (relative to this stylesheet's
             // directory) to the kindle:embed index of the embedded font
-            // resource (issue #18).
-            let css_dir = match decoded.rfind('/') {
-                Some(i) => &decoded[..i],
-                None => "",
-            };
+            // resource (issue #18). The directory comes from where the sheet
+            // was found rather than from the href text, because a document in
+            // a subdirectory makes those two different: `content/ch1.html`
+            // linking `style.css` means `content/style.css`, so a font url
+            // inside it resolves against `content/`.
+            let css_dir = package_relative_dir(&css_path, &opf.base_dir).unwrap_or_else(|| {
+                match decoded.rfind('/') {
+                    Some(i) => decoded[..i].to_string(),
+                    None => String::new(),
+                }
+            });
             css_parts.push(crate::fonts::rewrite_css_font_urls(
                 &content,
-                css_dir,
+                &css_dir,
                 font_embeds,
             ));
             if let Some(fname) = decoded.rsplit('/').next() {
@@ -2427,11 +2456,13 @@ fn extract_css_content(
         }
     };
 
-    // Source 1: manifest.
+    // Source 1: manifest. A manifest href is package-relative by definition, so
+    // there is no document to resolve it against.
     for (href, media_type) in opf.manifest.values() {
         if media_type == "text/css" || href.ends_with(".css") {
             take_css(
                 href,
+                None,
                 &mut css_parts,
                 &mut extracted_basenames,
                 &mut seen_paths,
@@ -2439,13 +2470,16 @@ fn extract_css_content(
         }
     }
 
-    // Source 2: <link href="*.css"> scanned from the spine HTML.
+    // Source 2: <link href="*.css"> scanned from the spine HTML, each link
+    // resolved against the document it was found in.
     let link_re = Regex::new(r#"(?i)<link\b[^>]*\bhref\s*=\s*"([^"]+\.css)"[^>]*>"#).unwrap();
-    for part in html_parts {
+    for (i, part) in html_parts.iter().enumerate() {
+        let document = spine_docs.get(i).map(|p| p.as_path());
         for caps in link_re.captures_iter(part) {
             let href = caps.get(1).unwrap().as_str();
             take_css(
                 href,
+                document,
                 &mut css_parts,
                 &mut extracted_basenames,
                 &mut seen_paths,
@@ -2454,6 +2488,77 @@ fn extract_css_content(
     }
 
     (css_parts.join("\n"), extracted_basenames)
+}
+
+/// A path relative to the package root, with `.` and `..` folded away (`None`
+/// when it is not under the root at all). Files are named by this rather than
+/// by an absolute path, which says nothing about where they sit in the book.
+fn package_relative(path: &Path, base_dir: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base_dir).ok()?;
+    let rel = rel.to_string_lossy();
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rel.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// The directory a file sits in, relative to the package root.
+///
+/// Used for the `@font-face` urls, which are relative to the stylesheet: the
+/// stylesheet's own directory is where it was found, which for a linked sheet
+/// is not the directory its `href` text spells. A font url that walks back out
+/// of it, into a sibling `fonts/` directory for instance, still resolves,
+/// because
+/// `crate::fonts::rewrite_css_font_urls` folds the joined path itself.
+fn package_relative_dir(path: &Path, base_dir: &Path) -> Option<String> {
+    let rel = package_relative(path, base_dir)?;
+    Some(match rel.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    })
+}
+
+/// The file an HTML document's stylesheet `href` names, when it is on disk.
+///
+/// A relative `href` is relative to the document that writes it, not to the
+/// package: a file under `content/` linking a sheet one directory up means the
+/// sheet beside the OPF. Resolving it against the OPF's own directory instead
+/// looks one level too high, finds nothing and drops the sheet in silence — and
+/// a dictionary takes its *whole* stylesheet from this scan, so every rule in
+/// it goes too. The real Wadoku corpus is exactly that shape: 71 files under
+/// `content/`, each linking a sheet one directory up, whose build shipped no
+/// compiled markup at all. A book has the manifest to fall back on and usually
+/// declares its
+/// sheets, so the same link there only loses the styling of a source that
+/// forgot the manifest entry; [`extract_css_content`] now resolves its links
+/// the same way.
+///
+/// The OPF directory is still tried second, because a source may write its link
+/// against the package root rather than its own directory, which is what this
+/// scan used to assume for every link. That only ever finds a sheet the first
+/// candidate did not, so a source that wrote its links that way keeps working.
+///
+/// `None` when neither candidate is a file: a link that names nothing is not
+/// worth an entry in the stylesheet.
+fn linked_stylesheet_path(
+    document: &Path,
+    base_dir: &Path,
+    href: &str,
+) -> Option<std::path::PathBuf> {
+    if let Some(from_document) = document.parent().map(|dir| dir.join(href)) {
+        if from_document.is_file() {
+            return Some(from_document);
+        }
+    }
+    let from_package = base_dir.join(href);
+    from_package.is_file().then_some(from_package)
 }
 
 /// A `filepos` value is exactly ten digits, so the placeholder written on
@@ -3060,7 +3165,9 @@ fn build_text_content_by_letter(
                         }
                     }
                     // External stylesheets never reached this path at all, so a
-                    // dictionary keeping its CSS in a file got nothing.
+                    // dictionary keeping its CSS in a file got nothing. Each
+                    // link is relative to the file that writes it — see
+                    // `linked_stylesheet_path`.
                     for link in link_re.find_iter(head) {
                         let tag = link.as_str();
                         if !tag.to_ascii_lowercase().contains("stylesheet") {
@@ -3074,7 +3181,13 @@ fn build_text_content_by_letter(
                             continue;
                         }
                         let decoded = percent_decode(&href);
-                        let css_path = opf.base_dir.join(&decoded);
+                        // The link is relative to the file that writes it, which
+                        // is not necessarily the OPF's own directory.
+                        let Some(css_path) =
+                            linked_stylesheet_path(html_path, &opf.base_dir, &decoded)
+                        else {
+                            continue;
+                        };
                         let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
                         if !seen_css_paths.insert(key) {
                             continue;

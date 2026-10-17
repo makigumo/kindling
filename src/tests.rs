@@ -10297,6 +10297,387 @@ p { margin: 0.3em 0; }
                 "a later file's styles must survive too"
             );
         }
+
+        // 4. A link is relative to the document that writes it, not to the
+        //    package. A dictionary keeping its files in a subdirectory and its
+        //    sheet beside the OPF — the shape the real Wadoku corpus has —
+        //    named a file that was never looked for, and lost every rule in it
+        //    without a word.
+        {
+            let dir = TempDir::new("css_document_relative");
+            fs::create_dir(dir.path().join("content")).unwrap();
+            fs::write(
+                dir.path().join("content").join("c.html"),
+                dict_html(
+                    "<head>",
+                    r#"<link rel="stylesheet" type="text/css" href="../style.css"/>"#,
+                    "alpha",
+                ),
+            )
+            .unwrap();
+            fs::write(dir.path().join("style.css"), "p { padding: 5px; }").unwrap();
+            let opf = dir.path().join("content.opf");
+            fs::write(
+                &opf,
+                dict_opf(
+                    r#"<item id="c" href="content/c.html" media-type="application/xhtml+xml"/>"#,
+                    r#"<itemref idref="c"/>"#,
+                ),
+            )
+            .unwrap();
+            let data = build_dict_mobi_bytes(&opf, dir.path());
+            let text = String::from_utf8_lossy(&data);
+            assert!(
+                text.contains("padding: 5px"),
+                "a sheet beside the OPF, named from a file in a subdirectory, must \
+                 reach the dictionary"
+            );
+        }
+
+        // 5. The package-relative form keeps working, and a link naming nothing
+        //    is skipped rather than stopping the scan.
+        {
+            let dir = TempDir::new("css_package_relative");
+            fs::create_dir(dir.path().join("styles")).unwrap();
+            fs::write(
+                dir.path().join("c.html"),
+                dict_html(
+                    "<head>",
+                    concat!(
+                        r#"<link rel="stylesheet" type="text/css" href="styles/style.css"/>"#,
+                        r#"<link rel="stylesheet" type="text/css" href="missing.css"/>"#
+                    ),
+                    "alpha",
+                ),
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join("styles").join("style.css"),
+                "p { padding: 4px; }",
+            )
+            .unwrap();
+            let opf = dir.path().join("content.opf");
+            fs::write(
+                &opf,
+                dict_opf(
+                    r#"<item id="c" href="c.html" media-type="application/xhtml+xml"/>"#,
+                    r#"<itemref idref="c"/>"#,
+                ),
+            )
+            .unwrap();
+            let data = build_dict_mobi_bytes(&opf, dir.path());
+            let text = String::from_utf8_lossy(&data);
+            assert!(
+                text.contains("padding: 4px"),
+                "a sheet in a subdirectory, named from the package root, must still be found"
+            );
+        }
+    }
+
+    /// A book's `<link rel="stylesheet">` names a file relative to the
+    /// document that writes it, and that is where it has to be looked for.
+    ///
+    /// The manifest is the normal route and still comes first: a declared sheet
+    /// is read from the package root, which is what a manifest href means. This
+    /// is the case where the sheet is not declared there, and the link is the
+    /// only thing that mentions it — then the link decides, and a sheet in the
+    /// same subdirectory as the document that links it used to be looked for
+    /// one level too high, found nowhere, and dropped in silence, leaving the
+    /// reader on its default styling.
+    #[test]
+    fn a_book_keeps_a_linked_stylesheet_the_manifest_omits() {
+        /// Build a one-chapter book and report whether the CSS flow carries
+        /// this rule. `no_compress` keeps the flow greppable in the bytes.
+        fn css_flow_contains(css_path: &str, css: &str, href: &str, needle: &str) -> bool {
+            let dir = TempDir::new("book_css");
+            fs::create_dir_all(dir.path().join("content")).unwrap();
+            fs::write(
+                dir.path().join("content").join("ch1.html"),
+                format!(
+                    r#"<html><head><title>C</title><link rel="stylesheet" type="text/css" href="{href}"/></head><body><p>x</p></body></html>"#
+                ),
+            )
+            .unwrap();
+            let sheet = dir.path().join(css_path);
+            fs::create_dir_all(sheet.parent().unwrap()).unwrap();
+            fs::write(&sheet, css).unwrap();
+            let opf_path = dir.path().join("content.opf");
+            fs::write(
+                &opf_path,
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c1" href="content/ch1.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#,
+            )
+            .unwrap();
+            let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+            data.windows(needle.len()).any(|w| w == needle.as_bytes())
+        }
+
+        // 1. The sheet sits beside the document that links it, as `style.css`.
+        assert!(
+            css_flow_contains(
+                "content/style.css",
+                "p { padding: 11px; }",
+                "style.css",
+                "padding: 11px"
+            ),
+            "a sheet beside the linking document must reach the book"
+        );
+
+        // 2. The document's own directory decides, even when a package-root
+        //    file of the same name exists.
+        {
+            let dir = TempDir::new("book_css_ambiguous");
+            fs::create_dir_all(dir.path().join("content")).unwrap();
+            fs::write(
+                dir.path().join("content").join("ch1.html"),
+                r#"<html><head><title>C</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><p>x</p></body></html>"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join("content").join("style.css"),
+                "p { padding: 12px; }",
+            )
+            .unwrap();
+            fs::write(dir.path().join("style.css"), "p { padding: 99px; }").unwrap();
+            let opf_path = dir.path().join("content.opf");
+            fs::write(
+                &opf_path,
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c1" href="content/ch1.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#,
+            )
+            .unwrap();
+            let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+            let text = String::from_utf8_lossy(&data);
+            assert!(
+                text.contains("padding: 12px"),
+                "the sheet the link names must win over a same-named file at the root"
+            );
+            assert!(
+                !text.contains("padding: 99px"),
+                "the package-root file is not the file this link names"
+            );
+        }
+
+        // 3. A link written against the package root still works: the file is
+        //    not beside the document, so the second candidate finds it.
+        assert!(
+            css_flow_contains(
+                "styles/theme.css",
+                "p { padding: 13px; }",
+                "styles/theme.css",
+                "padding: 13px"
+            ),
+            "a sheet named from the package root must still be found"
+        );
+    }
+
+    /// Each document resolves its own link, not the first document's.
+    ///
+    /// Two chapters in two directories each link `style.css`, which is a
+    /// different file in each: both are theirs, so both have to reach the CSS
+    /// flow. Resolving against the first document (or against the package root
+    /// alone) reaches one of them at most, and the other chapter renders with
+    /// the reader's defaults.
+    #[test]
+    fn each_document_resolves_its_own_linked_stylesheet() {
+        let dir = TempDir::new("book_css_per_document");
+        for (sub, word, padding) in [("content", "one", 31), ("parts", "two", 32)] {
+            fs::create_dir_all(dir.path().join(sub)).unwrap();
+            fs::write(
+                dir.path().join(sub).join("ch.html"),
+                format!(
+                    r#"<html><head><title>{word}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><p>{word}</p></body></html>"#
+                ),
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join(sub).join("style.css"),
+                format!("p {{ padding: {padding}px; }}"),
+            )
+            .unwrap();
+        }
+        let opf_path = dir.path().join("content.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="a" href="content/ch.html" media-type="application/xhtml+xml"/>
+    <item id="b" href="parts/ch.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="a"/><itemref idref="b"/></spine>
+</package>"#,
+        )
+        .unwrap();
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let text = String::from_utf8_lossy(&data);
+        for padding in [31, 32] {
+            assert!(
+                text.contains(&format!("padding: {padding}px")),
+                "the sheet of the document that links it must reach the book (padding {padding}px)"
+            );
+        }
+    }
+
+    /// A linked sheet's `@font-face` urls are relative to the sheet, so they
+    /// resolve from where the sheet was found rather than from the directory
+    /// its `href` text spells.
+    ///
+    /// The two only differ when the link is read from a document in another
+    /// directory — `content/ch1.html` linking `style.css` means
+    /// `content/style.css`, so a font url inside it resolves against
+    /// `content/`. Reading the directory off the `href` instead (`""` here)
+    /// sends the url to the package root and the font reference is left as
+    /// written, which the reader resolves against nothing.
+    #[test]
+    fn a_linked_sheets_font_urls_resolve_from_where_the_sheet_is() {
+        let dir = TempDir::new("book_css_font");
+        fs::create_dir_all(dir.path().join("content").join("fonts")).unwrap();
+        let mut font_data = vec![0x00u8, 0x01, 0x00, 0x00];
+        font_data.extend((0..3000u32).flat_map(|i| i.to_be_bytes()));
+        fs::write(
+            dir.path().join("content").join("fonts").join("C.ttf"),
+            &font_data,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("content").join("style.css"),
+            "@font-face { font-family: C; src: url(\"fonts/C.ttf\"); }\nbody { font-family: C; }",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("content").join("ch1.html"),
+            r#"<html><head><title>C</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><p>x</p></body></html>"#,
+        )
+        .unwrap();
+        let opf_path = dir.path().join("content.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c1" href="content/ch1.html" media-type="application/xhtml+xml"/>
+    <item id="f1" href="content/fonts/C.ttf" media-type="application/x-font-ttf"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#,
+        )
+        .unwrap();
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let needle = b"url(kindle:embed:0001?mime=application/x-font-ttf)";
+        assert!(
+            data.windows(needle.len()).any(|w| w == needle),
+            "the font url must resolve from the directory the sheet was found in"
+        );
+    }
+
+    /// A dictionary entry's `<pre>` has to ship the way kindlegen ships it.
+    ///
+    /// MOBI has no `<pre>` and the popup has no stylesheet, so a `<pre>` is
+    /// replaced by a spacer for its top margin, its indent, and
+    /// `<div align="left"><tt>`, with its whitespace spelled out in `<br/>` and
+    /// `&nbsp;`. kindling used to ship the source element and its raw
+    /// whitespace, which the popup then collapsed to one line.
+    #[test]
+    fn a_dictionary_entry_with_a_pre_ships_kindlegens_wrapper() {
+        fn dict_html(body: &str, styles: &str) -> String {
+            format!(
+                r#"<html xmlns:idx="idx"><head><title>D</title>{styles}</head>
+<body><mbp:frameset><idx:entry><idx:orth value="alpha"><b>alpha</b></idx:orth>
+{body}</idx:entry></mbp:frameset></body></html>"#
+            )
+        }
+        fn dict_opf() -> String {
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">D</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+    <x-metadata><DictionaryInLanguage>en</DictionaryInLanguage>
+    <DictionaryOutLanguage>en</DictionaryOutLanguage></x-metadata>
+  </metadata>
+  <manifest><item id="c" href="c.html" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c"/></spine>
+</package>"#
+                .to_string()
+        }
+
+        // No stylesheet at all: the element is still transliterated, and the
+        // indentation of the second line survives as `&nbsp;` where a run of
+        // plain spaces would be collapsed away.
+        {
+            let dir = TempDir::new("pre_bare");
+            fs::write(
+                dir.path().join("c.html"),
+                dict_html("<pre>  x\ny</pre>", ""),
+            )
+            .unwrap();
+            let opf = dir.path().join("content.opf");
+            fs::write(&opf, dict_opf()).unwrap();
+            let data = build_dict_mobi_bytes(&opf, dir.path());
+            let text = String::from_utf8_lossy(&data);
+            assert!(
+                !text.contains("<pre"),
+                "a <pre> must not reach the popup: {}",
+                &text[..text.len().min(400)]
+            );
+            assert!(
+                text.contains(
+                    r#"<div height="0"></div><div align="left"><tt>&nbsp;&nbsp;x<br/>y</tt></div>"#
+                ),
+                "the spacer, the wrapper and the encoded whitespace must all be there"
+            );
+        }
+
+        // With a sheet rule: the indent wraps the generated wrapper and the
+        // bold goes inside the `<tt>`, both where kindlegen puts them.
+        {
+            let dir = TempDir::new("pre_styled");
+            fs::write(
+                dir.path().join("c.html"),
+                dict_html(
+                    r#"<pre class="code">x</pre>"#,
+                    r#"<style type="text/css">pre { margin-left: 1em; margin-bottom: 20px; font-weight: bold; }</style>"#,
+                ),
+            )
+            .unwrap();
+            let opf = dir.path().join("content.opf");
+            fs::write(&opf, dict_opf()).unwrap();
+            let data = build_dict_mobi_bytes(&opf, dir.path());
+            let text = String::from_utf8_lossy(&data);
+            assert!(
+                text.contains(
+                    r#"<blockquote><div align="left"><tt><b>x</b></blockquote></tt></div><div height="20"></div>"#
+                ),
+                "a rule for pre must land on the wrapper it becomes"
+            );
+        }
     }
 
     /// The EPUB 3 cover property is `cover-image`; kindling only matched the
