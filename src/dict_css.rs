@@ -736,12 +736,23 @@ fn size_delta(value: &str) -> Option<i8> {
 
 /// Split a declaration block into `(property, value)` pairs, keeping the
 /// original text of each so uncompiled ones can be put back verbatim.
+///
+/// The property and value are read from the declaration with its comments taken
+/// out, so `/* why */ color: red` is a `color` and `red /* and not pink */` is
+/// `red`; the original text is what a declaration that is not compiled puts
+/// back. A declaration that is nothing but a comment has no property to read and
+/// is kept for the sheet rather than dropped, since a rule that is written back
+/// should carry what its author wrote in it.
 fn declarations(block: &str) -> Vec<(String, String, String)> {
     block
         .split(';')
         .filter(|d| !d.trim().is_empty())
         .filter_map(|d| {
-            let (name, value) = d.split_once(':')?;
+            let bare = without_comments(d);
+            if bare.trim().is_empty() {
+                return Some((String::new(), String::new(), d.to_string()));
+            }
+            let (name, value) = bare.split_once(':')?;
             Some((
                 name.trim().to_ascii_lowercase(),
                 without_important(value.trim()).to_string(),
@@ -994,6 +1005,32 @@ fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<St
     (effect, kept)
 }
 
+/// The selector text with CSS comments taken out.
+///
+/// A comment is not a selector, but it stands exactly where one is expected:
+/// the real Wadoku sheet opens with a `/** … */` banner before `.poses`, and
+/// since the text between two rules is read as the next rule's selector list,
+/// that banner landed inside it and disqualified the rule behind it. The whole
+/// sheet then compiled for nothing but its first rule. Anything from `/*` to the
+/// next `*/` goes, and an unterminated `/*` swallows the rest of the text, which
+/// is what a browser does with it too.
+///
+/// Only the parse sees this: whatever a rule leaves in the sheet is written back
+/// as the author wrote it, comments included.
+fn without_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("*/") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Compile a stylesheet into inline effects plus whatever is left of it.
 ///
 /// Later rules win over earlier ones for the same selector, which is the
@@ -1026,7 +1063,10 @@ pub(crate) fn compile(css: &str) -> Compiled {
         }
 
         let parts: Vec<&str> = selectors.split(',').collect();
-        let parsed: Option<Vec<Selector>> = parts.iter().map(|p| parse_selector(p)).collect();
+        let parsed: Option<Vec<Selector>> = parts
+            .iter()
+            .map(|p| parse_selector(&without_comments(p)))
+            .collect();
         let Some(parsed) = parsed.filter(|p| !p.is_empty()) else {
             // One unusable part disqualifies the rule: putting back only the
             // parts that compiled would drop styling the sheet asked for.
@@ -1915,6 +1955,49 @@ v { margin-left: 0.4em; }",
         let c = compile("b, #id { font-weight: bold; }");
         assert!(c.effects.is_empty());
         assert!(c.residual_css.contains("#id"));
+    }
+
+    #[test]
+    fn a_comment_before_a_rule_does_not_disqualify_it() {
+        // The real Wadoku sheet opens with a banner comment before `.poses`,
+        // which the real build showed does not compile kindlegen's `<i>`.
+        let c = compile("/**\nMedia queries:\namzn-mobi\namzn-kf8\n */\n.poses { font-style: italic; }");
+        assert!(c.effects.get("span", r#" class="poses""#).unwrap().italic);
+        assert_eq!(c.residual_css.trim(), "");
+    }
+
+    #[test]
+    fn a_comment_inside_a_selector_list_does_not_disqualify_a_part() {
+        let e = effects_of(".def, /* the other one */ .other { font-weight: bold; }");
+        assert!(e.get("span", r#" class="def""#).unwrap().bold);
+        assert!(e.get("span", r#" class="other""#).unwrap().bold);
+        // And a comment *inside* the block is not a declaration either.
+        let e = effects_of(".def { /* margin first */ font-weight: bold; }");
+        assert!(e.get("span", r#" class="def""#).unwrap().bold);
+    }
+
+    #[test]
+    fn a_comment_stays_where_the_rule_it_stands_in_stays() {
+        // A rule this cannot use is written back whole, comment and all, so a
+        // sheet kept for the reader keeps what its author wrote.
+        let css = "/* why: the heading */\n.heading { padding-left: 2em; }";
+        let c = compile(css);
+        assert_eq!(c.residual_css, css);
+        // An unterminated comment swallows the rule behind it, as a browser
+        // swallows it, and leaves no effect behind.
+        let c = compile("/* never closed\n.def { font-weight: bold; }");
+        assert!(c.effects.is_empty());
+        assert!(c.residual_css.starts_with("/* never closed"));
+    }
+
+    #[test]
+    fn only_a_comment_is_removed_from_the_selector_text() {
+        assert_eq!(without_comments(".a"), ".a");
+        assert_eq!(without_comments("/* x */ .a"), " .a");
+        assert_eq!(without_comments(".a/* x */.b"), ".a.b");
+        assert_eq!(without_comments(".a /* one */ /* two */"), ".a  ");
+        assert_eq!(without_comments("/* a */"), "");
+        assert_eq!(without_comments(".a /* open"), ".a ");
     }
 
     #[test]
