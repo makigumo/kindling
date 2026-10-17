@@ -1436,9 +1436,7 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
             open_stack.push(("pre".to_string(), close, effect.trailing_spacer()));
             return;
         }
-        let Some(effect) = effect else {
-            return;
-        };
+        let effect = effect.unwrap_or_default();
         // `bgcolor` belongs on the element itself, so it goes just inside the
         // start tag's `>`. Self-closing elements were skipped above, which is
         // what makes the last byte of this span that `>`.
@@ -1448,15 +1446,17 @@ pub(crate) fn apply<'a>(html: &'a str, effects: &Effects) -> Cow<'a, str> {
             }
         }
         let (open, close) = effect.markup();
-        let spacer = effect.trailing_spacer();
-        // An effect can be an attribute or a trailing spacer alone, with
-        // nothing to wrap.
-        if !open.is_empty() || spacer.is_some() {
-            if !open.is_empty() {
-                inserts.push((tag.end, open));
-            }
-            open_stack.push((tag.name.clone(), close, spacer));
+        if !open.is_empty() {
+            inserts.push((tag.end, open));
         }
+        // Every element that is not self-closing goes on the stack, with an
+        // empty close when it has no markup of its own. Matching a close by
+        // name alone finds the innermost *open* element of that name, so an
+        // element that pushed nothing — a bare `<div>` inside a
+        // `<div class="a">` — used to swallow the outer element's close: the
+        // `<blockquote>` was closed at the inner `</div>` and whatever followed
+        // it inside the outer element fell outside the indent.
+        open_stack.push((tag.name.clone(), close, effect.trailing_spacer()));
     });
 
     // Source markup that never closes an element would otherwise leave the
@@ -2146,6 +2146,26 @@ v { margin-left: 0.4em; }",
     }
 
     #[test]
+    fn a_close_finds_the_element_that_is_actually_open() {
+        // The outer `.a` div's content continues after a bare inner `<div>` of
+        // the same name. Matching a close by name alone found the outer element
+        // when the inner `</div>` arrived — the inner one had pushed nothing —
+        // and closed the `<blockquote>` there, which put `after` outside the
+        // indent. kindlegen nests an inner wrapper of its own on that element;
+        // this is the shape kindling writes until it does.
+        let e = effects_of(".a { margin-left: 1em; }");
+        assert_eq!(
+            apply(r#"<div class="a">before<div>inner</div>after</div>"#, &e),
+            r#"<div class="a"><blockquote>before<div>inner</div>after</blockquote></div>"#
+        );
+        // A bare element with no wrapper of its own still closes what it should.
+        assert_eq!(
+            apply(r#"<div class="a"><p>x</p>y</div>"#, &e),
+            r#"<div class="a"><blockquote><p>x</p>y</blockquote></div>"#
+        );
+    }
+
+    #[test]
     fn a_descendant_selector_compiles_against_its_leading_compound() {
         // Measured on kindlegen 2.9: `.a .b` indents a `.a` even when the entry
         // holds no `.b` at all, so the compound before the space is what the
@@ -2157,7 +2177,10 @@ v { margin-left: 0.4em; }",
         // inline style all reach their leading compound.
         let e = effects_of("span .b { font-size: .4em; } div.a .b { color: red; }");
         assert_eq!(e.get("span", "").unwrap().size, Some(-3));
-        assert_eq!(e.get("div", r#" class="a""#).unwrap().color.as_deref(), Some("red"));
+        assert_eq!(
+            e.get("div", r#" class="a""#).unwrap().color.as_deref(),
+            Some("red")
+        );
         // The rule stays in the sheet, because the elements the descendant half
         // names can only be styled from there.
         let c = compile("div.a .b { margin-left: 1em; }".to_string().as_str());
@@ -2270,7 +2293,9 @@ v { margin-left: 0.4em; }",
     fn a_comment_before_a_rule_does_not_disqualify_it() {
         // The real Wadoku sheet opens with a banner comment before `.poses`,
         // which the real build showed does not compile kindlegen's `<i>`.
-        let c = compile("/**\nMedia queries:\namzn-mobi\namzn-kf8\n */\n.poses { font-style: italic; }");
+        let c = compile(
+            "/**\nMedia queries:\namzn-mobi\namzn-kf8\n */\n.poses { font-style: italic; }",
+        );
         assert!(c.effects.get("span", r#" class="poses""#).unwrap().italic);
         assert_eq!(c.residual_css.trim(), "");
     }
