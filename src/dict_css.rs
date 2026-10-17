@@ -1062,17 +1062,33 @@ pub(crate) fn compile(css: &str) -> Compiled {
             continue;
         }
 
+        // Every part that can be read is compiled, and the rule stays in the
+        // sheet for the parts that cannot — a descendant selector, an id, a
+        // pseudo-class — carrying its whole declaration block there, because
+        // only a stylesheet can reach the elements those parts name.
+        //
+        // Measured on the real Wadoku sheet: one `.season small` in a list
+        // beside five usable selectors cost the build 82,716 of the 107,416
+        // `<font>` tags kindlegen 2.9 writes, since dropping the rule dropped
+        // `rt`, `.accent`, `i.genus`, `.descr` and `.etym` with it.
         let parts: Vec<&str> = selectors.split(',').collect();
-        let parsed: Option<Vec<Selector>> = parts
-            .iter()
-            .map(|p| parse_selector(&without_comments(p)))
-            .collect();
-        let Some(parsed) = parsed.filter(|p| !p.is_empty()) else {
-            // One unusable part disqualifies the rule: putting back only the
-            // parts that compiled would drop styling the sheet asked for.
+        let mut parsed: Vec<Selector> = Vec::new();
+        let mut readable: Vec<&str> = Vec::new();
+        let mut unusable: Vec<&str> = Vec::new();
+        for part in &parts {
+            match parse_selector(&without_comments(part)) {
+                Some(selector) => {
+                    parsed.push(selector);
+                    readable.push(part);
+                }
+                None => unusable.push(part),
+            }
+        }
+        if parsed.is_empty() {
+            // Nothing in the rule can be read, so the sheet keeps it whole.
             residual.push_str(whole);
             continue;
-        };
+        }
 
         // A selector that names an element cannot be any other element, so the
         // whole rule's `text-align` is either expressible or is not. A class
@@ -1088,7 +1104,17 @@ pub(crate) fn compile(css: &str) -> Compiled {
                 effects.insert(selector, &effect);
             }
         }
-        // Put the rule back only if something in it was not compiled. A rule
+        // The parts that could not be read keep the rule's declarations, whole
+        // block and all: nothing else can style the elements they name. The
+        // parts that were compiled have theirs removed below, so no element is
+        // ever reachable by both a compiled tag and the sheet's own rule.
+        if !unusable.is_empty() && !effect.is_empty() {
+            residual.push_str(&unusable.join(","));
+            residual.push('{');
+            residual.push_str(block);
+            residual.push_str(";}");
+        }
+        // Put the rest back only if something in it was not compiled. A rule
         // that compiled nothing is written back exactly as it arrived rather
         // than rebuilt, so a sheet this cannot use still reaches the reader
         // unchanged down to its spacing.
@@ -1096,7 +1122,7 @@ pub(crate) fn compile(css: &str) -> Compiled {
             if effect.is_empty() {
                 residual.push_str(whole);
             } else {
-                residual.push_str(selectors);
+                residual.push_str(&readable.join(","));
                 residual.push('{');
                 residual.push_str(&kept.join(";"));
                 residual.push_str(";}");
@@ -1948,13 +1974,52 @@ v { margin-left: 0.4em; }",
     }
 
     #[test]
-    fn a_selector_list_compiles_only_when_every_part_does() {
+    fn a_selector_list_compiles_the_parts_it_can_read() {
         let e = effects_of("b, strong { font-weight: bold; }");
         assert!(e.get("b", "").unwrap().bold && e.get("strong", "").unwrap().bold);
-        // One unusable part disqualifies the whole rule, so the sheet keeps it.
+        // A part that cannot be read keeps the rule in the sheet while the
+        // parts beside it compile.
         let c = compile("b, #id { font-weight: bold; }");
-        assert!(c.effects.is_empty());
+        assert!(c.effects.get("b", "").unwrap().bold);
+        assert!(c.effects.get("span", r#" id="id""#).is_none());
         assert!(c.residual_css.contains("#id"));
+        assert!(c.residual_css.contains("font-weight: bold"));
+        // A rule with nothing readable in it is kept exactly as it arrived.
+        let c = compile("p b, #id { font-weight: bold; }");
+        assert!(c.effects.is_empty());
+        assert_eq!(c.residual_css, "p b, #id { font-weight: bold; }");
+    }
+
+    #[test]
+    fn one_unusable_part_no_longer_takes_the_others_with_it() {
+        // The real Wadoku rule, with `.season small` in it: kindlegen compiles
+        // the five parts it can read, and kindling used to drop all six.
+        let css = "rt, .accent, i.genus, .descr, .etym, .season small \
+                   { font-size: .4em; color: #3d3d3d; }";
+        let e = effects_of(css);
+        for (element, attrs) in [
+            ("rt", ""),
+            ("span", r#" class="accent""#),
+            ("i", r#" class="genus""#),
+            ("span", r#" class="descr""#),
+            ("span", r#" class="etym""#),
+        ] {
+            let eff = e
+                .get(element, attrs)
+                .unwrap_or_else(|| panic!("{element}{attrs} was not compiled"));
+            assert_eq!(eff.size, Some(-3), "{element}{attrs}");
+            assert_eq!(eff.color.as_deref(), Some("#3d3d3d"), "{element}{attrs}");
+        }
+        // Only the unreadable part stays in the sheet, and it keeps the whole
+        // declaration block, because nothing else can reach its elements.
+        let c = compile(css);
+        assert!(c.residual_css.contains(".season small"));
+        assert!(c.residual_css.contains("font-size: .4em"));
+        assert!(
+            !c.residual_css.contains(".etym"),
+            "a compiled part was left in the sheet: {:?}",
+            c.residual_css
+        );
     }
 
     #[test]
