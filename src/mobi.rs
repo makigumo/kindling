@@ -767,7 +767,11 @@ fn build_dictionary_mobi(
         None, // no HD images for dictionaries
         creator_tag,
         None, // no doc_type for dictionaries
-        0,    // unused: the dictionary EXTH (build_exth) writes its own 125
+        // EXTH 125: the dictionary section's resource records, which are its
+        // images. A MOBI7-only dictionary carries no embedded fonts and no
+        // RESC record, so this is the image count (kindlegen writes the same
+        // thing plus one per RESC record).
+        num_image_records as u32,
         huffdic_model,
         datp_index,
         kf7_ncx_index_record,
@@ -7876,6 +7880,7 @@ fn build_record0(
             headword_chars,
             creator_tag,
             cover_offset,
+            resource_count,
         )
     } else {
         let asin = doc_type.map(|_| exth::book_asin(&opf.dc_identifiers, full_name, &opf.author));
