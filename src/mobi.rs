@@ -3736,7 +3736,13 @@ fn convert_list_markers(html: &str) -> String {
 }
 
 /// Strip idx: namespace tags from HTML, keeping only display content.
-fn strip_idx_markup(html: &str) -> String {
+///
+/// `pub(crate)` so the stylesheet compiler's tests can assert on the markup an
+/// entry actually ships: this pass runs immediately after `dict_css::apply` on
+/// every entry, and it is the one that takes the `class` and `style`
+/// attributes off, so a compiler test that stopped at `apply` would be reading
+/// a shape no reader ever sees.
+pub(crate) fn strip_idx_markup(html: &str) -> String {
     use std::sync::OnceLock;
     // kindlegen drops a <script> element, content and all, from a
     // dictionary's text (checked on a PyGlossary dictionary). Kept, its code

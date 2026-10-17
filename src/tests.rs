@@ -6002,6 +6002,88 @@ p { margin: 0.3em 0; }
         println!("  \u{2713} dictionary CSS compiled into inline popup markup");
     }
 
+    /// An element's own `style="…"` attribute compiles the way a rule does.
+    ///
+    /// The entry strip takes `style` attributes off the shipped entries
+    /// (issue #6: the library-search preview bails on them), so a declaration
+    /// list written inline used to reach neither the popup nor the stylesheet
+    /// and the styling was lost in silence. kindlegen resolves those
+    /// declarations into the same legacy markup it compiles a rule to, and
+    /// this does too now: on an inner element, on the entry wrapper itself,
+    /// and beside a sheet rule for the element it sits on.
+    #[test]
+    fn test_dict_css_compiles_inline_style_attributes() {
+        let dir = TempDir::new("dict_inline_style");
+
+        let html = r#"<html><head><style type="text/css">
+.sense { margin-left: 10px; }
+</style></head><body>
+<idx:entry style="font-style:italic"><idx:orth value="zstyle"><b>zstyle</b></idx:orth><div class="sense" style="color:red">first <span style="font-size:260%;font-weight:bold">BIG</span> sense</div><p style="padding-left:2em;text-align:center">plain</p></idx:entry>
+</body></html>"#;
+        fs::write(dir.path().join("content.html"), html).unwrap();
+
+        let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Inline Style Dict</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+    <dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">Tester</dc:creator>
+    <x-metadata>
+      <DictionaryInLanguage>en</DictionaryInLanguage>
+      <DictionaryOutLanguage>en</DictionaryOutLanguage>
+      <DefaultLookupIndex>default</DefaultLookupIndex>
+    </x-metadata>
+  </metadata>
+  <manifest>
+    <item id="content" href="content.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="content"/>
+  </spine>
+</package>"#;
+        let opf_path = dir.path().join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let text = extract_text_from_uncompressed_mobi(&data);
+
+        // The sheet rule's indent and the element's own colour, one wrapped
+        // inside the other, with the nested span's own inline declarations
+        // compiled where they sit.
+        assert!(
+            text.contains(
+                r##"<div><blockquote><font color="red">first <span><font size="+3"><b>BIG</b></font></span> sense</font></blockquote></div>"##
+            ),
+            "the class rule and the inline declarations should both compile, got: {}",
+            &text[..text.len().min(1200)]
+        );
+        // A `style` on the entry wrapper reaches the entries inside it: the
+        // `<i>` opens ahead of the headword and closes after the last element,
+        // holding everything between.
+        assert!(
+            text.contains("<i><b>zstyle</b>") && text.contains("</p></i><hr/>"),
+            "the entry wrapper's own style should wrap the entry, got: {}",
+            &text[..text.len().min(1200)]
+        );
+        // `text-align` compiles to the element's own `align` attribute —
+        // measured: kindlegen ships `<p align="center">plain</p>` for this
+        // element — while `padding-left`, which has no legacy form, compiles
+        // to nothing and goes with the attribute.
+        assert!(
+            text.contains(r#"<p align="center">plain</p>"#),
+            "text-align should reach the element as align, got: {}",
+            &text[..text.len().min(1200)]
+        );
+        for gone in ["style=", "padding-left", "text-align"] {
+            assert!(
+                !text.contains(gone),
+                "{gone} must not survive into the shipped text: {}",
+                &text[..text.len().min(1200)]
+            );
+        }
+        println!("  \u{2713} inline style attributes compiled into popup markup");
+    }
+
     /// Everything outside an `<idx:entry>` used to be dropped in silence:
     /// letter headings, a note between entries, the body of an entry the
     /// parser rejects, a closing paragraph. The build exited 0 and the text

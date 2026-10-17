@@ -993,6 +993,20 @@ mod validate {
             !bytes.windows(7).any(|w| w == b"style=\""),
             "style=\"...\" attribute must be stripped from dict entries"
         );
+
+        // The glyph cell carries `text-align: center` inline. Compiling it is
+        // what keeps the alignment now that the attribute is gone, and the
+        // value goes on the element itself as the legacy `align`, measured
+        // against kindlegen 2.9.
+        let rawml = mobi_rawml(&expected);
+        assert!(
+            rawml.contains(r#"<td align="center">"#),
+            "text-align should compile to align on the cell\n{rawml}"
+        );
+        assert!(
+            !rawml.contains("text-align"),
+            "the compiled declaration must not survive in the text\n{rawml}"
+        );
     }
 
     #[test]
