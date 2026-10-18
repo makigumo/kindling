@@ -1,10 +1,11 @@
 /// INDX record building for MOBI dictionary index.
 ///
 /// Builds 3 sub-indexes within the orth range:
-///   Sub-index 1: Headword entries (TAGX tags 1, 2) with ORDT/SPL sort tables
+///   Sub-index 1: Headword entries (TAGX tags 1/2 for the text span, 22 for
+///                another label of the same entry) with ORDT/SPL sort tables
 ///   Sub-index 2: Character mapping (TAGX tag 37)
 ///   Sub-index 3: "default" index name (TAGX tag 1)
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
@@ -242,6 +243,11 @@ pub fn build_orth_indx(
     index_name: &str,
 ) -> OrthIndx {
     // --- Sub-index 1: Headword entries ---
+    //
+    // Tags 1/2 carry the entry's text span. Tag 22 carries the ordinal of the
+    // entry record another label of the same entry belongs to (see
+    // `entry_ordinals` below); kindlegen defines it in this position, after 2,
+    // and the control bit is the tag's index in the table.
     let tag_defs1 = [
         TagDef {
             tag_id: 1,
@@ -253,8 +259,32 @@ pub fn build_orth_indx(
             num_values: 1,
             mask: 0x02,
         }, // text length
+        TagDef {
+            tag_id: 22,
+            num_values: 1,
+            mask: 0x04,
+        }, // ordinal of the entry this label belongs to
     ];
     let tagx1 = build_tagx(&tag_defs1);
+
+    // Every label of one entry was emitted with that entry's span (aliases and
+    // inflections share the headword's start and length), so the span is the
+    // entry's identity within this index. The first term with a given span is
+    // the entry record and every later one is another spelling of the same
+    // entry: kindlegen stores that as tag 22 — the ordinal of the entry record
+    // in this index — instead of repeating the span in the alias. Measured on
+    // kindlegen's Wadoku build, all 56,349 tag-22 values are entry-record
+    // positions, a perfect bijection with the 14,580 entries, and the device
+    // follows them.
+    let mut first_with_span: HashMap<(usize, usize), usize> =
+        HashMap::with_capacity(lookup_terms.len());
+    let mut entry_ordinals: Vec<Option<usize>> = Vec::with_capacity(lookup_terms.len());
+    for (i, term) in lookup_terms.iter().enumerate() {
+        let first = *first_with_span
+            .entry((term.start_pos, term.text_len))
+            .or_insert(i);
+        entry_ordinals.push((first != i).then_some(first));
+    }
 
     // Encode every routing entry in parallel. `encode_indx_entry` is a pure
     // function of the label + tag_values (prefix compression is disabled, so
@@ -263,9 +293,12 @@ pub fn build_orth_indx(
     // running byte sizes, but the per-entry encoding was the dominant cost.
     let encoded_entries: Vec<Vec<u8>> = lookup_terms
         .par_iter()
-        .map(|term| {
-            let tag_values: [(u8, u32); 2] =
-                [(1, term.start_pos as u32), (2, term.text_len as u32)];
+        .zip(entry_ordinals.par_iter())
+        .map(|(term, alias_of)| {
+            let tag_values: Vec<(u8, u32)> = match alias_of {
+                None => vec![(1, term.start_pos as u32), (2, term.text_len as u32)],
+                Some(entry) => vec![(22, *entry as u32)],
+            };
             encode_indx_entry(&term.label_bytes, &[], &tag_values, &tag_defs1)
         })
         .collect();
