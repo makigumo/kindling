@@ -445,18 +445,74 @@ fn labels_are_ordt(primary: &[u8], oentries: u32, ordt2_off: usize) -> bool {
         && primary.get(ordt2_off..ordt2_off + 4) == Some(b"ORDT".as_slice())
 }
 
-/// Read one inverted VWI (high bit set marks the last byte) starting at `pos`.
-fn read_vwi_inv(entry: &[u8], mut pos: usize) -> Option<u32> {
+/// Read one inverted VWI (high bit set marks the last byte) starting at `pos`,
+/// returning the value and the position just past it.
+fn read_vwi_inv(entry: &[u8], pos: usize) -> Option<(u32, usize)> {
+    let mut pos = pos;
     let mut value: u32 = 0;
     for _ in 0..5 {
         let b = *entry.get(pos)?;
         value = (value << 7) | (b & 0x7F) as u32;
         pos += 1;
         if b & 0x80 != 0 {
-            return Some(value);
+            return Some((value, pos));
         }
     }
     None
+}
+
+/// TAGX tag table of a primary INDX, in table order: `(tag id, values per
+/// entry)`. Empty when no TAGX sits behind the header.
+fn tagx_tags(primary: &[u8], header_len: usize) -> Vec<(u8, u8)> {
+    if primary.get(header_len..header_len + 4) != Some(b"TAGX".as_slice()) {
+        return Vec::new();
+    }
+    let Some(total) = u32_be(primary, header_len + 4).map(|n| n as usize) else {
+        return Vec::new();
+    };
+    let end = (header_len + total).min(primary.len());
+    let mut tags = Vec::new();
+    let mut at = header_len + 12;
+    while at + 4 <= end {
+        let id = primary[at];
+        let count = primary[at + 1];
+        if id != 0 || count != 0 {
+            tags.push((id, count));
+        }
+        // The (0,0,0,1) sentinel, or a writer that flags its last tag, ends
+        // the table.
+        if primary[at + 3] != 0 {
+            break;
+        }
+        at += 4;
+    }
+    tags
+}
+
+/// The tag values of one data entry, in TAGX order, as `(tag id, value)` with
+/// one item per value (`num_values` is 2 for a start/length pair).
+fn entry_tag_values(
+    entry: &[u8],
+    label_end: usize,
+    control_bytes: usize,
+    tags: &[(u8, u8)],
+) -> Vec<(u8, u32)> {
+    let mut values = Vec::new();
+    let mut pos = label_end + control_bytes;
+    for (index, (tag_id, count)) in tags.iter().enumerate() {
+        let byte = entry.get(label_end + index / 8).copied().unwrap_or(0);
+        if byte & (1 << (index % 8)) == 0 {
+            continue;
+        }
+        for _ in 0..*count {
+            let Some((value, next)) = read_vwi_inv(entry, pos) else {
+                return values;
+            };
+            values.push((*tag_id, value));
+            pos = next;
+        }
+    }
+    values
 }
 
 /// Index encoding declared by an orth primary INDX header (0xFDEA). Weaker
@@ -666,8 +722,12 @@ fn parse_orth_index(data: &[u8]) -> Option<OrthIndex> {
         two_byte: ordt_type == 0,
     };
 
+    let tags = tagx_tags(primary, header_len);
     let mut labels: Vec<Label> = Vec::new();
     let mut ranges: Vec<Range<usize>> = Vec::new();
+    // Labels that carry only tag 22: another spelling of the entry record the
+    // value names, resolved once every record has been read.
+    let mut aliases: Vec<(usize, u32)> = Vec::new();
     for di in 0..num_data {
         let ri = orth_idx + 1 + di;
         if ri >= recs.len() {
@@ -687,8 +747,17 @@ fn parse_orth_index(data: &[u8]) -> Option<OrthIndex> {
             }
             let bytes = &entry[1..1 + label_len];
             let units = coding.units(bytes);
-            // First tag value after the control bytes is the text position.
-            let position = read_vwi_inv(entry, 1 + label_len + control_bytes).unwrap_or(0);
+            // Tag 1 is the text position; tag 22, when the entry has no span
+            // of its own, points at the entry record whose text it opens.
+            let values = entry_tag_values(entry, 1 + label_len, control_bytes, &tags);
+            let position = values
+                .iter()
+                .find(|(id, _)| *id == 1)
+                .map(|(_, value)| *value)
+                .unwrap_or(0);
+            if let Some((_, target)) = values.iter().find(|(id, _)| *id == 22) {
+                aliases.push((labels.len(), *target));
+            }
             labels.push(Label {
                 key: label_key(bytes, &units),
                 units,
@@ -696,6 +765,16 @@ fn parse_orth_index(data: &[u8]) -> Option<OrthIndex> {
             });
         }
         ranges.push(start..labels.len());
+    }
+
+    // Resolve tag-22 aliases: they open the text of the entry record they
+    // name. The target is an ordinal over every label of the index, which is
+    // exactly the position in `labels`; the entry record always comes first
+    // among an entry's labels, so one pass is enough.
+    for (label, target) in aliases {
+        if let Some(position) = labels.get(target as usize).map(|l| l.position) {
+            labels[label].position = position;
+        }
     }
 
     // The routing label of each data record is the label in the primary's
