@@ -201,14 +201,30 @@ fn check_common(code: &str, c: &Lang, parsed: &ParsedMobi, idx: usize, primary: 
     );
 
     let indx = parse_indx(parsed, idx).unwrap_or_else(|e| panic!("{code}: parse INDX: {e}"));
-    // Every entry must point at a real article. The first headword used to
-    // get (0, 0) and render as a blank page (issue #11 white-page bug).
-    for e in &indx.entries {
-        let pos = e.tag_value(1, 0).unwrap_or(0);
-        let len = e.tag_value(2, 0).unwrap_or(0);
+    // Every entry must resolve to a real article. The first headword used to
+    // get (0, 0) and render as a blank page (issue #11 white-page bug), and a
+    // label with no span of its own must be an alias record (tag 22) whose
+    // entry record does carry one: it opens that entry's text.
+    fn span(e: &common::IndxEntry) -> (u32, u32) {
+        (
+            e.tag_value(1, 0).unwrap_or(0),
+            e.tag_value(2, 0).unwrap_or(0),
+        )
+    }
+    for (i, e) in indx.entries.iter().enumerate() {
+        if span(e) != (0, 0) {
+            continue;
+        }
+        let target = e.tag_value(22, 0).unwrap_or_else(|| {
+            panic!("{code}: entry {i} has neither a text span nor a tag-22 entry ordinal")
+        });
+        let target_entry = indx
+            .entries
+            .get(target as usize)
+            .unwrap_or_else(|| panic!("{code}: entry {i}: tag-22 target {target} out of range"));
         assert!(
-            !(pos == 0 && len == 0),
-            "{code}: entry has empty (0,0) text pointer (blank lookup page)"
+            span(target_entry) != (0, 0),
+            "{code}: entry {i}: tag-22 target {target} has no text span either"
         );
     }
 }
