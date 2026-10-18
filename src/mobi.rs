@@ -3631,14 +3631,17 @@ fn build_text_content_by_letter(
         format!("{}<mbp:pagebreak/>{}", fm_body, dict_body)
     };
 
-    // Whatever the compile could not turn into markup still ships, so the
-    // book view keeps its margins and its indentation. The declarations that
-    // did compile are gone from it, or the book view would apply the rule and
-    // the inline tag both and render the effect twice.
-    let style_block = defer_escaped_colon_rules(&compiled_css.residual_css);
+    // A dictionary ships no stylesheet in its `<head>`. Firmware 5.16 answers
+    // `InvalidBookException: BadFormat` at book init for a MOBI6 dictionary
+    // whose first text fragment carries a `<style>` element — "The selected item
+    // could not be opened" — and opens the same build without it; kindlegen's
+    // MOBI7 output carries none either. Everything that can be written as
+    // legacy markup is already compiled into the entries above, which is where
+    // the lookup popup and the book view read it; the residual sheet only ever
+    // served the book view's own margins and indentation.
+    let style_block = String::new();
     let (guide_block, guide_links) = build_guide_block(opf, &documents);
-    // The guide is the head's first child, the way kindlegen writes it; the
-    // style block kindling compiles the source's CSS into follows it.
+    // The guide is the head's only child, the way kindlegen writes it.
     let combined = format!(
         "<html><head>{}{}</head><body>{}  <mbp:pagebreak/></body></html>",
         guide_block, style_block, merged_body
@@ -3805,72 +3808,6 @@ fn romanian_letter_aliases(label: &str, romanian: bool) -> Vec<String> {
         aliases.extend(respell(cedilla, comma_below));
     }
     aliases
-}
-
-/// Move any CSS rule whose selector carries an escaped colon to the end of the
-/// `<style>` block.
-///
-/// The Kindle popup renderer's CSS parser stops at `\:` in a selector and
-/// silently drops every rule after it, so an `idx\:orth { ... }` rule sitting
-/// near the top of a stylesheet takes the whole rest of the sheet down with it
-/// on device (issue #39, reported with device evidence on #27). Putting those
-/// rules last is the reporter's own verified workaround.
-///
-/// Nothing is lost by doing this: `strip_idx_markup` removes the `idx:` tags
-/// before the text blob is built, so a selector targeting one can never match
-/// anything kindling emits. The rules are kept rather than dropped in case a
-/// firmware ever fixes the parser.
-fn defer_escaped_colon_rules(style_block: &str) -> String {
-    if !style_block.contains("\\:") {
-        return style_block.to_string();
-    }
-    // Only the innards of the <style> element are reordered; the open and close
-    // tags stay put.
-    let Some(open_end) = style_block.find('>') else {
-        return style_block.to_string();
-    };
-    let Some(close_start) = style_block.rfind("</style>") else {
-        return style_block.to_string();
-    };
-    if close_start <= open_end {
-        return style_block.to_string();
-    }
-    let (head, body, tail) = (
-        &style_block[..=open_end],
-        &style_block[open_end + 1..close_start],
-        &style_block[close_start..],
-    );
-
-    // Split into top-level rules on brace depth, so a nested block such as
-    // @media stays with its own rule.
-    let mut kept = String::new();
-    let mut deferred = String::new();
-    let mut depth = 0usize;
-    let mut rule = String::new();
-    for ch in body.chars() {
-        rule.push(ch);
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let selector = rule.split('{').next().unwrap_or("");
-                    if selector.contains("\\:") {
-                        deferred.push_str(&rule);
-                    } else {
-                        kept.push_str(&rule);
-                    }
-                    rule.clear();
-                }
-            }
-            _ => {}
-        }
-    }
-    // Trailing text that never closed a rule (comments, whitespace, or a
-    // malformed tail) is left where it was.
-    kept.push_str(&rule);
-
-    format!("{head}{kept}{deferred}{tail}")
 }
 
 /// Longest prefix of an entry's stripped HTML that is safe to search for.
@@ -9269,39 +9206,6 @@ mod record_size_header_tests {
 #[cfg(test)]
 mod low_hanging_fixes_tests {
     use super::*;
-
-    /// The popup CSS parser stops at an escaped colon and drops the rest of the
-    /// sheet, so those rules go last (issue #39, device-reported on #27).
-    #[test]
-    fn escaped_colon_rules_move_to_the_end() {
-        let block = "<style type=\"text/css\">\n  p { font-size: 0.95em; }\n                       idx\\:orth { display: block; }\n  .other { margin-bottom: 6px; }\n</style>";
-        let out = defer_escaped_colon_rules(block);
-        let orth = out.find("idx\\:orth").expect("escaped rule kept");
-        let other = out.find(".other").expect("plain rule kept");
-        assert!(
-            other < orth,
-            "the plain rule must now precede the escaped one:\n{out}"
-        );
-        assert!(out.starts_with("<style type=\"text/css\">"));
-        assert!(out.ends_with("</style>"));
-    }
-
-    /// A sheet with nothing to reorder comes back untouched.
-    #[test]
-    fn plain_stylesheet_is_left_alone() {
-        let block = "<style>p { margin: 0; }</style>";
-        assert_eq!(defer_escaped_colon_rules(block), block);
-    }
-
-    /// A nested block stays with its own rule rather than being split at the
-    /// inner brace.
-    #[test]
-    fn nested_at_rules_survive_the_split() {
-        let block = "<style>@media all { p { margin: 0; } }\nidx\\:orth { display: block; }\n.z { color: red; }</style>";
-        let out = defer_escaped_colon_rules(block);
-        assert!(out.contains("@media all { p { margin: 0; } }"));
-        assert!(out.find(".z").unwrap() < out.find("idx\\:orth").unwrap());
-    }
 
     /// A headword carrying a non-breaking space is unreachable without an
     /// alias, because the reader's query carries a plain one (issue #36).
