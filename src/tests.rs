@@ -5879,14 +5879,20 @@ mod tests {
         String::from_utf8_lossy(&text_bytes).to_string()
     }
 
+    /// A dictionary ships no `<style>` block in its head — the CSS reaches the
+    /// entries as markup instead.
+    ///
+    /// kindlegen's MOBI7 output carries no stylesheet, and a head `<style>` is
+    /// what a firmware 5.16 refuses a Wadoku dictionary for: with it, "The
+    /// selected item could not be opened"; the same file minus that block opens.
+    /// So the rule reaches the output the way the popup reads it, compiled into
+    /// the entry.
     #[test]
-    fn test_dict_css_preserved_in_text() {
+    fn test_dict_ships_no_stylesheet_in_its_head() {
         let dir = TempDir::new("dict_css_preserved");
 
-        // Build HTML with a <style> block in the <head>. The declaration is a
-        // `padding`, which has no legacy tag to become: the point here is that
-        // a sheet kindling cannot use still reaches the output.
-        let html = r#"<html><head><style>.def { padding-left: 20px; }</style><guide></guide></head><body>
+        // Build HTML with a <style> block in the <head>.
+        let html = r#"<html><head><style>.def { color: red; }</style><guide></guide></head><body>
 <idx:entry><idx:orth value="apple">apple</idx:orth><span class="def">a fruit</span></idx:entry>
 <idx:entry><idx:orth value="banana">banana</idx:orth><span class="def">another fruit</span></idx:entry>
 </body></html>"#;
@@ -5918,15 +5924,16 @@ mod tests {
         let text = extract_text_from_uncompressed_mobi(&data);
 
         assert!(
-            text.contains(".def { padding-left: 20px; }"),
-            "CSS style block should be preserved in text output, got: {}",
+            text.contains(r#"<font color="red">a fruit</font>"#),
+            "a rule from the head must reach the entry as markup, got: {}",
             &text[..text.len().min(500)]
         );
         assert!(
-            text.contains("<style>"),
-            "Style tag should be present in text output"
+            !text.contains("<style"),
+            "a dictionary must ship no stylesheet in its head, got: {}",
+            &text[..text.len().min(500)]
         );
-        println!("  \u{2713} CSS <style> block preserved in dictionary text output");
+        println!("  \u{2713} dictionary CSS reaches the entry, with no head stylesheet");
     }
 
     #[test]
@@ -6111,11 +6118,12 @@ p { margin: 0.3em 0; }
             "a colour rule should reach the entry as inline markup, got: {}",
             &text[..text.len().min(800)]
         );
-        // Everything the popup cannot express still ships. A margin whose left
-        // component is zero has no legacy tag to become, so this one stays.
+        // A rule with no legacy form ships nowhere now: the head carries no
+        // stylesheet, because a head `<style>` is what firmware 5.16 refuses a
+        // dictionary for (see `test_dict_ships_no_stylesheet_in_its_head`).
         assert!(
-            text.contains("margin: 0.3em 0"),
-            "uncompiled rules should survive, got: {}",
+            !text.contains("<style") && !text.contains("margin: 0.3em 0"),
+            "no rule may reach the head, got: {}",
             &text[..text.len().min(800)]
         );
         println!("  \u{2713} dictionary CSS compiled into inline popup markup");
@@ -10274,7 +10282,7 @@ p { margin: 0.3em 0; }
         // Shapes that only the anchoring path gets right, so a regression to the
         // old assembler shows up as a difference rather than as a silent pass.
         let html = r#"<html xmlns:idx="idx"><head><title>D</title>
-<style type="text/css">p { padding: 3px; }</style></head><body><mbp:frameset>
+<style type="text/css">p { color: red; }</style></head><body><mbp:frameset>
 <idx:entry><idx:orth value="alpha"><b>alpha</b></idx:orth><p>first</p></idx:entry>
 <idx:entry><idx:orth value="beta"/><p>no headword in this body at all</p></idx:entry>
 <idx:entry><idx:orth value="gamma"/><h1>gamma</h1><p>headword in a heading</p></idx:entry>
@@ -10308,8 +10316,8 @@ p { margin: 0.3em 0; }
             "below the split threshold the flag must not change the text blob"
         );
         assert!(
-            a.contains("padding: 3px"),
-            "the stylesheet must survive at both settings, got: {}",
+            a.contains(r#"<font color="red">"#),
+            "the stylesheet must reach the entry at both settings, got: {}",
             &a[..a.len().min(300)]
         );
         assert!(
@@ -10357,7 +10365,7 @@ p { margin: 0.3em 0; }
                 dir.path().join("c.html"),
                 dict_html(
                     r#"<head profile="http://example.invalid/">"#,
-                    r#"<style type="text/css">p { padding: 7px; }</style>"#,
+                    r#"<style type="text/css">p { color: red; }</style>"#,
                     "alpha",
                 ),
             )
@@ -10373,8 +10381,10 @@ p { margin: 0.3em 0; }
             .unwrap();
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
+            // A dictionary ships no stylesheet in its head, so a collected rule
+            // is observable through the markup it compiles to.
             assert!(
-                text.contains("padding: 7px"),
+                text.contains(r#"<font color="red">"#),
                 "<head profile=...> must not swallow the stylesheet"
             );
         }
@@ -10391,7 +10401,7 @@ p { margin: 0.3em 0; }
                 ),
             )
             .unwrap();
-            fs::write(dir.path().join("style.css"), "p { padding: 3px; }").unwrap();
+            fs::write(dir.path().join("style.css"), "p { color: blue; }").unwrap();
             let opf = dir.path().join("content.opf");
             fs::write(
                 &opf,
@@ -10405,7 +10415,7 @@ p { margin: 0.3em 0; }
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
             assert!(
-                text.contains("padding: 3px"),
+                text.contains(r#"<font color="blue">"#),
                 "an external <link rel=stylesheet> must reach the dictionary"
             );
         }
@@ -10416,12 +10426,14 @@ p { margin: 0.3em 0; }
             for (i, word) in [(1, "alpha"), (2, "bravo")] {
                 fs::write(
                     dir.path().join(format!("part{i}.html")),
-                    dict_html(
-                        "<head>",
-                        &format!(
-                            r#"<style type="text/css">.part{i} {{ padding: {i}px; }}</style>"#
-                        ),
-                        word,
+                    // Each file's rule names only the class its own entry
+                    // carries, so the two cannot cover for one another.
+                    format!(
+                        r#"<html xmlns:idx="idx"><head><title>D</title>\
+<style type="text/css">.part{i} {{ color: {color}; }}</style></head>\
+<body><mbp:frameset><idx:entry><idx:orth value="{word}"><b>{word}</b></idx:orth>\
+<p class="part{i}">def</p></idx:entry></mbp:frameset></body></html>"#,
+                        color = if i == 1 { "green" } else { "purple" }
                     ),
                 )
                 .unwrap();
@@ -10438,9 +10450,12 @@ p { margin: 0.3em 0; }
             .unwrap();
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
-            assert!(text.contains(".part1"), "first file's styles must survive");
             assert!(
-                text.contains(".part2"),
+                text.contains(r#"<font color="green">"#),
+                "first file's styles must survive"
+            );
+            assert!(
+                text.contains(r#"<font color="purple">"#),
                 "a later file's styles must survive too"
             );
         }
@@ -10462,7 +10477,7 @@ p { margin: 0.3em 0; }
                 ),
             )
             .unwrap();
-            fs::write(dir.path().join("style.css"), "p { padding: 5px; }").unwrap();
+            fs::write(dir.path().join("style.css"), "p { color: teal; }").unwrap();
             let opf = dir.path().join("content.opf");
             fs::write(
                 &opf,
@@ -10475,7 +10490,7 @@ p { margin: 0.3em 0; }
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
             assert!(
-                text.contains("padding: 5px"),
+                text.contains(r#"<font color="teal">"#),
                 "a sheet beside the OPF, named from a file in a subdirectory, must \
                  reach the dictionary"
             );
@@ -10500,7 +10515,7 @@ p { margin: 0.3em 0; }
             .unwrap();
             fs::write(
                 dir.path().join("styles").join("style.css"),
-                "p { padding: 4px; }",
+                "p { color: navy; }",
             )
             .unwrap();
             let opf = dir.path().join("content.opf");
@@ -10515,7 +10530,7 @@ p { margin: 0.3em 0; }
             let data = build_dict_mobi_bytes(&opf, dir.path());
             let text = String::from_utf8_lossy(&data);
             assert!(
-                text.contains("padding: 4px"),
+                text.contains(r#"<font color="navy">"#),
                 "a sheet in a subdirectory, named from the package root, must still be found"
             );
         }
