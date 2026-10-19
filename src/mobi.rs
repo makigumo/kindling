@@ -313,7 +313,7 @@ fn build_dictionary_mobi(
         let image_path = opf.base_dir.join(href);
 
         let data = std::fs::read(&image_path).or_else(|_| {
-            let decoded = percent_decode(href);
+            let decoded = links::percent_decode(href);
             std::fs::read(opf.base_dir.join(&decoded))
         });
 
@@ -994,7 +994,7 @@ fn build_book_mobi(
 
         // Try reading the file directly, then with percent-decoded path
         let data = std::fs::read(&image_path).or_else(|_| {
-            let decoded = percent_decode(href);
+            let decoded = links::percent_decode(href);
             std::fs::read(opf.base_dir.join(&decoded))
         });
 
@@ -2398,7 +2398,7 @@ fn is_bare_cover_page(part: &str, cover_href: Option<&str>) -> bool {
             .as_str()
             .rsplit('/')
             .next()
-            .map(|b| b == cover_base || percent_decode(b) == cover_base)
+            .map(|b| b == cover_base || links::percent_decode(b) == cover_base)
             .unwrap_or(false)
     })
 }
@@ -2463,7 +2463,7 @@ fn extract_css_content(
                     css_parts: &mut Vec<String>,
                     extracted: &mut std::collections::HashSet<String>,
                     seen: &mut std::collections::HashSet<std::path::PathBuf>| {
-        let decoded = percent_decode(href);
+        let decoded = links::percent_decode(href);
         // A manifest href is package-relative; a link is relative to the file
         // that writes it, which is what `linked_stylesheet_path` handles. Both
         // forms land on the same path when the two agree, and the canonical
@@ -2527,7 +2527,8 @@ fn extract_css_content(
             let href = caps.get(1).unwrap().as_str();
             if let Some(doc) = document {
                 if !is_external_href(href)
-                    && linked_stylesheet_path(doc, &opf.base_dir, &percent_decode(href)).is_none()
+                    && linked_stylesheet_path(doc, &opf.base_dir, &links::percent_decode(href))
+                        .is_none()
                     && warned_hrefs.insert(href.to_string())
                 {
                     warn_missing_stylesheet(doc, &opf.base_dir, href);
@@ -3688,7 +3689,7 @@ fn build_text_content_by_letter(
                         if href.starts_with("kindle:") {
                             continue;
                         }
-                        let decoded = percent_decode(&href);
+                        let decoded = links::percent_decode(&href);
                         // The link is relative to the file that writes it, which
                         // is not necessarily the OPF's own directory.
                         let Some(css_path) =
@@ -4756,7 +4757,7 @@ fn build_recindex_lookup(
         path_to_recindex.insert(href.clone(), recindex);
 
         // Also try with URL-decoded form (spaces encoded as %20, etc.)
-        let decoded = percent_decode(href);
+        let decoded = links::percent_decode(href);
         if decoded != *href {
             path_to_recindex.insert(decoded, recindex);
         }
@@ -4819,7 +4820,7 @@ fn apply_recindex_lookup(
             format!("recindex=\"{:05}\"", recindex)
         } else {
             // Try URL-decoded version
-            let decoded = percent_decode(src_path);
+            let decoded = links::percent_decode(src_path);
             if let Some(&recindex) = path_to_recindex.get(&decoded) {
                 format!("recindex=\"{:05}\"", recindex)
             } else {
@@ -4839,28 +4840,6 @@ fn apply_recindex_lookup(
     });
 
     result.into_owned()
-}
-
-/// Simple percent-decoding for URL-encoded paths (handles %20, %2F, etc.)
-fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let h1 = chars.next();
-            let h2 = chars.next();
-            if let (Some(h1), Some(h2)) = (h1, h2) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1 as char, h2 as char), 16) {
-                    result.push(byte as char);
-                    continue;
-                }
-            }
-            result.push('%');
-        } else {
-            result.push(b as char);
-        }
-    }
-    result
 }
 
 /// Threshold for parallel compression (1 MB).
