@@ -1248,29 +1248,46 @@ fn build_book_mobi(
         }
     }
 
-    let (css_content, css_basenames) =
-        extract_css_content(opf, &html_parts, &spine_paths, &font_embeds);
-    let css_content = if strip_font_css {
-        let stripped = crate::fonts::strip_font_locking_css(&css_content);
-        if stripped != css_content {
+    let mut css = extract_css_content(
+        opf,
+        &html_parts,
+        &spine_paths,
+        &spine_hrefs,
+        &font_embeds,
+        kindlegen_parity,
+    );
+    if strip_font_css {
+        let mut changed = false;
+        let stripped = crate::fonts::strip_font_locking_css(&css.flow);
+        if stripped != css.flow {
+            changed = true;
+            css.flow = stripped;
+        }
+        // Scoped sheets are inlined into their documents, so they have to lose
+        // the font-family declarations too; otherwise a cover's font rules
+        // keep overriding the reader's Aa choice on the pages that carry them.
+        for sheets in &mut css.inline {
+            for sheet in sheets.values_mut() {
+                let stripped = crate::fonts::strip_font_locking_css(sheet);
+                if stripped != *sheet {
+                    changed = true;
+                    *sheet = stripped;
+                }
+            }
+        }
+        if changed {
             eprintln!(
                 "No embedded fonts: stripped font-family CSS so the device \
                  Aa font menu controls the text face (issue #19)"
             );
         }
-        stripped
-    } else {
-        css_content
-    };
-    let css_content = match injected_css {
-        Some(css) => {
-            for part in &mut html_parts {
-                *part = crate::font_injection::link_css_flow(part);
-            }
-            css_content + &css
+    }
+    if let Some(injected) = injected_css {
+        for part in &mut html_parts {
+            *part = crate::font_injection::link_css_flow(part);
         }
-        None => css_content,
-    };
+        css.flow.push_str(&injected);
+    }
     let kf8_title = if opf.title.is_empty() {
         "Book"
     } else {
@@ -1282,8 +1299,9 @@ fn build_book_mobi(
     let spine_nav_points = crate::nav::group_by_spine(&nav_points, &spine_hrefs);
     let kf8_section = crate::kf8::build_kf8_section(
         &html_parts,
-        &css_content,
-        &css_basenames,
+        &css.flow,
+        &css.flow_basenames,
+        &css.inline,
         &href_to_recindex,
         &opf.spine_items,
         &spine_hrefs,
@@ -2417,10 +2435,26 @@ fn build_html_parts(opf: &OPFData) -> Vec<String> {
     parts
 }
 
+/// The stylesheets a KF8 book build ships, and how each one reaches a page.
+struct CollectedCss {
+    /// Every sheet a page may see, concatenated into one KF8 flow.
+    flow: String,
+    /// Basenames of the sheets in `flow`. A `<link>` naming one is rewritten
+    /// to `kindle:flow:0001`.
+    flow_basenames: HashSet<String>,
+    /// Sheets to inline as a `<style>` block, per spine part, keyed by
+    /// basename. A sheet linked only by fixed-layout documents lands here
+    /// instead of the flow, so its rules reach the pages that linked it and
+    /// no others. That matters because the flow is global: a cover-only
+    /// `html, body { font-size: 0 }` in the flow also zeroes every
+    /// reflowable chapter, which no reader control can undo.
+    inline: Vec<std::collections::HashMap<String, String>>,
+}
+
 /// Extract CSS content for the KF8 CSS flow.
 ///
-/// Returns the concatenated CSS plus the set of basenames of every CSS
-/// file that was successfully read. The basename set lets the KF8 HTML
+/// Returns the sheets for the shared flow, plus the sheets to inline into
+/// fixed-layout documents. The flow's basename set lets the KF8 HTML
 /// transform rewrite the matching `<link href="...css">` references to
 /// `kindle:flow:0001` (and leave unknown `.css` links dangling, like
 /// kindlegen does).
@@ -2438,18 +2472,27 @@ fn build_html_parts(opf: &OPFData) -> Vec<String> {
 /// link-discovered CSS in first-seen order, joined with `\n` (matching the
 /// previous behavior).
 ///
-/// A link is resolved against the document that writes it, the way the file it
-/// names is meant, with the package root tried second — see
-/// [`linked_stylesheet_path`]. `spine_docs` is the spine HTML in the same order
-/// as `html_parts`, so each part knows where it came from; a part with no path
-/// (which a caller can no longer produce, but the signature allows) falls back
-/// to the package-relative reading.
+/// A sheet linked by nothing but fixed-layout documents is scoped to them
+/// instead: its text is inlined where each of those documents linked it, and
+/// it is left out of the flow. A link is resolved against the document that
+/// writes it, the way the file it names is meant, with the package root tried
+/// second — see [`linked_stylesheet_path`]. `spine_docs` is the spine HTML in
+/// the same order as `html_parts`, so each part knows where it came from; a
+/// part with no path (which a caller can no longer produce, but the signature
+/// allows) falls back to the package-relative reading.
+///
+/// Scoping is skipped in kindlegen-parity mode (which passes CSS through like
+/// kindlegen, flow and all) and for wholly pre-paginated books, where every
+/// document is fixed-layout and inlining would copy one shared sheet into
+/// every page instead of writing it once.
 fn extract_css_content(
     opf: &OPFData,
     html_parts: &[String],
     spine_docs: &[std::path::PathBuf],
+    spine_hrefs: &[String],
     font_embeds: &std::collections::HashMap<String, (usize, String)>,
-) -> (String, std::collections::HashSet<String>) {
+    kindlegen_parity: bool,
+) -> CollectedCss {
     let mut css_parts: Vec<String> = Vec::new();
     let mut extracted_basenames: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -2457,6 +2500,109 @@ fn extract_css_content(
     // once per referencing file.
     let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
+    let mut inline: Vec<std::collections::HashMap<String, String>> =
+        vec![std::collections::HashMap::new(); html_parts.len()];
+
+    // Which documents link which sheets, resolved the same way the flow pass
+    // below resolves them. A sheet's linkers decide whether it may be scoped
+    // to them or has to stay in the shared flow.
+    let link_re = Regex::new(r#"(?i)<link\b[^>]*\bhref\s*=\s*"([^"]+\.css)"[^>]*>"#).unwrap();
+    // `Some(i)` is a document that ships, at index `i`; `None` is a spine
+    // document the caller dropped from the output (a bare cover page, see
+    // `is_bare_cover_page`). Its links still say which sheet was cover-only.
+    let mut linkers: std::collections::HashMap<std::path::PathBuf, Vec<Option<usize>>> =
+        std::collections::HashMap::new();
+    for (i, part) in html_parts.iter().enumerate() {
+        let document = spine_docs.get(i).map(|p| p.as_path());
+        for caps in link_re.captures_iter(part) {
+            let href = caps.get(1).unwrap().as_str();
+            let decoded = links::percent_decode(href);
+            let css_path = document
+                .and_then(|doc| linked_stylesheet_path(doc, &opf.base_dir, &decoded))
+                .unwrap_or_else(|| opf.base_dir.join(&decoded));
+            let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
+            linkers.entry(key).or_default().push(Some(i));
+        }
+    }
+    // The same scan for the spine documents that did not make it into the
+    // output. Without this, a dropped cover's sheet looks manifest-only and
+    // goes back into the global flow, which is exactly the leak being fixed.
+    let output_docs: std::collections::HashSet<std::path::PathBuf> = spine_docs
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    for path in opf.get_content_html_paths() {
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if output_docs.contains(&key) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for caps in link_re.captures_iter(&content) {
+            let href = caps.get(1).unwrap().as_str();
+            let decoded = links::percent_decode(href);
+            let css_path = linked_stylesheet_path(&path, &opf.base_dir, &decoded)
+                .unwrap_or_else(|| opf.base_dir.join(&decoded));
+            let sheet = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
+            linkers.entry(sheet).or_default().push(None);
+        }
+    }
+
+    // A mixed book is the case scoping exists for: fixed-layout front matter
+    // (a cover) beside reflowable chapters. A wholly pre-paginated book needs
+    // no scoping and would only get a copy of each sheet per page.
+    let scope = !kindlegen_parity && !opf.is_fixed_layout;
+    let fixed_layout: Vec<bool> = html_parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| scope && is_fixed_layout_document(opf, spine_hrefs.get(i), part))
+        .collect();
+    // Only the documents that ship decide where a sheet can be inlined; a
+    // dropped linker is no page, so it is ignored rather than counted as a
+    // reflowable one.
+    let inline_paths: std::collections::HashSet<std::path::PathBuf> = linkers
+        .iter()
+        .filter_map(|(path, docs)| {
+            let shipped: Vec<usize> = docs.iter().flatten().copied().collect();
+            (!shipped.is_empty()
+                && shipped
+                    .iter()
+                    .all(|&i| fixed_layout.get(i).copied().unwrap_or(false)))
+            .then_some(path.clone())
+        })
+        .collect();
+    // A sheet whose only linkers were dropped applies to no page at all. It
+    // is not inlined (there is nothing to inline it into) and must not enter
+    // the flow the surviving pages link.
+    let orphaned: std::collections::HashSet<std::path::PathBuf> = linkers
+        .iter()
+        .filter(|(_, docs)| !docs.is_empty() && docs.iter().all(|slot| slot.is_none()))
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    // Read each scoped sheet once, with the same font-url rewriting the flow
+    // gets, then hand the text to every document that linked it. The sheet's
+    // own directory is its true location on disk, which is what a relative
+    // `url(...)` inside it resolves against.
+    for path in &inline_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let css_dir = package_relative_dir(path, &opf.base_dir).unwrap_or_default();
+            let css = crate::fonts::rewrite_css_font_urls(&content, &css_dir, font_embeds);
+            let basename = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if basename.is_empty() {
+                continue;
+            }
+            for &i in linkers[path].iter().flatten() {
+                if let Some(sheets) = inline.get_mut(i) {
+                    sheets.insert(basename.clone(), css.clone());
+                }
+            }
+        }
+    }
 
     let take_css = |href: &str,
                     document: Option<&Path>,
@@ -2472,6 +2618,13 @@ fn extract_css_content(
             .and_then(|doc| linked_stylesheet_path(doc, &opf.base_dir, &decoded))
             .unwrap_or_else(|| opf.base_dir.join(&decoded));
         let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
+        // A scoped sheet is inlined into its documents by the HTML transform,
+        // not concatenated into the flow every document links. A sheet only a
+        // dropped document linked has no page left to style and is left out
+        // entirely.
+        if inline_paths.contains(&key) || orphaned.contains(&key) {
+            return;
+        }
         if !seen.insert(key) {
             return;
         }
@@ -2519,7 +2672,6 @@ fn extract_css_content(
     // reported, because the styling it carries is then simply absent from the
     // build; the report is de-duplicated by href, since a book whose every
     // chapter links the same missing sheet has one missing sheet.
-    let link_re = Regex::new(r#"(?i)<link\b[^>]*\bhref\s*=\s*"([^"]+\.css)"[^>]*>"#).unwrap();
     let mut warned_hrefs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, part) in html_parts.iter().enumerate() {
         let document = spine_docs.get(i).map(|p| p.as_path());
@@ -2544,7 +2696,55 @@ fn extract_css_content(
         }
     }
 
-    (css_parts.join("\n"), extracted_basenames)
+    CollectedCss {
+        flow: css_parts.join("\n"),
+        flow_basenames: extracted_basenames,
+        inline,
+    }
+}
+
+/// Whether a spine document is fixed-layout (pre-paginated).
+///
+/// Two signals, either sufficient: the manifest item carries
+/// `rendition:layout-pre-paginated`, or the document's head has an EPUB
+/// viewport meta with a pixel width (`content="width=1025, height=800"`).
+/// The pixel width is what separates that from the `width=device-width` meta
+/// a reflowable, web-derived EPUB may carry: only a fixed-layout page knows
+/// the size the publisher designed it at.
+fn is_fixed_layout_document(opf: &OPFData, href: Option<&String>, html: &str) -> bool {
+    if let Some(href) = href {
+        let wanted = links::normalize_path(&links::percent_decode(href));
+        if opf.manifest_items.iter().any(|item| {
+            links::normalize_path(&links::percent_decode(&item.href)) == wanted
+                && item
+                    .properties
+                    .split_whitespace()
+                    .any(|p| p.eq_ignore_ascii_case("rendition:layout-pre-paginated"))
+        }) {
+            return true;
+        }
+    }
+    has_fixed_layout_viewport(html)
+}
+
+/// Whether an XHTML document declares a fixed-layout viewport.
+fn has_fixed_layout_viewport(html: &str) -> bool {
+    let meta_re = Regex::new(r"(?is)<meta\b[^>]*>").unwrap();
+    let name_re = Regex::new(r#"(?is)\bname\s*=\s*["']([^"']*)["']"#).unwrap();
+    let content_re = Regex::new(r#"(?is)\bcontent\s*=\s*["']([^"']*)["']"#).unwrap();
+    let pixel_width_re = Regex::new(r"(?i)\bwidth\s*=\s*\d").unwrap();
+    meta_re.find_iter(html).any(|meta| {
+        let tag = meta.as_str();
+        let is_viewport = name_re
+            .captures(tag)
+            .map(|c| c.get(1).unwrap().as_str().eq_ignore_ascii_case("viewport"))
+            .unwrap_or(false);
+        is_viewport
+            && content_re
+                .captures(tag)
+                .map(|c| pixel_width_re.is_match(c.get(1).unwrap().as_str()))
+                .unwrap_or(false)
+    })
 }
 
 /// A path relative to the package root, with `.` and `..` folded away (`None`
