@@ -2738,7 +2738,14 @@ fn build_text_content(
     for (index, html_path) in opf.get_content_html_paths().iter().enumerate() {
         let content = std::fs::read_to_string(html_path).unwrap_or_default();
         let cleaned = if strip_idx {
-            strip_idx_markup(&content)
+            // A dictionary's front matter is cleaned by the dictionary pass,
+            // which drops every `style=` attribute. The one declaration that
+            // has a legacy form there is the cover's centring —
+            // `<h1 style="text-align: center">` — and it has to be compiled
+            // before the attribute goes, or the title lines render left-
+            // aligned where kindlegen centres them over the logo.
+            let centred = translate_css_for_legacy_readers(&content);
+            strip_idx_markup(&centred)
         } else {
             clean_book_html(&content)
         };
@@ -3723,7 +3730,13 @@ fn build_text_content_by_letter(
             // own `<body>`. Drop it: the assembler writes the document's one
             // real head, and a second one in mid-body is junk the reader has
             // to skip past.
-            let cleaned = strip_idx_markup(&content);
+            // Compile the one declaration the dictionary pass would otherwise
+            // throw away with the `style=` attribute it sits in: the cover's
+            // `<h1 style="text-align: center">`, which kindlegen ships as
+            // `align="center"`. Without it the cover's title lines render
+            // left-aligned above a centred logo.
+            let centred = translate_css_for_legacy_readers(&content);
+            let cleaned = strip_idx_markup(&centred);
             let cleaned = head_in_body_re.replace_all(&cleaned, "").into_owned();
             let body = match body_re.captures(&cleaned) {
                 Some(cap) => cap.get(1).unwrap().as_str().trim().to_string(),
