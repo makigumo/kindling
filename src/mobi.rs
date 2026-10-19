@@ -1511,12 +1511,12 @@ fn build_book_mobi(
         // devices that would have to parse it (issue #33).)
         eprintln!("Building KF7 text content...");
         let recindex_lookup = build_recindex_lookup(&href_to_recindex, &opf.spine_items);
-        let text_content = build_text_content(opf, false, &recindex_lookup);
+        let kf7_text = build_text_content(opf, false, &recindex_lookup);
 
         // Build KF7 text records
         let (text_records, text_length) = if no_compress {
             eprintln!("Splitting KF7 text into uncompressed records...");
-            let result = split_text_uncompressed(&text_content);
+            let result = split_text_uncompressed(&kf7_text.bytes);
             eprintln!(
                 "Split KF7 text into {} uncompressed records ({} bytes)",
                 result.0.len(),
@@ -1525,7 +1525,7 @@ fn build_book_mobi(
             result
         } else {
             eprintln!("Compressing KF7 text...");
-            let result = compress_text(&text_content);
+            let result = compress_text(&kf7_text.bytes);
             eprintln!(
                 "Compressed KF7 text into {} records ({} bytes uncompressed)",
                 result.0.len(),
@@ -1533,6 +1533,15 @@ fn build_book_mobi(
             );
             result
         };
+
+        // The MOBI6 half's own table of contents. kindlegen writes this index
+        // after the text; without it a reader that only understands MOBI6 gets
+        // no TOC even though the KF8 half has one. Entries address the KF7
+        // blob by absolute offset, which `build_text_content` just recorded.
+        let kf7_ncx_entries = build_book_ncx_entries(&nav_points, &kf7_text);
+        let (kf7_ncx_records, kf7_ncx_cncx_records) =
+            crate::kf8::build_kf7_ncx_indx(&kf7_ncx_entries);
+        let kf7_ncx_record_count = kf7_ncx_records.len() + kf7_ncx_cncx_records.len();
 
         // --- KF7 Section record layout ---
         let kf7_first_non_book = text_records.len() + 1;
@@ -1543,7 +1552,21 @@ fn build_book_mobi(
         } else {
             0xFFFFFFFF
         };
-        let kf7_flis = text_records.len() + 1 + num_image_records + num_font_records;
+        let kf7_ncx_index_record = if kf7_ncx_records.is_empty() {
+            None
+        } else {
+            Some(text_records.len() + 1 + num_image_records + num_font_records)
+        };
+        if let Some(idx) = kf7_ncx_index_record {
+            eprintln!(
+                "KF7 NCX: {} entries at record {} ({} records)",
+                kf7_ncx_entries.len(),
+                idx,
+                kf7_ncx_record_count
+            );
+        }
+        let kf7_flis =
+            text_records.len() + 1 + num_image_records + num_font_records + kf7_ncx_record_count;
         let kf7_fcis = kf7_flis + 1;
         let kf7_srcs_idx = if srcs_record.is_some() {
             Some(kf7_fcis + 1)
@@ -1551,11 +1574,21 @@ fn build_book_mobi(
             None
         };
 
-        let boundary_idx =
-            1 + text_records.len() + num_image_records + num_font_records + 2 + num_optional;
+        let boundary_idx = 1
+            + text_records.len()
+            + num_image_records
+            + num_font_records
+            + kf7_ncx_record_count
+            + 2
+            + num_optional;
         let kf8_record0_global = boundary_idx + 1;
-        let kf7_total =
-            1 + text_records.len() + num_image_records + num_font_records + 2 + num_optional;
+        let kf7_total = 1
+            + text_records.len()
+            + num_image_records
+            + num_font_records
+            + kf7_ncx_record_count
+            + 2
+            + num_optional;
 
         // --- KF8 Section record layout (KF8-relative indices) ---
         let kf8_text_count = kf8_section.text_records.len();
@@ -1631,9 +1664,9 @@ fn build_book_mobi(
             doc_type,
             // EXTH 125: resources live in the KF7 section of a dual file
             (num_image_records + num_font_records) as u32,
-            None, // books keep PalmDOC; huffdic is a dictionary option
-            None, // books and comics are never huffdic, so no DATP
-            None, // books carry their NCX in the KF8 section
+            None,                 // books keep PalmDOC; huffdic is a dictionary option
+            None,                 // books and comics are never huffdic, so no DATP
+            kf7_ncx_index_record, // the MOBI6 half's own TOC index
         );
 
         // Build KF8 record 0 (version=8, KF8-relative indices)
@@ -1689,6 +1722,8 @@ fn build_book_mobi(
         all_records.extend(text_records);
         all_records.extend(image_records);
         all_records.extend(font_records);
+        all_records.extend(kf7_ncx_records);
+        all_records.extend(kf7_ncx_cncx_records);
         all_records.push(kf7_flis_rec);
         all_records.push(kf7_fcis_rec);
         if let Some(srcs) = srcs_record {
@@ -2650,16 +2685,39 @@ struct PendingFilepos {
 /// `recindex_lookup` is applied per document rather than to the merged blob
 /// because rewriting an image src changes byte lengths; doing it afterwards
 /// would move every anchor out from under the offsets computed here.
+/// The KF7 text blob, plus where every spine document and anchor landed in
+/// it. The KF7 NCX index addresses this blob by absolute offset, so it needs
+/// the same numbers the link patcher already computed.
+struct Kf7Text {
+    bytes: Vec<u8>,
+    /// Offset of each spine document's body in `bytes`.
+    doc_start: Vec<usize>,
+    /// Manifest-style href of each spine document, normalized the way a nav
+    /// document's target is, so a nav point's `file_href` compares directly.
+    hrefs: Vec<String>,
+    /// Absolute offset of every `id`/`name` anchor, per spine document.
+    anchors: Vec<std::collections::HashMap<String, usize>>,
+    /// Ids on each document's `<html>`/`<body>` wrappers; a nav target naming
+    /// one means the document start, because the merge drops those elements.
+    wrapper_anchors: Vec<std::collections::HashSet<String>>,
+}
+
 fn build_text_content(
     opf: &OPFData,
     strip_idx: bool,
     recindex_lookup: &std::collections::HashMap<String, usize>,
-) -> Vec<u8> {
+) -> Kf7Text {
     let body_re = Regex::new(r"(?s)<body[^>]*>(.*?)</body>").unwrap();
     let head_re = Regex::new(r"(?s)<head[^>]*>.*?</head>").unwrap();
 
     let doc_hrefs = opf.get_content_html_hrefs();
     let documents = links::build_document_index(&doc_hrefs);
+    // The same hrefs in the form a nav document writes a target in, so the
+    // KF7 NCX can match its nav points against them directly.
+    let nav_hrefs: Vec<String> = doc_hrefs
+        .iter()
+        .map(|href| links::normalize_path(&links::percent_decode(href)))
+        .collect();
 
     let mut body_contents: Vec<String> = Vec::new();
     let mut body_anchors: Vec<Vec<links::Anchor>> = Vec::new();
@@ -2730,13 +2788,13 @@ fn build_text_content(
         cursor += body.len() + SEPARATOR.len();
     }
 
-    let anchor_offsets: Vec<std::collections::HashMap<&str, usize>> = body_anchors
+    let anchor_offsets: Vec<std::collections::HashMap<String, usize>> = body_anchors
         .iter()
         .enumerate()
         .map(|(i, anchors)| {
             anchors
                 .iter()
-                .map(|a| (a.name.as_str(), doc_start[i] + a.offset))
+                .map(|a| (a.name.clone(), doc_start[i] + a.offset))
                 .collect()
         })
         .collect();
@@ -2806,7 +2864,13 @@ fn build_text_content(
             unresolved
         );
     }
-    bytes
+    Kf7Text {
+        bytes,
+        doc_start,
+        hrefs: nav_hrefs,
+        anchors: anchor_offsets,
+        wrapper_anchors,
+    }
 }
 
 /// Replace every internal `<a href>` in one document's body with a
@@ -3340,6 +3404,77 @@ fn build_dictionary_ncx_entries(
             "Dictionary NCX: {unresolved} navigation target(s) could not be resolved and were \
              omitted"
         );
+    }
+    out
+}
+
+/// Build the KF7 NCX index entries for a book from its nav document and the
+/// offsets recorded while assembling the KF7 text.
+///
+/// Every nav entry that resolves to a place in the text gets a row with its
+/// own label and depth — the TOC a pre-2012 engine reads, and one entry per
+/// source entry. Spans follow the same rule the KF8 index uses: a row runs to
+/// the nearest entry that begins later at the same or a shallower depth, and
+/// when several rows share an offset at one depth only the last of them owns
+/// the span, which is what kindlegen writes for a repeated target (its
+/// earlier rows are zero-length). Rows are emitted in text order.
+fn build_book_ncx_entries(
+    nav_points: &[crate::nav::NavPoint],
+    text: &Kf7Text,
+) -> Vec<crate::kf8::Kf7NcxEntry> {
+    let mut rows: Vec<(usize, usize, String)> = Vec::new();
+    for point in nav_points {
+        if point.label.is_empty() {
+            continue;
+        }
+        let Some(file) = text.hrefs.iter().position(|href| *href == point.file_href) else {
+            continue;
+        };
+        let offset = match point.fragment.as_deref() {
+            None => text.doc_start[file],
+            Some(fragment) => match text.anchors.get(file).and_then(|m| m.get(fragment)) {
+                Some(offset) => *offset,
+                None if text
+                    .wrapper_anchors
+                    .get(file)
+                    .is_some_and(|wrappers| wrappers.contains(fragment)) =>
+                {
+                    text.doc_start[file]
+                }
+                None => continue,
+            },
+        };
+        if offset < text.bytes.len() {
+            rows.push((offset, point.depth, point.label.clone()));
+        }
+    }
+
+    // Text order, which is the order the index is written in and the order a
+    // reader walks the Go To list in.
+    rows.sort_by_key(|(offset, _, _)| *offset);
+    let total = text.bytes.len();
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, (offset, depth, label)) in rows.iter().enumerate() {
+        let end = rows
+            .iter()
+            .map(|(next, next_depth, _)| (*next, *next_depth))
+            .filter(|(next, next_depth)| next > offset && next_depth <= depth)
+            .map(|(next, _)| next)
+            .min()
+            .unwrap_or(total);
+        let repeated_later = rows[i + 1..]
+            .iter()
+            .any(|(next, next_depth, _)| next == offset && next_depth == depth);
+        out.push(crate::kf8::Kf7NcxEntry {
+            offset: *offset,
+            length: if repeated_later {
+                0
+            } else {
+                end.saturating_sub(*offset)
+            },
+            label: label.clone(),
+            depth: *depth,
+        });
     }
     out
 }
