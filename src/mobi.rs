@@ -1348,17 +1348,19 @@ fn build_book_mobi(
 
     let num_image_records = image_records.len();
 
-    // Build fixed-layout metadata if applicable
-    let fixed_layout = if opf.is_fixed_layout {
+    // Layout metadata is not only for fixed-layout books. kindlegen derives
+    // EXTH 525 (primary writing mode) and 527 (page progression direction)
+    // from the OPF spine for reflowable books too: an rtl spine gives a
+    // reflowable Japanese book `vertical-rl`/`rtl`. Dropping it here leaves
+    // the KF8 reader on LTR tap zones even when the text itself is vertical.
+    let fixed_layout = Some(exth::FixedLayoutMeta {
+        is_fixed_layout: opf.is_fixed_layout,
+        original_resolution: opf.original_resolution.clone(),
+        page_progression_direction: opf.page_progression_direction.clone(),
+    });
+    if opf.is_fixed_layout {
         eprintln!("Detected fixed-layout content");
-        Some(exth::FixedLayoutMeta {
-            is_fixed_layout: true,
-            original_resolution: opf.original_resolution.clone(),
-            page_progression_direction: opf.page_progression_direction.clone(),
-        })
-    } else {
-        None
-    };
+    }
 
     let title = if opf.title.is_empty() {
         "Book"
