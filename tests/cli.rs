@@ -317,6 +317,218 @@ mod validate {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Decode an INDX primary's data records into `(label, [(tag, values)])`,
+    /// reading each value through the primary's TAGX. A tag present in the
+    /// control byte spends `values_per_entry * set bits of its mask` values.
+    fn indx_entries(primary: &[u8], data: &[&[u8]]) -> Vec<(Vec<u8>, Vec<(u8, Vec<u32>)>)> {
+        let be32 =
+            |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        let tagx = be32(primary, 180);
+        let control_bytes = be32(primary, tagx + 8);
+        let tagx_len = be32(primary, tagx + 4);
+        let mut tags: Vec<(u8, usize, u8)> = Vec::new();
+        let mut at = tagx + 12;
+        while at + 4 <= tagx + tagx_len {
+            let (id, vpe, mask, last) = (
+                primary[at],
+                primary[at + 1] as usize,
+                primary[at + 2],
+                primary[at + 3],
+            );
+            if mask != 0 {
+                tags.push((id, vpe, mask));
+            }
+            if last == 1 {
+                break;
+            }
+            at += 4;
+        }
+        let mut out = Vec::new();
+        for rec in data {
+            let idxt = be32(rec, 20);
+            let count = be32(rec, 24);
+            let mut starts: Vec<usize> = (0..count)
+                .map(|i| {
+                    u16::from_be_bytes([rec[idxt + 4 + 2 * i], rec[idxt + 5 + 2 * i]]) as usize
+                })
+                .collect();
+            starts.push(idxt);
+            for w in starts.windows(2) {
+                let entry = &rec[w[0]..w[1]];
+                let label_len = entry[0] as usize;
+                let mut pos = 1 + label_len;
+                let control = &entry[pos..pos + control_bytes];
+                pos += control_bytes;
+                let mut values = Vec::new();
+                for &(id, vpe, mask) in &tags {
+                    if control[0] & mask == 0 {
+                        continue;
+                    }
+                    let mut v = Vec::new();
+                    for _ in 0..vpe * mask.count_ones() as usize {
+                        let mut value: u32 = 0;
+                        loop {
+                            let b = entry[pos];
+                            pos += 1;
+                            value = (value << 7) | u32::from(b & 0x7f);
+                            if b & 0x80 != 0 {
+                                break;
+                            }
+                        }
+                        v.push(value);
+                    }
+                    values.push((id, v));
+                }
+                out.push((entry[1..1 + label_len].to_vec(), values));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_toc_entry_repeating_another_target_keeps_its_row_in_both_ncx_indexes() {
+        // kindlegen keeps a nav entry that points where an earlier entry
+        // already points, with a zero-length span. kindling used to drop it,
+        // so a TOC row the source asked for never reached the book. The MOBI6
+        // half now carries its own NCX index as well, so both halves must
+        // list every source entry without writing a span twice.
+        let dir = TempDir::new("dup_toc");
+        std::fs::write(
+            dir.path().join("book.opf"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Duplicate TOC</dc:title><dc:language>de</dc:language><dc:identifier id="uid">dup-toc</dc:identifier></metadata>
+<manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine toc="ncx"><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("toc.ncx"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="dup-toc"/></head><docTitle><text>Duplicate TOC</text></docTitle><navMap>
+<navPoint id="n1" playOrder="1"><navLabel><text>Kapitel 1</text></navLabel><content src="ch0.xhtml"/></navPoint>
+<navPoint id="n2" playOrder="2"><navLabel><text>Kapitel 2</text></navLabel><content src="ch1.xhtml"/></navPoint>
+<navPoint id="n3" playOrder="3"><navLabel><text>Noch einmal Kapitel 1</text></navLabel><content src="ch0.xhtml"/></navPoint>
+<navPoint id="n4" playOrder="4"><navLabel><text>Kapitel 1, Anker</text></navLabel><content src="ch0.xhtml#z"/></navPoint>
+</navMap></ncx>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ch0.xhtml"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Kapitel 0</title></head><body><h1>Kapitel 0</h1><p>Erster Absatz des ersten Kapitels.</p><a id="z"/><p>Text nach dem Anker.</p></body></html>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ch1.xhtml"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Kapitel 1</title></head><body><h1>Kapitel 1</h1><p>Erster Absatz des zweiten Kapitels.</p></body></html>"#,
+        )
+        .unwrap();
+
+        let opf = dir.path().join("book.opf");
+        for (name, extra) in [("book.azw3", None), ("book.mobi", Some("--legacy-mobi"))] {
+            let out = dir.path().join(name);
+            let mut args = vec![
+                "build",
+                opf.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--no-validate",
+            ];
+            if let Some(flag) = extra {
+                args.push(flag);
+            }
+            let built = Command::new(kindling_bin())
+                .args(&args)
+                .output()
+                .expect("spawn kindling-cli");
+            assert!(
+                built.status.success(),
+                "{name} build failed\n{}",
+                dump(&built)
+            );
+        }
+
+        for name in ["book.azw3", "book.mobi"] {
+            let path = dir.path().join(name);
+            let data = std::fs::read(&path).unwrap();
+            let count = u16::from_be_bytes([data[76], data[77]]) as usize;
+            let be32 = |o: usize| u32::from_be_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+            let offsets: Vec<usize> = (0..count)
+                .map(|i| be32(78 + 8 * i))
+                .chain([data.len()])
+                .collect();
+            let rec = |i: usize| &data[offsets[i]..offsets[i + 1]];
+            let ncx = u32::from_be_bytes(rec(0)[0xF4..0xF8].try_into().unwrap()) as usize;
+            assert_ne!(ncx, 0xFFFF_FFFF, "{name}: the file has no NCX index");
+            let data_records = u32::from_be_bytes(rec(ncx)[24..28].try_into().unwrap()) as usize;
+            let records: Vec<&[u8]> = (0..data_records).map(|k| rec(ncx + 1 + k)).collect();
+            let entries = indx_entries(rec(ncx), &records);
+            assert_eq!(
+                entries.len(),
+                4,
+                "{name}: every nav entry must keep its row, got {:?}",
+                entries
+                    .iter()
+                    .map(|(l, _)| String::from_utf8_lossy(l).into_owned())
+                    .collect::<Vec<_>>()
+            );
+            let tag = |entry: &(Vec<u8>, Vec<(u8, Vec<u32>)>), id: u8| -> u32 {
+                entry
+                    .1
+                    .iter()
+                    .find(|(t, _)| *t == id)
+                    .map(|(_, v)| v[0])
+                    .unwrap_or(u32::MAX)
+            };
+            let rows: Vec<(u32, u32)> = entries.iter().map(|e| (tag(e, 1), tag(e, 2))).collect();
+            let zero: Vec<&(u32, u32)> = rows.iter().filter(|(_, len)| *len == 0).collect();
+            assert_eq!(zero.len(), 1, "{name}: rows {rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|(start, len)| *len > 0 && start == &zero[0].0),
+                "{name}: the duplicate must share a target with a spanned row, rows {rows:?}"
+            );
+            let mut spans = rows.clone();
+            spans.sort_unstable();
+            spans.dedup();
+            assert_eq!(
+                spans.len(),
+                rows.len(),
+                "{name}: a span written twice in {rows:?}"
+            );
+
+            if name.ends_with(".mobi") {
+                // The MOBI6 index addresses the KF7 text by absolute offset.
+                let text = mobi_rawml(&path);
+                let first = rows.iter().map(|(start, _)| *start).min().unwrap() as usize;
+                let anchor = rows.iter().map(|(start, _)| *start).max().unwrap() as usize;
+                assert!(
+                    text[first..].starts_with("<h1>Kapitel 0"),
+                    "KF7 row points at {:?}",
+                    &text[first..first + 20]
+                );
+                assert!(
+                    text[anchor..].starts_with("<h1>Kapitel 1"),
+                    "KF7 row points at {:?}",
+                    &text[anchor..anchor + 20]
+                );
+                let anchor_row = rows
+                    .iter()
+                    .filter(|(start, _)| *start != first as u32 && *start != anchor as u32)
+                    .map(|(start, _)| *start as usize)
+                    .next()
+                    .expect("a row for the anchored nav entry");
+                assert!(
+                    text[anchor_row..].starts_with("<a id=\"z\""),
+                    "KF7 anchor row points at {:?}",
+                    &text[anchor_row..anchor_row + 20]
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_book_with_thousands_of_chapters_gets_sound_skeleton_and_fragment_indexes() {
         // One skeleton entry and at least one fragment entry per chapter: in
