@@ -123,6 +123,7 @@ pub fn build_kf8_section(
     html_parts: &[String],
     css_content: &str,
     css_basenames: &std::collections::HashSet<String>,
+    inline_css: &[std::collections::HashMap<String, String>],
     href_to_recindex: &std::collections::HashMap<String, usize>,
     spine_items: &[(String, String)],
     spine_hrefs: &[String],
@@ -140,6 +141,7 @@ pub fn build_kf8_section(
         spine_items,
         spine_hrefs,
         css_basenames,
+        inline_css,
         kindlegen_parity,
     );
 
@@ -619,6 +621,7 @@ fn build_kf8_html(
     spine_items: &[(String, String)],
     spine_hrefs: &[String],
     css_basenames: &std::collections::HashSet<String>,
+    inline_css: &[std::collections::HashMap<String, String>],
     kindlegen_parity: bool,
 ) -> (Vec<u8>, Vec<SkeletonEntry>, Vec<FragmentEntry>) {
     let path_to_recindex = build_image_path_lookup(href_to_recindex, spine_items);
@@ -686,6 +689,7 @@ fn build_kf8_html(
             &mut aid_counter,
             &path_to_recindex,
             css_basenames,
+            inline_css.get(skel_idx),
             kindlegen_parity,
         );
         if !kindlegen_parity {
@@ -1008,6 +1012,7 @@ fn process_kf8_part(
     aid_counter: &mut u32,
     path_to_recindex: &std::collections::HashMap<String, usize>,
     css_basenames: &std::collections::HashSet<String>,
+    inline_css: Option<&std::collections::HashMap<String, String>>,
     kindlegen_parity: bool,
 ) -> String {
     let mut result = html.to_string();
@@ -1046,16 +1051,26 @@ fn process_kf8_part(
     // we actually extracted into the CSS flow to `kindle:flow:0001`. CSS
     // files we didn't extract (and non-CSS links like page-template.xpgt)
     // are left untouched, exactly like kindlegen.
-    if !css_basenames.is_empty() {
+    //
+    // A sheet this document shares with no reflowable page (`inline_css`) is
+    // not in the flow at all: its text replaces its own link here, so the
+    // rules apply to the pages that linked them in the same cascade position
+    // and cannot reach any other page.
+    let has_inline = inline_css.map(|sheets| !sheets.is_empty()).unwrap_or(false);
+    if !css_basenames.is_empty() || has_inline {
         let link_re =
             Regex::new(r#"(?i)(<link\b[^>]*\bhref\s*=\s*")([^"]+\.css)("[^>]*>)"#).unwrap();
         result = link_re
             .replace_all(&result, |caps: &regex::Captures| {
                 let href = caps.get(2).unwrap().as_str();
                 let basename = href.rsplit('/').next().unwrap_or(href);
-                if css_basenames.contains(basename)
-                    || css_basenames.contains(&crate::links::percent_decode(basename))
+                let decoded = crate::links::percent_decode(basename);
+                if let Some(css) = inline_css
+                    .and_then(|sheets| sheets.get(basename).or_else(|| sheets.get(&decoded)))
                 {
+                    return format!("<style type=\"text/css\">\n{css}\n</style>");
+                }
+                if css_basenames.contains(basename) || css_basenames.contains(&decoded) {
                     format!(
                         "{}kindle:flow:0001?mime=text/css{}",
                         caps.get(1).unwrap().as_str(),
@@ -2501,6 +2516,7 @@ mod tests {
             &spine_items,
             &[],
             &std::collections::HashSet::new(),
+            &[],
             false,
         );
         assert_eq!(skels.len(), 5);
@@ -2536,6 +2552,7 @@ mod tests {
             &spine_items,
             &[],
             &std::collections::HashSet::new(),
+            &[],
             false,
         );
         assert_eq!(frags.len(), 1);
@@ -2552,6 +2569,7 @@ mod tests {
             &mut counter,
             &lookup,
             &std::collections::HashSet::new(),
+            None,
             false,
         );
         assert!(out.contains("<body"));
@@ -2856,6 +2874,7 @@ mod tests {
             &parts,
             css,
             &std::collections::HashSet::new(),
+            &[],
             &href_to_recindex,
             &spine_items,
             &[],
@@ -3392,6 +3411,7 @@ mod tests {
             &parts,
             "",
             &std::collections::HashSet::new(),
+            &[],
             &std::collections::HashMap::new(),
             &Vec::new(),
             &[],
@@ -3424,6 +3444,7 @@ mod tests {
             &parts,
             "body{margin:0}",
             &std::collections::HashSet::new(),
+            &[],
             &href_to_recindex,
             &spine_items,
             &[],
