@@ -1205,6 +1205,73 @@ mod tests {
         println!("  \u{2713} 103/105 present, no series record guessed at");
     }
 
+    /// Reflowable books must carry the OPF spine's page progression into
+    /// EXTH 525/527. kindlegen writes rtl as vertical-rl/rtl and ltr as
+    /// horizontal-lr/ltr; an omitted direction writes no 527 at all.
+    #[test]
+    fn test_reflowable_page_progression_writes_525_and_527() {
+        let build = |ppd: Option<&str>| {
+            let layout = FixedLayoutMeta {
+                is_fixed_layout: false,
+                original_resolution: None,
+                page_progression_direction: ppd.map(str::to_string),
+            };
+            parse_exth_records(&build_book_exth(
+                "Test Book",
+                "Author",
+                "2026-01-01",
+                "ja",
+                None,
+                None,
+                None,
+                Some(&layout),
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                0,
+            ))
+        };
+
+        let rtl = build(Some("rtl"));
+        assert_eq!(
+            find_record(&rtl, 525).as_deref(),
+            Some(b"vertical-rl".as_slice()),
+            "an rtl reflowable book must declare vertical writing"
+        );
+        assert_eq!(
+            find_record(&rtl, 527).as_deref(),
+            Some(b"rtl".as_slice()),
+            "an rtl reflowable book must declare rtl page progression"
+        );
+
+        let ltr = build(Some("ltr"));
+        assert_eq!(
+            find_record(&ltr, 525).as_deref(),
+            Some(b"horizontal-lr".as_slice()),
+            "an ltr reflowable book must stay horizontal-lr"
+        );
+        assert_eq!(
+            find_record(&ltr, 527).as_deref(),
+            Some(b"ltr".as_slice()),
+            "an explicit ltr direction must be written to 527"
+        );
+
+        let absent = build(None);
+        assert_eq!(
+            find_record(&absent, 525).as_deref(),
+            Some(b"horizontal-lr".as_slice()),
+            "a book without a direction defaults to horizontal-lr"
+        );
+        assert!(
+            find_record(&absent, 527).is_none(),
+            "a book without a direction must not invent EXTH 527"
+        );
+    }
+
     #[test]
     fn test_exth_header_structure() {
         // Verify the EXTH block has valid structure: magic, length, record count
