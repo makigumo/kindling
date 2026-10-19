@@ -155,17 +155,14 @@ pub fn build_kf8_section(
     let mut combined_text = kf8_html;
     combined_text.extend_from_slice(css_bytes);
 
-    // Per-section NCX node boundaries: one node per skeleton (spine item),
-    // each starting at the skeleton's absolute offset in the HTML flow and
-    // running to the next skeleton (last one to the end of the HTML flow).
-    // This tiles the whole book so the device's reading-position / progress
-    // map advances across every chapter instead of collapsing onto the
-    // single front-matter record (issue #15). A genuine one-page comic has
-    // a single skeleton and therefore still gets a single node. Labels come
-    // from the EPUB nav document where available, and nav entries that
-    // point at `file#anchor` targets get their own nodes at the anchor
-    // positions so multi-chapter spine files keep every TOC entry
-    // (issue #18).
+    // NCX node boundaries. A usable EPUB nav document supplies the rows, so
+    // the TOC matches the source's chapter list and continuation files with
+    // no nav entry do not appear as extra chapters; nav entries that point at
+    // `file#anchor` targets get their own nodes at the anchor positions so a
+    // multi-chapter spine file keeps every TOC entry (issue #18). A book with
+    // no usable nav falls back to one node per skeleton, which tiles the whole
+    // book so the device's reading-position / progress map advances across
+    // every chapter instead of collapsing onto the first record (issue #15).
     let ncx_nodes = build_ncx_nodes(
         &skeleton_entries,
         &fragment_entries,
@@ -329,19 +326,26 @@ pub(crate) struct Kf7NcxEntry {
     pub depth: usize,
 }
 
-/// Derive the NCX nodes: one base node per skeleton, labelled by the
-/// EPUB nav document (toc.ncx / nav.xhtml) entry for that spine file
-/// where one exists, falling back to the spine file's `<title>`, then to
-/// "Section N". The nav label comes first because per-file `<title>`
-/// tags are often a generic template string ("Chapter") while the real
-/// chapter names live only in the nav document (issue #18).
+/// Derive the NCX nodes from the EPUB nav document (toc.ncx / nav.xhtml).
+///
+/// When the nav maps onto the spine, its entries are the table of contents:
+/// only those rows are emitted, exactly as kindlegen does. A spine file with
+/// no nav entry is a continuation page (the rest of a chapter, a section of
+/// front matter), not a chapter, so it must not gain a TOC row just because
+/// it is a separate file. Emitting one row per skeleton used to preserve the
+/// reading-position map for books without navigation (issue #15), but it also
+/// listed every page under its `<title>` tag — often the book title repeated
+/// dozens of times — and buried the real chapter names.
+///
+/// A book whose nav does not map onto any spine file keeps the per-skeleton
+/// fallback: each file is a row labelled by its `<title>`, then "Section N",
+/// so the reading-position map still tiles the book when there is no usable
+/// table of contents.
 ///
 /// Nav entries beyond the first that point at a `file#anchor` target get
 /// their own node at the anchor's position, so a spine file holding
-/// several chapters keeps every TOC entry. The base node still starts at
-/// the skeleton so the nodes tile the whole book (issue #15); kindlegen
-/// instead starts at the first anchor and leaves any front matter
-/// uncovered.
+/// several chapters keeps every TOC entry. The base node starts at the
+/// skeleton but jumps to the first anchor, matching kindlegen's Go To target.
 ///
 /// A nav entry that repeats a target another entry already has keeps its
 /// entry (its label, its depth, its jump target) like every other one;
@@ -357,13 +361,27 @@ fn build_ncx_nodes(
     spine_nav_points: &[Vec<crate::nav::NavPoint>],
 ) -> Vec<NcxNode> {
     let title_re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap();
-    let mut nodes: Vec<NcxNode> = Vec::with_capacity(skeleton_entries.len());
+    // A nav document that targets at least one spine file is the book's TOC.
+    // A nav that names only non-spine pages (or none at all) is unusable here,
+    // so fall back to the per-file labels that keep the position map whole.
+    let has_nav = spine_nav_points.iter().any(|points| !points.is_empty());
+    let mut nodes: Vec<NcxNode> = Vec::with_capacity(if has_nav {
+        spine_nav_points.iter().map(Vec::len).sum()
+    } else {
+        skeleton_entries.len()
+    });
     for (i, skel) in skeleton_entries.iter().enumerate() {
         let end = skeleton_entries
             .get(i + 1)
             .map(|s| s.start_pos)
             .unwrap_or(html_length);
         let nav_points = spine_nav_points.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        // With a usable nav, a file it does not name is a continuation page and
+        // gets no row. Without one, every skeleton keeps its reading-position
+        // row, labelled from the file itself.
+        if has_nav && nav_points.is_empty() {
+            continue;
+        }
         let nav_label = nav_points
             .first()
             .map(|p| p.label.clone())
@@ -2225,10 +2243,10 @@ fn build_fragment_indx_with_cncx(frags: &[FragmentEntry]) -> (Vec<Vec<u8>>, Vec<
 /// kindlegen's 8-tag hierarchical layout, adding 21 (parent), 22 (first
 /// child), 23 (last child) between tags 4 and 6 (issue #19); childless
 /// entries omit tags 22/23 and top-level entries omit tag 21, exactly as
-/// kindlegen does (the control byte marks them absent). Emitting one node
-/// per spine item tiles the whole book so the device's reading-position /
-/// progress bar advances across every chapter, and the node labels
-/// populate the device table-of-contents. Tag 6 addresses the jump target as
+/// kindlegen does (the control byte marks them absent). The node labels
+/// populate the device table-of-contents; a book without a usable nav
+/// document gets one node per spine item so its reading-position / progress
+/// bar still advances across every chapter. Tag 6 addresses the jump target as
 /// `(fragment id, offset in that fragment)`: the id is the FRAG chunk the
 /// anchor falls in — the skeleton's first chunk for a target at the document
 /// start, a later one for an anchor deep in a long chapter.
