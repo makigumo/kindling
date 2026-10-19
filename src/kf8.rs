@@ -265,12 +265,14 @@ struct NcxNode {
     offset: usize,
     /// Display label (nav document entry, chapter `<title>`, or fallback).
     label: String,
-    /// Fragment id this node points at (== the spine/skeleton index,
-    /// since kindling emits exactly one fragment per spine item).
+    /// Fragment id this node points at: the FRAG entry's sequence number
+    /// (tag 4), i.e. the chunk of the skeleton's payload that holds the
+    /// target. See [`fragment_target`].
     fid: usize,
-    /// Byte offset of the target anchor within the fragment payload
-    /// (second value of the pos_fid tag; 0 = start of the file). This is
-    /// what the "Go To" jump lands on, verified against kindlegen output.
+    /// Byte offset of the target anchor within that fragment chunk
+    /// (second value of the pos_fid tag; 0 = start of the file, or of the
+    /// chunk the anchor falls in). This is what the "Go To" jump lands on,
+    /// verified against kindlegen output.
     frag_off: usize,
     /// Nesting depth from the EPUB nav document (issue #19). `None` for
     /// fallback nodes (spine files with no nav entry), which inherit the
@@ -298,9 +300,10 @@ struct NcxIndexEntry {
     length: usize,
     /// Display label.
     label: String,
-    /// Fragment id (spine/skeleton index) of the pos_fid jump target.
+    /// Fragment id (the FRAG chunk's sequence number) of the pos_fid jump
+    /// target.
     fid: usize,
-    /// Anchor byte offset within the fragment payload (pos_fid value 2).
+    /// Anchor byte offset within that chunk (pos_fid value 2).
     frag_off: usize,
     /// Resolved depth (0 = top level), clamped so it never jumps by more
     /// than one level from the previous document-order entry.
@@ -387,11 +390,12 @@ fn build_ncx_nodes(
         // anchor is `fragment insert position + offset within payload`,
         // which is the offset space kindlegen's NCX uses.
         let frag_phys_start = (skel.start_pos + skel.length).min(end);
-        let insert_pos = fragment_entries
-            .iter()
-            .find(|f| f.file_number == i)
-            .map(|f| f.insert_pos)
-            .unwrap_or(frag_phys_start);
+        let first_chunk = fragment_entries.iter().find(|f| f.file_number == i);
+        let insert_pos = first_chunk.map(|f| f.insert_pos).unwrap_or(frag_phys_start);
+        // Fragment id of this document's first chunk: a jump target is
+        // addressed as (chunk, offset within that chunk), so an anchor deep
+        // in a long chapter lands in a later chunk than the document start.
+        let first_fid = first_chunk.map(|f| f.sequence_number).unwrap_or(0);
         let payload = &kf8_html[frag_phys_start..end];
         // Ids on this document's `<html>`/`<body>` wrappers. The merge drops
         // those elements, so a nav entry naming one means the document start
@@ -410,11 +414,12 @@ fn build_ncx_nodes(
             .and_then(|frag| find_anchor_offset(payload, frag))
             .unwrap_or(0);
 
+        let base_target = fragment_target(first_fid, base_frag_off);
         nodes.push(NcxNode {
             offset: skel.start_pos,
             label,
-            fid: i,
-            frag_off: base_frag_off,
+            fid: base_target.0,
+            frag_off: base_target.1,
             depth: base_depth,
         });
 
@@ -429,32 +434,37 @@ fn build_ncx_nodes(
             .filter_map(|p| match p.fragment.as_deref() {
                 Some(frag) => {
                     if let Some(off) = find_anchor_offset(payload, frag) {
+                        let target = fragment_target(first_fid, off);
                         Some(NcxNode {
                             offset: insert_pos + off,
                             label: p.label.clone(),
-                            fid: i,
-                            frag_off: off,
+                            fid: target.0,
+                            frag_off: target.1,
                             depth: Some(p.depth),
                         })
                     } else if wrapper_anchors.contains(frag) {
+                        let target = fragment_target(first_fid, 0);
                         Some(NcxNode {
                             offset: skel.start_pos,
                             label: p.label.clone(),
-                            fid: i,
-                            frag_off: 0,
+                            fid: target.0,
+                            frag_off: target.1,
                             depth: Some(p.depth),
                         })
                     } else {
                         None
                     }
                 }
-                None => Some(NcxNode {
-                    offset: skel.start_pos,
-                    label: p.label.clone(),
-                    fid: i,
-                    frag_off: 0,
-                    depth: Some(p.depth),
-                }),
+                None => {
+                    let target = fragment_target(first_fid, 0);
+                    Some(NcxNode {
+                        offset: skel.start_pos,
+                        label: p.label.clone(),
+                        fid: target.0,
+                        frag_off: target.1,
+                        depth: Some(p.depth),
+                    })
+                }
             })
             .collect();
         extras.sort_by_key(|n| n.offset);
@@ -610,11 +620,38 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Bytes of one fragment chunk.
+///
+/// kindlegen writes one FRAG row per skeleton only for a small chapter: on a
+/// large one it splits the skeleton's payload into ~8 KB fragments (measured
+/// on a 1.29 MB single-chapter book: 160 rows of 7,992–8,510 bytes, spans
+/// tiling the payload exactly). A reader then touches a page's worth of text
+/// instead of one multi-megabyte record. This is the chunk size kindling
+/// uses; a payload at or under it still gets exactly one row, as before.
+const FRAG_CHUNK_BYTES: usize = 8192;
+
+/// Map a byte offset inside a skeleton's payload to the fragment that owns
+/// it: `(fragment id, offset within that fragment)`.
+///
+/// A fragment id is the FRAG entry's sequence number (tag 4), numbered across
+/// the whole book, and a skeleton's chunks are consecutive, so the id is the
+/// skeleton's first chunk plus the chunk ordinal. These are the two values a
+/// `kindle:pos:fid:FFFF:off:OOOOOOOOOO` URL carries, and the two values the
+/// NCX's tag 6 carries; both address the same coordinate space, which is why
+/// the same function resolves both.
+fn fragment_target(first_fid: usize, payload_offset: usize) -> (usize, usize) {
+    (
+        first_fid + payload_offset / FRAG_CHUNK_BYTES,
+        payload_offset % FRAG_CHUNK_BYTES,
+    )
+}
+
 /// Build KF8 HTML with aid attributes, kindle:embed image URLs, and the
 /// skeleton/fragment split.
 ///
 /// Returns (combined_text_bytes, skeleton_entries, fragment_entries).
-/// The combined text layout is `[skel_0][frag_0_0]...[skel_1][frag_1_0]...`.
+/// The combined text layout is `[skel_0][frag_0_0]...[skel_1][frag_1_0]...`,
+/// where a skeleton's fragments are consecutive chunks of its payload.
 fn build_kf8_html(
     html_parts: &[String],
     href_to_recindex: &std::collections::HashMap<String, usize>,
@@ -626,8 +663,9 @@ fn build_kf8_html(
 ) -> (Vec<u8>, Vec<SkeletonEntry>, Vec<FragmentEntry>) {
     let path_to_recindex = build_image_path_lookup(href_to_recindex, spine_items);
     // Every spine document's normalized href mapped to its position in
-    // spine order, which is also its fragment id because kindling emits
-    // exactly one fragment per spine document. Used to rewrite
+    // spine order. A resolved href records that document number, which the
+    // resolution pass below turns into `(fragment id, offset)` once the
+    // anchor's byte offset is known. Used to rewrite
     // `<a href="other.xhtml#frag">` to `kindle:pos:fid:FFFF:off:OOOOOOOOOO`.
     let documents = links::build_document_index(spine_hrefs);
     // Spine documents this half does not emit. `build_book_mobi` drops a
@@ -648,6 +686,9 @@ fn build_kf8_html(
     let mut fragment_entries: Vec<FragmentEntry> = Vec::new();
     let mut combined: Vec<u8> = Vec::new();
     let mut global_seq: usize = 0;
+    // Fragment id of each spine document's first chunk, so a link or nav
+    // target that lands in a later chunk can work out that chunk's id.
+    let mut first_fid_per_file: Vec<usize> = Vec::new();
     // Anchor tables and link sites, filled in as each part is emitted and
     // resolved once every fragment's contents are final. `fragment_anchors`
     // holds offsets relative to a fragment's own text, which is exactly
@@ -670,9 +711,9 @@ fn build_kf8_html(
     let mut global_aid_counter: u32 = 0;
 
     // `global_seq` numbers the fragments emitted so far, which is a
-    // different quantity from `skel_idx` even though the two currently
-    // agree, because each spine part emits exactly one fragment today.
-    // Folding it into the iterator would bake that assumption in.
+    // different quantity from `skel_idx`: each spine part emits as many
+    // fragments as its payload has chunks, and the count is not known until
+    // the payload is split. It is also the fragment id a jump target names.
     #[allow(clippy::explicit_counter_loop)]
     for (skel_idx, raw_part) in html_parts.iter().enumerate() {
         let mut aid_counter: u32 = if kindlegen_parity {
@@ -724,10 +765,11 @@ fn build_kf8_html(
         //    fragment content belongs in the final rendered document).
         let insert_pos = skel_start + split.body_inner_offset;
 
-        // 5. Emit a single fragment that contains the body's inner
-        //    content (everything between `<body ...>` and `</body>`).
-        //    More complex pages could split the inner content further
-        //    — for simple comic pages there is always one chunk.
+        // 5. Emit the body's inner content (everything between
+        //    `<body ...>` and `</body>`) as consecutive fragment chunks.
+        //    Splitting the payload is metadata only: the bytes stay in
+        //    one run, and the rows that describe it tile that run, so
+        //    nothing here moves relative to the skeleton.
         let frag_start = combined.len();
         combined.extend_from_slice(body_inner);
         let frag_len = body_inner.len();
@@ -759,32 +801,41 @@ fn build_kf8_html(
             pending_links.push((at, link.target));
         }
 
-        // Compute start_pos relative to the first fragment of this
-        // skel's fragment block (which is `skel_start + skel_len`).
-        // With one fragment per skel, this is 0.
-        let relative_start = 0usize;
-
-        fragment_entries.push(FragmentEntry {
-            insert_pos,
-            selector: format!("P-//*[@aid='{}']", split.body_aid),
-            file_number: skel_idx,
-            sequence_number: global_seq,
-            start_pos: relative_start,
-            length: frag_len,
-        });
-        global_seq += 1;
+        // 5c. One row per chunk, in payload order. `start_pos` is the
+        //     chunk's offset in this skel's payload block and the label
+        //     is where that chunk splices back in, so the rows tile the
+        //     payload exactly once — no two of them can describe the same
+        //     bytes. A payload shorter than the chunk size (including an
+        //     empty body) still gets exactly one row.
+        first_fid_per_file.push(global_seq);
+        let chunk_count = frag_len.div_ceil(FRAG_CHUNK_BYTES).max(1);
+        for chunk_idx in 0..chunk_count {
+            let chunk_start = chunk_idx * FRAG_CHUNK_BYTES;
+            let chunk_end = (chunk_start + FRAG_CHUNK_BYTES).min(frag_len);
+            fragment_entries.push(FragmentEntry {
+                insert_pos: insert_pos + chunk_start,
+                selector: format!("P-//*[@aid='{}']", split.body_aid),
+                file_number: skel_idx,
+                sequence_number: global_seq,
+                start_pos: chunk_start,
+                length: chunk_end - chunk_start,
+            });
+            global_seq += 1;
+        }
 
         skeleton_entries.push(SkeletonEntry {
             label: format!("SKEL{:010}", skel_idx),
             start_pos: skel_start,
             length: skel_len,
-            chunk_count: 1,
+            chunk_count,
         });
     }
 
     // Second pass: every fragment's contents are final, so each link's
-    // target byte offset is now known. Writing it never changes a length —
-    // the URL was emitted at full width — so nothing computed above moves.
+    // target byte offset is now known, and with it which fragment chunk of
+    // the target document that offset falls in. Both the id and the offset
+    // are fixed width, so writing them never changes a length and nothing
+    // computed above moves.
     for (at, (file, fragment)) in pending_links {
         let offset = match &fragment {
             None => Some(0),
@@ -803,7 +854,13 @@ fn build_kf8_html(
         };
         match offset {
             Some(offset) => {
-                let encoded = links::encode_base32(offset, KINDLE_POS_OFF_LEN);
+                let first_fid = first_fid_per_file.get(file).copied().unwrap_or(0);
+                let (fid, local_off) = fragment_target(first_fid, offset);
+                let encoded_fid = links::encode_base32(fid, KINDLE_POS_FID_LEN);
+                let fid_at = at + KINDLE_POS_SCHEME.len();
+                combined[fid_at..fid_at + encoded_fid.len()]
+                    .copy_from_slice(encoded_fid.as_bytes());
+                let encoded = links::encode_base32(local_off, KINDLE_POS_OFF_LEN);
                 let start = at + KINDLE_POS_OFF_AT;
                 combined[start..start + encoded.len()].copy_from_slice(encoded.as_bytes());
             }
@@ -1210,12 +1267,14 @@ const KINDLE_POS_LEN: usize = KINDLE_POS_OFF_AT + KINDLE_POS_OFF_LEN;
 /// `kindle:pos` URL, returning the rewritten string and the offsets still
 /// to be filled in.
 ///
-/// The fragment id is known immediately — it is the target document's
-/// position in spine order, because kindling emits exactly one fragment per
-/// spine document — but the offset inside it is not, so it starts as ten
-/// `X` characters. A link that resolves to no document at all is written as
-/// a full-width run of `X`, which is the inert placeholder kindlegen uses
-/// for a link it reports as unresolved.
+/// The fragment id is a placeholder here — the target document's first
+/// fragment, which is only the right answer for a link to the top of that
+/// document — because which chunk of the document the target anchor falls in
+/// is not known until the anchor's offset is, in the resolution pass. Both
+/// fields are fixed width, so that pass rewrites the id as well as the
+/// offset. A link that resolves to no document at all is written as a
+/// full-width run of `X`, which is the inert placeholder kindlegen uses for
+/// a link it reports as unresolved.
 ///
 /// This must run after aid injection: the offsets recorded here are into
 /// the returned string, and injecting `aid` attributes afterwards would
@@ -2079,6 +2138,27 @@ fn build_fragment_indx_with_cncx(frags: &[FragmentEntry]) -> (Vec<Vec<u8>>, Vec<
         return (minimal_indx(), Vec::new());
     }
 
+    // Claim-and-span: a fragment owns a byte range of its skeleton's payload
+    // and no two fragments may own the same byte. The rows of one skeleton
+    // therefore tile its payload — each one starting where the previous one
+    // ended. Nothing else may append a row here (a navigation entry names an
+    // existing fragment rather than claiming a span of its own), so this
+    // holds by construction; the assertion is what keeps a future caller from
+    // writing a duplicate or overlapping row.
+    debug_assert!(
+        {
+            let mut next_start: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            frags.iter().all(|f| {
+                let next = next_start.entry(f.file_number).or_insert(0);
+                let contiguous = f.start_pos == *next;
+                *next = f.start_pos + f.length;
+                contiguous
+            })
+        },
+        "FRAG rows of one skeleton must tile its payload exactly once"
+    );
+
     let tag_defs = [
         TagMeta {
             number: 2,
@@ -2148,8 +2228,10 @@ fn build_fragment_indx_with_cncx(frags: &[FragmentEntry]) -> (Vec<Vec<u8>>, Vec<
 /// kindlegen does (the control byte marks them absent). Emitting one node
 /// per spine item tiles the whole book so the device's reading-position /
 /// progress bar advances across every chapter, and the node labels
-/// populate the device table-of-contents. The fragment id in tag 6 is the
-/// node's spine index (one fragment per spine item).
+/// populate the device table-of-contents. Tag 6 addresses the jump target as
+/// `(fragment id, offset in that fragment)`: the id is the FRAG chunk the
+/// anchor falls in — the skeleton's first chunk for a target at the document
+/// start, a later one for an anchor deep in a long chapter.
 fn build_ncx_indx(title: &str, entries: &[NcxIndexEntry]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut ncx_cncx = CncxBuilder::new();
 
