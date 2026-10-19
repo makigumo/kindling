@@ -1054,7 +1054,7 @@ fn process_kf8_part(
                 let href = caps.get(2).unwrap().as_str();
                 let basename = href.rsplit('/').next().unwrap_or(href);
                 if css_basenames.contains(basename)
-                    || css_basenames.contains(&percent_decode_str(basename))
+                    || css_basenames.contains(&crate::links::percent_decode(basename))
                 {
                     format!(
                         "{}kindle:flow:0001?mime=text/css{}",
@@ -1253,27 +1253,6 @@ fn replace_hrefs_with_kindle_pos(
 
 /// Minimal percent-decoder for href basename comparison (mirrors the one
 /// in `mobi.rs`; kept local to avoid a cross-module dependency).
-fn percent_decode_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut bytes = s.bytes();
-    while let Some(b) = bytes.next() {
-        if b == b'%' {
-            let h1 = bytes.next();
-            let h2 = bytes.next();
-            if let (Some(h1), Some(h2)) = (h1, h2) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1 as char, h2 as char), 16) {
-                    out.push(byte as char);
-                    continue;
-                }
-            }
-            out.push('%');
-        } else {
-            out.push(b as char);
-        }
-    }
-    out
-}
-
 /// Append KF8 TBS (Trailing Byte Sequence) bytes to a text record.
 ///
 /// TBS tells the Kindle firmware which NCX entries overlap with a given
