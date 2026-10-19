@@ -373,18 +373,24 @@ fn build_dictionary_mobi(
     // help text only ever promised to skip the 30 MB split and the file-count
     // warning. `kindle_limits` now controls exactly that and nothing else
     // (issue #41).
-    let (text_content, entry_needles, pending_links, entry_gap_texts, front_matter_needles) =
-        build_text_content_by_letter(
-            opf,
-            &all_entries,
-            &entry_files,
-            &entry_gaps,
-            &tail_gaps,
-            &tail_gap_files,
-            &files_with_entries,
-            &dictionary_nav_points,
-            kindle_limits,
-        );
+    let (
+        text_content,
+        entry_needles,
+        pending_links,
+        entry_gap_texts,
+        front_matter_needles,
+        ncx_owners,
+    ) = build_text_content_by_letter(
+        opf,
+        &all_entries,
+        &entry_files,
+        &entry_gaps,
+        &tail_gaps,
+        &tail_gap_files,
+        &files_with_entries,
+        &dictionary_nav_points,
+        kindle_limits,
+    );
 
     // Rewrite image src attributes to recindex references
     let text_content = if !href_to_recindex.is_empty() {
@@ -427,7 +433,8 @@ fn build_dictionary_mobi(
         &front_matter_needles,
     );
 
-    let kf7_ncx_entries = build_dictionary_ncx_entries(&dictionary_nav_points, &text_content);
+    let kf7_ncx_entries =
+        build_dictionary_ncx_entries(&dictionary_nav_points, &text_content, &ncx_owners);
     if !dictionary_nav_points.is_empty() && kf7_ncx_entries.is_empty() {
         eprintln!("Dictionary NCX: no navigation targets resolved; writing no NCX index");
     } else if !kf7_ncx_entries.is_empty() {
@@ -3239,13 +3246,53 @@ fn insert_dictionary_ncx_marker(text: &mut String, offset: usize, index: usize) 
     }
 }
 
-/// Place one invisible marker at every resolvable dictionary TOC target.
+/// One TOC target, as the pair `(container kind, container index, fragment)`.
+///
+/// Two nav entries that point at the same place name the same target: the same
+/// alphabet heading, the same entry, or the same file's first entry (the
+/// fragment being `None` for a target that means "the start of this
+/// container"). Wadoku's own navigation document nests a section under its
+/// chapter and points both at `あ1.html`, so this is the ordinary case for a
+/// dictionary, not a corner one.
+type NcxTarget = (u8, usize, Option<String>);
+
+/// Claim a target for one nav entry: the first entry to name it writes the
+/// marker, and a later entry that names the same place is pointed at that same
+/// marker. Returns whether the caller should insert a marker of its own; a
+/// caller that must not returns having recorded which entry's marker its row
+/// will resolve through.
+fn claim_ncx_target(
+    claimed: &mut std::collections::HashMap<NcxTarget, usize>,
+    owners: &mut [usize],
+    nav_index: usize,
+    target: NcxTarget,
+) -> bool {
+    match claimed.entry(target) {
+        std::collections::hash_map::Entry::Occupied(existing) => {
+            owners[nav_index] = *existing.get();
+            false
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(nav_index);
+            true
+        }
+    }
+}
+
+/// Place one invisible marker at every resolvable dictionary TOC target, and
+/// report which nav entry's marker each entry resolves through.
 ///
 /// This runs after each contribution has received the same cleanup it will
 /// have in the MOBI text, but before the contributions are concatenated. It
 /// therefore handles all source shapes: front matter, a file target, an
 /// anchor between entries (the usual letter heading), an entry id/headword,
 /// an anchor inside an entry, and trailing matter after the last entry.
+///
+/// A repeated target gets no second marker: the entries that name it resolve
+/// through the first one's, so they land on the same byte the way kindlegen's
+/// rows do. Inserting a marker per nav entry instead would put the repeat one
+/// marker-length past the place it names, because the offset is read from the
+/// text the earlier marker has already lengthened.
 #[allow(clippy::too_many_arguments)]
 fn insert_dictionary_ncx_markers(
     opf: &OPFData,
@@ -3258,11 +3305,11 @@ fn insert_dictionary_ncx_markers(
     stripped_entries: &mut [String],
     stripped_gaps: &mut [String],
     stripped_tails: &mut [String],
-) {
+) -> Vec<usize> {
     let doc_hrefs: Vec<String> = opf
         .get_content_html_hrefs()
         .iter()
-        .map(|href| links::normalize_path(&percent_decode(href)))
+        .map(|href| links::normalize_path(&links::percent_decode(href)))
         .collect();
     let wrapper_anchors: Vec<std::collections::HashSet<String>> = opf
         .get_content_html_paths()
@@ -3273,6 +3320,9 @@ fn insert_dictionary_ncx_markers(
                 .unwrap_or_default()
         })
         .collect();
+    // Each nav entry's own index until it turns out to share a target.
+    let mut owners: Vec<usize> = (0..nav_points.len()).collect();
+    let mut claimed: std::collections::HashMap<NcxTarget, usize> = std::collections::HashMap::new();
 
     for (nav_index, point) in nav_points.iter().enumerate() {
         let Some(file) = doc_hrefs.iter().position(|href| *href == point.file_href) else {
@@ -3300,21 +3350,27 @@ fn insert_dictionary_ncx_markers(
                     .map(|anchor| anchor.offset)
             };
             if let Some(offset) = target {
-                insert_dictionary_ncx_marker(
-                    &mut front_matter_sections[section],
-                    offset,
-                    nav_index,
-                );
+                let key = (0u8, section, point.fragment.clone());
+                if claim_ncx_target(&mut claimed, &mut owners, nav_index, key) {
+                    insert_dictionary_ncx_marker(
+                        &mut front_matter_sections[section],
+                        offset,
+                        nav_index,
+                    );
+                }
             }
             continue;
         }
 
         // A dictionary file begins with the run immediately before its first
         // entry. The run can be empty; adding the marker there still places a
-        // bare file target exactly before that entry.
+        // bare file target exactly before that entry. A file target and an
+        // entry target name the same place, so both claim the entry's key.
         if at_file_start {
             if let Some(i) = entry_files.iter().position(|&f| f == file) {
-                insert_dictionary_ncx_marker(&mut stripped_gaps[i], 0, nav_index);
+                if claim_ncx_target(&mut claimed, &mut owners, nav_index, (2u8, i, None)) {
+                    insert_dictionary_ncx_marker(&mut stripped_gaps[i], 0, nav_index);
+                }
             }
             continue;
         }
@@ -3332,7 +3388,10 @@ fn insert_dictionary_ncx_markers(
                 .into_iter()
                 .find(|anchor| anchor.name == fragment)
             {
-                insert_dictionary_ncx_marker(&mut stripped_gaps[i], anchor.offset, nav_index);
+                let key = (1u8, i, Some(fragment.to_string()));
+                if claim_ncx_target(&mut claimed, &mut owners, nav_index, key) {
+                    insert_dictionary_ncx_marker(&mut stripped_gaps[i], anchor.offset, nav_index);
+                }
                 placed = true;
                 break;
             }
@@ -3348,7 +3407,21 @@ fn insert_dictionary_ncx_markers(
                     .map(|anchor| anchor.offset)
             };
             if let Some(offset) = target {
-                insert_dictionary_ncx_marker(&mut stripped_entries[i], offset, nav_index);
+                // An entry id and a headword spelling name one entry, and a
+                // bare file target names the file's first one, so every one of
+                // them shares this key.
+                let key = (
+                    2u8,
+                    i,
+                    if entry_start {
+                        None
+                    } else {
+                        Some(fragment.to_string())
+                    },
+                );
+                if claim_ncx_target(&mut claimed, &mut owners, nav_index, key) {
+                    insert_dictionary_ncx_marker(&mut stripped_entries[i], offset, nav_index);
+                }
                 placed = true;
                 break;
             }
@@ -3362,23 +3435,40 @@ fn insert_dictionary_ncx_markers(
                 .into_iter()
                 .find(|anchor| anchor.name == fragment)
             {
-                insert_dictionary_ncx_marker(&mut stripped_tails[tail], anchor.offset, nav_index);
+                let key = (3u8, tail, Some(fragment.to_string()));
+                if claim_ncx_target(&mut claimed, &mut owners, nav_index, key) {
+                    insert_dictionary_ncx_marker(
+                        &mut stripped_tails[tail],
+                        anchor.offset,
+                        nav_index,
+                    );
+                }
             }
         }
     }
+
+    owners
 }
 
 /// Resolve the markers in the final byte stream into the four fields a KF7
 /// NCX stores. Entries are sorted by their assembled positions because the
 /// dictionary writer moves all front matter ahead of its entries.
+///
+/// `owners` says which nav entry's marker each entry resolves through; a row
+/// that names a place an earlier row already names shares that row's offset
+/// instead of getting a marker of its own. Spans then follow the book rule: a
+/// row runs to the nearest entry that begins later at the same or a shallower
+/// depth, and only the last row of a same-offset, same-depth group owns the
+/// span (kindlegen writes the earlier ones zero-length).
 fn build_dictionary_ncx_entries(
     nav_points: &[crate::nav::NavPoint],
     text: &[u8],
+    owners: &[usize],
 ) -> Vec<crate::kf8::Kf7NcxEntry> {
     let mut resolved: Vec<(usize, String, usize)> = Vec::new();
     let mut unresolved = 0usize;
     for (i, point) in nav_points.iter().enumerate() {
-        let marker = dictionary_ncx_marker(i);
+        let marker = dictionary_ncx_marker(owners[i]);
         match find_bytes(text, marker.as_bytes()) {
             Some(at) => resolved.push((at + marker.len(), point.label.clone(), point.depth)),
             None => unresolved += 1,
@@ -3386,17 +3476,38 @@ fn build_dictionary_ncx_entries(
     }
 
     resolved.sort_by_key(|(offset, _, _)| *offset);
-    let mut out = Vec::with_capacity(resolved.len());
+    let total = text.len();
+    let mut spans: Vec<(usize, usize, String)> = Vec::with_capacity(resolved.len());
     for (i, (offset, label, depth)) in resolved.iter().enumerate() {
-        let end = resolved.get(i + 1).map_or(text.len(), |next| next.0);
-        if end > *offset {
-            out.push(crate::kf8::Kf7NcxEntry {
-                offset: *offset,
-                length: end - *offset,
-                label: label.clone(),
-                depth: *depth,
-            });
-        }
+        let end = resolved[i + 1..]
+            .iter()
+            .filter(|(next, _, next_depth)| next > offset && next_depth <= depth)
+            .map(|(next, _, _)| *next)
+            .min()
+            .unwrap_or(total);
+        let repeated_later = resolved[i + 1..]
+            .iter()
+            .any(|(next, _, next_depth)| next == offset && next_depth == depth);
+        spans.push((
+            *offset,
+            if repeated_later {
+                0
+            } else {
+                end.saturating_sub(*offset)
+            },
+            label.clone(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(spans.len());
+    for (i, (offset, length, label)) in spans.iter().enumerate() {
+        let depth = resolved[i].2;
+        out.push(crate::kf8::Kf7NcxEntry {
+            offset: *offset,
+            length: *length,
+            label: label.clone(),
+            depth,
+        });
     }
 
     if unresolved > 0 {
@@ -3482,13 +3593,15 @@ fn build_book_ncx_entries(
 /// What `build_text_content_by_letter` returns: the merged body text, the
 /// per-entry headword needles, the link placeholders still waiting to be
 /// patched with real file positions, the gap text that sits between entries,
-/// and the opening bytes of each front-matter document with its spine index.
+/// the opening bytes of each front-matter document with its spine index, and
+/// the nav entry whose NCX marker each nav entry resolves through.
 type AssembledDictionaryText = (
     Vec<u8>,
     Vec<Box<[u8]>>,
     Vec<PendingFilepos>,
     Vec<String>,
     Vec<(usize, Box<[u8]>)>,
+    Vec<usize>,
 );
 
 /// Build text content for a dictionary, splitting at entry boundaries to stay
@@ -3683,7 +3796,7 @@ fn build_text_content_by_letter(
         .map(|gap| trim_leading_separators(&strip_idx_markup(gap)))
         .collect();
 
-    insert_dictionary_ncx_markers(
+    let ncx_owners = insert_dictionary_ncx_markers(
         opf,
         nav_points,
         entries,
@@ -3801,6 +3914,7 @@ fn build_text_content_by_letter(
         pending_links,
         stripped_gaps,
         front_matter_needles,
+        ncx_owners,
     )
 }
 
