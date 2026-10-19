@@ -1099,6 +1099,104 @@ mod validate {
     }
 
     #[test]
+    fn dictionary_kf7_ncx_keeps_a_nav_row_that_repeats_an_earlier_target() {
+        // kindlegen keeps a dictionary nav entry that points where an earlier
+        // one already points, giving the earlier row a zero-length span. Its
+        // own build of this shape writes, for `Validate` / `Validate again`,
+        // offset 485 length 0 followed by offset 485 length 88. kindling used
+        // to drop the repeat.
+        let (tmp, opf) = stage_fixture("clean_dict", "clean_dict.opf");
+        let content = tmp.path().join("content.html");
+        let content_html = std::fs::read_to_string(&content).unwrap();
+        std::fs::write(
+            &content,
+            content_html.replace(
+                "<p>To check or prove",
+                "<p id=\"validate-target\">To check or prove",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("toc.ncx"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<navMap>
+<navPoint id="n1" playOrder="1"><navLabel><text>How to Use</text></navLabel><content src="usage.html"/></navPoint>
+<navPoint id="n2" playOrder="2"><navLabel><text>Dictionary</text></navLabel><content src="content.html"/></navPoint>
+<navPoint id="n3" playOrder="3"><navLabel><text>Validate</text></navLabel><content src="content.html#validate-target"/></navPoint>
+<navPoint id="n4" playOrder="4"><navLabel><text>Validate again</text></navLabel><content src="content.html#validate-target"/></navPoint>
+<navPoint id="n5" playOrder="5"><navLabel><text>Copyright</text></navLabel><content src="copyright.html"/></navPoint>
+</navMap></ncx>"#,
+        )
+        .unwrap();
+
+        let built = Command::new(kindling_bin())
+            .arg("build")
+            .arg(&opf)
+            .output()
+            .expect("failed to spawn dictionary NCX build");
+        assert!(built.status.success(), "build failed\n{}", dump(&built));
+        assert!(
+            String::from_utf8_lossy(&built.stderr)
+                .contains("Dictionary NCX: 5 table-of-contents entries"),
+            "the repeated target lost its row\n{}",
+            dump(&built)
+        );
+
+        let path = tmp.path().join("clean_dict.mobi");
+        let data = std::fs::read(&path).unwrap();
+        let count = u16::from_be_bytes([data[76], data[77]]) as usize;
+        let be32 = |p: usize| u32::from_be_bytes(data[p..p + 4].try_into().unwrap()) as usize;
+        let offsets: Vec<usize> = (0..count)
+            .map(|i| be32(78 + i * 8))
+            .chain([data.len()])
+            .collect();
+        let rec = |i: usize| &data[offsets[i]..offsets[i + 1]];
+        let ncx = u32::from_be_bytes(rec(0)[0xF4..0xF8].try_into().unwrap()) as usize;
+        assert_ne!(ncx, 0xFFFF_FFFF, "the dictionary has no KF7 NCX index");
+        let data_records = u32::from_be_bytes(rec(ncx)[24..28].try_into().unwrap()) as usize;
+        let records: Vec<&[u8]> = (0..data_records).map(|k| rec(ncx + 1 + k)).collect();
+        let entries = indx_entries(rec(ncx), &records);
+        let rows: Vec<(u32, u32)> = entries
+            .iter()
+            .map(|entry| {
+                let tag = |id: u8| -> u32 {
+                    entry
+                        .1
+                        .iter()
+                        .find(|(t, _)| *t == id)
+                        .map(|(_, v)| v[0])
+                        .unwrap_or(u32::MAX)
+                };
+                (tag(1), tag(2))
+            })
+            .collect();
+        assert_eq!(rows.len(), 5, "rows {rows:?}");
+
+        let zero: Vec<(u32, u32)> = rows.iter().copied().filter(|(_, len)| *len == 0).collect();
+        assert_eq!(zero.len(), 1, "rows {rows:?}");
+        assert!(
+            rows.iter()
+                .any(|(start, len)| *len > 0 && *start == zero[0].0),
+            "the repeated target must share a spanned row's offset, rows {rows:?}"
+        );
+        let mut spans = rows.clone();
+        spans.sort_unstable();
+        spans.dedup();
+        assert_eq!(spans.len(), rows.len(), "a span written twice in {rows:?}");
+
+        // Both rows of the repeated pair address the same bytes, and those
+        // bytes are the element the nav entries name.
+        let text = mobi_rawml(&path);
+        let at = zero[0].0 as usize;
+        assert!(
+            text[at..].starts_with("<p id=\"validate-target\">"),
+            "KF7 row points at {:?}",
+            &text[at..at + 32]
+        );
+    }
+
+    #[test]
     fn build_reports_a_linked_stylesheet_that_names_no_file() {
         // A `<link rel="stylesheet">` naming a file that is not anywhere costs
         // the book that chapter's styling, and used to do it without a word:
