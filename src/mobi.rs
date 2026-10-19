@@ -6495,13 +6495,25 @@ fn build_lookup_terms(
 ) -> (Vec<LookupTerm>, Option<crate::ordt::OrdtTables>) {
     use std::collections::HashMap;
 
-    let mut terms: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    // The span one label opens: entry start, text length, the headword's
+    // length in the entry, and the entry's ordinal in the source.
+    type Span = (usize, usize, usize, usize);
+
+    let mut terms: HashMap<String, Span> = HashMap::new();
     let mut headwords: HashSet<String> = HashSet::new();
     // Labels in document (first-appearance) order. The generated-ORDT
     // symbol table is numbered in this order (symbol 3 is the first
     // label's lead byte; trailing high-byte symbols follow first
     // appearance), so it must match kindlegen's scan order. See crate::ordt.
     let mut ordered_labels: Vec<String> = Vec::new();
+    // Spans of labels a second entry carries too. kindlegen writes one index
+    // record per entry bearing a label — three entries spelled `いぬ` are
+    // three records, and the card pages through all three — while a table
+    // keyed by the label string holds one span and every later entry
+    // overwrites it. The earlier spans are kept here and appended to the
+    // label's run when the terms are emitted, so a repeated label costs one
+    // extra record per repeat and nothing at all for the usual unique label.
+    let mut repeated: HashMap<String, Vec<Span>> = HashMap::new();
 
     for (entry_ordinal, (entry, &(start_pos, text_len))) in
         entries.iter().zip(positions.iter()).enumerate()
@@ -6521,13 +6533,14 @@ fn build_lookup_terms(
             }
         }
 
-        if !terms.contains_key(hw) {
-            ordered_labels.push(hw.clone());
-        }
-        terms.insert(
+        if let Some(previous) = terms.insert(
             hw.clone(),
             (start_pos, text_len, hw_display_len, entry_ordinal),
-        );
+        ) {
+            repeated.entry(hw.clone()).or_default().push(previous);
+        } else {
+            ordered_labels.push(hw.clone());
+        }
         headwords.insert(hw.clone());
 
         // The entry's other orths are index labels over the SAME span: a
@@ -6537,15 +6550,27 @@ fn build_lookup_terms(
         // and they bypass `headwords_only` because they are spellings of the
         // headword rather than separate inflected forms.
         for alias in &entry.aliases {
-            if terms.contains_key(alias) || alias.is_empty() {
+            if alias.is_empty() {
                 continue;
             }
-            ordered_labels.push(alias.clone());
-            terms.insert(
-                alias.clone(),
-                (start_pos, text_len, hw_display_len, entry_ordinal),
-            );
-            headwords.insert(alias.clone());
+            let span = (start_pos, text_len, hw_display_len, entry_ordinal);
+            match terms.entry(alias.clone()) {
+                // Another entry already carries this orth. kindlegen gives
+                // each of them its own record, which is what lets a lookup
+                // offer both definitions instead of only the last one read.
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let previous = *slot.get();
+                    if previous.3 != entry_ordinal {
+                        repeated.entry(alias.clone()).or_default().push(previous);
+                    }
+                    slot.insert(span);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    ordered_labels.push(slot.key().clone());
+                    slot.insert(span);
+                    headwords.insert(alias.clone());
+                }
+            }
         }
     }
 
@@ -7079,20 +7104,30 @@ fn build_lookup_terms(
         });
     }
 
-    let lookup_terms = sorted_labels
-        .into_iter()
-        .map(|label| {
-            let (start_pos, text_len, hw_display_len, source_ordinal) = terms[&label];
-            LookupTerm {
+    // One record per entry carrying the label, in the label's own run. The
+    // firmware returns every label with the word's key in stored order and
+    // opens the first of them, so the repeats take their source order back
+    // here: kindlegen lists the three `いぬ` records by position, and so does
+    // this, which is what makes the card open on the same entry as its own.
+    let record_count = sorted_labels.len() + repeated.values().map(Vec::len).sum::<usize>();
+    let mut lookup_terms: Vec<LookupTerm> = Vec::with_capacity(record_count);
+    for label in &sorted_labels {
+        let mut spans: Vec<Span> = repeated.get(label).cloned().unwrap_or_default();
+        spans.push(terms[label]);
+        if spans.len() > 1 {
+            spans.sort_by_key(|span| span.3);
+        }
+        for (start_pos, text_len, hw_display_len, source_ordinal) in spans {
+            lookup_terms.push(LookupTerm {
                 label: label.clone(),
-                label_bytes: label_bytes_map[&label].clone(),
+                label_bytes: label_bytes_map[label].clone(),
                 start_pos,
                 text_len,
                 headword_display_len: hw_display_len,
                 source_ordinal,
-            }
-        })
-        .collect();
+            });
+        }
+    }
     (lookup_terms, gen_ordt)
 }
 
@@ -7772,6 +7807,54 @@ mod punctuated_label_order_tests {
         for lang in ["ja", "zh", "ko", "ar"] {
             assert_eq!(sorted_in(&["MP3"], lang, false, false), ["MP3"], "{lang}");
         }
+    }
+
+    /// Three entries spelled `いぬ` are three index records, the way
+    /// kindlegen writes them, and in source order so the firmware's "first of
+    /// the run" is the entry kindlegen opens on too. Before this the label
+    /// table held one span and the last entry read overwrote the others, so a
+    /// lookup offered one of the three and the card said `1 / 2` where
+    /// kindlegen's said `1 / 3`.
+    #[test]
+    fn a_repeated_label_keeps_one_record_per_entry() {
+        let entries: Vec<DictionaryEntry> =
+            ["\u{3044}\u{306c}"; 3].iter().map(|h| entry(h)).collect();
+        let positions = vec![(100, 10), (200, 20), (300, 30)];
+        let (terms, _) = build_lookup_terms(&entries, &positions, b"", false, "ja", false, false);
+        let spans: Vec<(usize, usize, usize)> = terms
+            .iter()
+            .filter(|t| t.label == "\u{3044}\u{306c}")
+            .map(|t| (t.start_pos, t.text_len, t.source_ordinal))
+            .collect();
+        assert_eq!(spans, [(100, 10, 0), (200, 20, 1), (300, 30, 2)]);
+        // The label is still one label: a repeated one must not be numbered
+        // twice in the generated symbol table.
+        assert_eq!(
+            terms
+                .iter()
+                .filter(|t| t.label == "\u{3044}\u{306c}")
+                .count(),
+            3
+        );
+    }
+
+    /// An orth two entries name keeps both records as well: kindlegen indexes
+    /// each entry's own `<idx:orth>` annotation.
+    #[test]
+    fn an_orth_two_entries_share_keeps_both_records() {
+        let mut first = entry("\u{72ac}");
+        first.aliases = vec!["\u{3053}\u{3044}\u{306c}".to_string()];
+        let mut second = entry("\u{3042}\u{306c}");
+        second.aliases = vec!["\u{3053}\u{3044}\u{306c}".to_string()];
+        let entries = vec![first, second];
+        let positions = vec![(10, 5), (60, 7)];
+        let (terms, _) = build_lookup_terms(&entries, &positions, b"", false, "ja", false, false);
+        let spans: Vec<(usize, usize, usize)> = terms
+            .iter()
+            .filter(|t| t.label == "\u{3053}\u{3044}\u{306c}")
+            .map(|t| (t.start_pos, t.text_len, t.source_ordinal))
+            .collect();
+        assert_eq!(spans, [(10, 5, 0), (60, 7, 1)]);
     }
 
     #[test]
