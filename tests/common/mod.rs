@@ -246,6 +246,9 @@ pub struct MobiHeader {
     pub flis_index: u32,
     pub skeleton_index: u32,
     pub fragment_index: u32,
+    /// The KF8 section's NCX INDX (rec0 offset 244; the MOBI6 half keeps its
+    /// own TOC index in the same field of its own header).
+    pub ncx_index: u32,
     pub extra_data_flags: u32,
     pub compression: u16,
     pub text_length: u32,
@@ -327,6 +330,7 @@ pub fn parse_mobi_section(rec0: &[u8], record_idx: usize) -> Result<MobiSection,
     let extra_data_flags = u32_be(rec0, 240);
     let fragment_index = u32_be(rec0, 248);
     let skeleton_index = u32_be(rec0, 252);
+    let ncx_index = u32_be(rec0, 244);
 
     let header = MobiHeader {
         header_len,
@@ -346,6 +350,7 @@ pub fn parse_mobi_section(rec0: &[u8], record_idx: usize) -> Result<MobiSection,
         flis_index,
         skeleton_index,
         fragment_index,
+        ncx_index,
         extra_data_flags,
         compression,
         text_length,
@@ -1464,6 +1469,38 @@ pub fn reconstruct_parts_from_mobi(parsed: &ParsedMobi) -> Result<Vec<Vec<u8>>, 
     let frag = parse_indx(parsed, frag_abs)?;
 
     reconstruct_kf8_parts(&flow0_owned, &skel, &frag)
+}
+
+/// The KF8 fragment table in fragment-id order, the way a reader walks it:
+/// one `(file_number, start_pos, length)` per FRAG entry. A fragment id
+/// addresses this table directly, and the row it names says which spine file
+/// the fragment belongs to and where its bytes sit inside that file's
+/// payload — which is what turns a `kindle:pos:fid:FFFF:off:OOOOOOOOOO` URL
+/// into a byte in a reconstructed document.
+pub fn kf8_fragment_spans(parsed: &ParsedMobi) -> Result<Vec<(usize, usize, usize)>, String> {
+    let kf8 = parsed.kf8_or_kf7();
+    let frag_raw = kf8.header.fragment_index;
+    if frag_raw == 0xFFFFFFFF {
+        return Err("this file has no KF8 fragment index".to_string());
+    }
+    let frag = parse_indx(parsed, kf8.record_idx + frag_raw as usize)?;
+    frag.entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            Ok((
+                e.tag_value(3, 0)
+                    .ok_or_else(|| format!("FRAG entry {i}: missing tag 3 (file number)"))?
+                    as usize,
+                e.tag_value(6, 0)
+                    .ok_or_else(|| format!("FRAG entry {i}: missing tag 6 idx 0 (start)"))?
+                    as usize,
+                e.tag_value(6, 1)
+                    .ok_or_else(|| format!("FRAG entry {i}: missing tag 6 idx 1 (length)"))?
+                    as usize,
+            ))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
