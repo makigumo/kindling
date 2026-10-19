@@ -209,7 +209,10 @@ fn md5_hash(data: &[u8]) -> [u8; 16] {
     result
 }
 
-/// Fixed-layout metadata parsed from OPF.
+/// Layout metadata parsed from the OPF package.
+///
+/// This is supplied for reflowable books as well as fixed-layout ones: the
+/// page progression direction drives EXTH 525/527 on both paths.
 pub struct FixedLayoutMeta {
     pub is_fixed_layout: bool,
     pub original_resolution: Option<String>,
@@ -222,8 +225,10 @@ pub struct FixedLayoutMeta {
 /// records like language pairs (531/532), InMemory flag (547), and fontsignature (300).
 /// If `cover_offset` is Some, sets EXTH 201 (CoverOffset) and 202 (ThumbOffset)
 /// to the 0-based index of the cover image within the image records.
-/// If `fixed_layout` is provided and indicates fixed-layout content, adds EXTH
-/// records 122, 307, and 527.
+/// `fixed_layout` is provided for every book build, not only fixed-layout
+/// ones. Its page progression direction becomes EXTH 525/527 (kindlegen
+/// writes both for reflowable books too); when it indicates fixed-layout
+/// content, the fixed-layout records 122-128, 300, and 527 are added as well.
 /// If `hd_geometry` is Some, adds EXTH 536 with the HD image geometry string
 /// (format: "WxH:start-end|").
 ///
@@ -311,7 +316,10 @@ pub fn build_book_exth(
     // EXTH 503 (updated_title): emit for reflowable books, skip for
     // fixed-layout comics. EXTH 503 breaks Kindle fixed-layout navigation
     // (toolbar/go-home disappear). KCC/kindlegen also omit it for comics.
-    if fixed_layout.is_none() && !title.is_empty() {
+    // `fixed_layout` is present for every book now, because it also carries
+    // the reflowable page-progression metadata; the flag, not the Option,
+    // says which kind of book this is.
+    if fixed_layout.is_none_or(|layout| !layout.is_fixed_layout) && !title.is_empty() {
         records.push(exth_record(503, title.as_bytes()));
     }
 
@@ -343,14 +351,26 @@ pub fn build_book_exth(
         records.push(exth_record(524, language.as_bytes()));
     }
 
-    // Writing mode (525) - use horizontal-rl for RTL fixed-layout content
-    let writing_mode = if fixed_layout
-        .map(|fl| fl.page_progression_direction.as_deref() == Some("rtl"))
-        .unwrap_or(false)
-    {
-        b"horizontal-rl" as &[u8]
-    } else {
-        b"horizontal-lr" as &[u8]
+    // Page progression direction (527) and primary writing mode (525).
+    //
+    // kindlegen derives both from the OPF spine's page-progression-direction:
+    // an rtl spine is `vertical-rl`/`rtl` for a reflowable book, but
+    // `horizontal-rl`/`rtl` for a fixed-layout one. An ltr spine writes
+    // horizontal-lr/ltr; no direction writes only horizontal-lr. Writing 527
+    // is what gives a reflowable vertical book RTL tap zones - without it the
+    // reader falls back to LTR page turns even though 525 and the CSS say
+    // vertical-rl.
+    let is_fixed_layout = fixed_layout.map(|fl| fl.is_fixed_layout).unwrap_or(false);
+    let ppd = fixed_layout.and_then(|fl| fl.page_progression_direction.as_deref());
+    if !is_fixed_layout {
+        if let Some(ppd) = ppd {
+            records.push(exth_record(527, ppd.as_bytes()));
+        }
+    }
+    let writing_mode: &[u8] = match ppd {
+        Some("rtl") if is_fixed_layout => b"horizontal-rl",
+        Some("rtl") => b"vertical-rl",
+        _ => b"horizontal-lr",
     };
     records.push(exth_record(525, writing_mode));
 
@@ -423,6 +443,8 @@ pub fn build_book_exth(
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ];
             records.push(exth_record(300, &fontsig));
+            // Fixed-layout content has always written 527 even when the OPF
+            // omits the direction, so keep that behavior.
             let ppd = fl.page_progression_direction.as_deref().unwrap_or("ltr");
             records.push(exth_record(527, ppd.as_bytes()));
         }
