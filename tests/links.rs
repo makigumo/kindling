@@ -471,18 +471,47 @@ fn body_content_start(part: &str) -> usize {
     part[open..].find('>').expect("unterminated body tag") + open + 1
 }
 
+/// Resolve a `kindle:pos:fid:FFFF:off:OOOOOOOOOO` target to a byte in a
+/// reconstructed document, the way a reader does: the fragment id names a
+/// FRAG row, which says which spine file the fragment belongs to and where
+/// its bytes start inside that file's payload.
+///
+/// The id is NOT the spine file number. A payload longer than one chunk is
+/// split into several fragments, so a late chapter or a deep anchor names a
+/// later chunk of the same file.
+fn resolve_pos(
+    frags: &[(usize, usize, usize)],
+    parts: &[String],
+    fid: usize,
+    off: usize,
+) -> (usize, usize) {
+    let (file, chunk_start, chunk_len) = frags.get(fid).copied().unwrap_or_else(|| {
+        panic!(
+            "fragment {fid} is not in the FRAG index ({} rows)",
+            frags.len()
+        )
+    });
+    assert!(
+        off < chunk_len,
+        "offset {off} is outside fragment {fid} of document {file} ({chunk_len} bytes)"
+    );
+    (file, body_content_start(&parts[file]) + chunk_start + off)
+}
+
 #[test]
 fn kf8_resolves_fragment_links_to_a_real_offset() {
     let parsed = build_footnote_fixture(false, "kf8_offsets");
+    let frags = kf8_fragment_spans(&parsed).expect("KF8 fragment index");
     let parts = reconstruct_parts_from_mobi(&parsed).expect("reconstruct KF8 parts");
     let parts: Vec<String> = parts
         .into_iter()
         .map(|p| String::from_utf8(p).expect("KF8 part is UTF-8"))
         .collect();
 
-    // A reader resolves `kindle:pos:fid:F:off:O` by starting at fragment
-    // F's content and walking O bytes into it. Reconstructing the parts and
-    // measuring from the body's first byte is that same arithmetic.
+    // A reader resolves `kindle:pos:fid:F:off:O` by finding fragment F in
+    // the FRAG index, which names the document it belongs to and where its
+    // bytes start, then walking O bytes into it. `resolve_pos` is that
+    // arithmetic.
     // The two `#local` links are the discriminating pair here, as in the
     // MOBI6 test: both documents declare a `local`.
     let expected: &[(&str, &str)] = &[
@@ -505,11 +534,11 @@ fn kf8_resolves_fragment_links_to_a_real_offset() {
             let tag_start = part[..at].rfind('<').unwrap();
             let label = link_label(part, tag_start);
 
-            let target = &parts[fid];
-            let pos = body_content_start(target) + off;
+            let (file, pos) = resolve_pos(&frags, &parts, fid, off);
+            let target = &parts[file];
             assert!(
                 pos < target.len(),
-                "{label:?} resolves past the end of document {fid}"
+                "{label:?} resolves past the end of document {file}"
             );
 
             if let Some((_, marker)) = expected.iter().find(|(l, _)| *l == label) {
@@ -530,8 +559,8 @@ fn kf8_resolves_fragment_links_to_a_real_offset() {
             }
             if let Some((_, chapter)) = backlinks.iter().find(|(l, _)| *l == label) {
                 assert_eq!(
-                    fid, *chapter,
-                    "{label:?} should land in document {chapter}, not {fid}"
+                    file, *chapter,
+                    "{label:?} should land in document {chapter}, not {file}"
                 );
                 assert!(
                     target[pos..].starts_with("<a "),
@@ -541,7 +570,7 @@ fn kf8_resolves_fragment_links_to_a_real_offset() {
                 backlinks_seen += 1;
             }
             if label == "[1]" {
-                note_targets.push((fid, pos));
+                note_targets.push((file, pos));
             }
             from = at + 34;
         }
@@ -553,11 +582,11 @@ fn kf8_resolves_fragment_links_to_a_real_offset() {
     // a label and a fragment name but must reach different notes.
     assert_eq!(note_targets.len(), 2, "expected two footnote markers");
     for (i, expect) in [r#"<p id="n1""#, r#"<p id="n2""#].iter().enumerate() {
-        let (fid, pos) = note_targets[i];
+        let (file, pos) = note_targets[i];
         assert!(
-            parts[fid][pos..].starts_with(expect),
+            parts[file][pos..].starts_with(expect),
             "footnote marker {i} reached {:?}, expected {expect:?}",
-            &parts[fid][pos..pos + 60]
+            &parts[file][pos..pos + 60]
         );
     }
 }
@@ -578,6 +607,249 @@ fn kf8_leaves_no_bare_fragment_links_behind() {
     assert!(blob.contains(r#"href="https://example.org/""#));
     // A whole-document link is offset zero, not a dead link.
     assert!(blob.contains("kindle:pos:fid:0000:off:0000000000"));
+}
+
+// ---------------------------------------------------------------------------
+// Fragment chunking: a payload larger than one fragment
+// ---------------------------------------------------------------------------
+//
+// kindlegen writes one FRAG row per skeleton only while the payload is small;
+// past ~8 KB it splits the payload into chunks and writes a row per chunk,
+// each one claiming a distinct span of the same skeleton. A jump target is
+// then addressed as `(chunk, offset within that chunk)`, so the fragment id
+// is no longer the spine file number. These tests pin both halves: the rows
+// tile the payload, and an anchor in a late chunk is addressed by that chunk
+// and reaches the element the source named.
+
+const LONG_CHAPTER_PARAGRAPHS: usize = 4000;
+const LONG_CHAPTER_HEADING_EVERY: usize = 250;
+/// kindling's fragment chunk size (kindling::kf8::FRAG_CHUNK_BYTES): the
+/// observed behavior this test pins, duplicated here on purpose so a change to
+/// the constant has to change the test too.
+const FRAG_CHUNK_BYTES: usize = 8192;
+
+/// Build a one-spine-file book whose text is several fragment chunks long.
+/// Every `LONG_CHAPTER_HEADING_EVERY` paragraphs a heading gets both a nav
+/// entry and a link from the top of the document, so the same anchors are
+/// addressed by the TOC and by a `kindle:pos` link.
+fn build_long_chapter(slot: &str) -> ParsedMobi {
+    let tmp = std::env::temp_dir().join("kindling_links").join(slot);
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    let opf = tmp.join("content.opf");
+    let out = tmp.join("long.azw3");
+
+    let mut links = String::new();
+    let mut body = String::from("<p>Chapter one.</p>");
+    let mut points = String::new();
+    let mut headings = 0usize;
+    for i in 0..LONG_CHAPTER_PARAGRAPHS {
+        if i % LONG_CHAPTER_HEADING_EVERY == 0 {
+            let id = format!("h{headings}");
+            body.push_str(&format!(r#"<h1 id="{id}">Heading {headings}</h1>"#));
+            points.push_str(&format!(
+                r#"<navPoint id="n{headings}" playOrder="{}"><navLabel><text>Heading {headings}</text></navLabel><content src="book.xhtml#{id}"/></navPoint>"#,
+                headings + 1
+            ));
+            if headings > 0 {
+                links.push_str(&format!(r##"<a href="#{id}">to heading {headings}</a> "##));
+            }
+            headings += 1;
+        }
+        body.push_str(&format!(
+            "<p id=\"p{i}\">Paragraph {i} filler filler filler filler filler.</p>"
+        ));
+    }
+    fs::write(
+        tmp.join("book.xhtml"),
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Long</title></head><body><p>{links}</p>{body}</body></html>"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp.join("toc.ncx"),
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="long"/></head><docTitle><text>Long</text></docTitle><navMap>{points}</navMap></ncx>"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &opf,
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Long</dc:title><dc:language>en</dc:language><dc:identifier id="uid">long</dc:identifier></metadata>
+<manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="c" href="book.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine toc="ncx"><itemref idref="c"/></spine></package>"#,
+    )
+    .unwrap();
+
+    let run = Command::new(kindling_bin())
+        .args([
+            "build",
+            opf.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--no-validate",
+        ])
+        .output()
+        .expect("failed to spawn kindling-cli");
+    assert!(
+        run.status.success(),
+        "build failed: {:?}\n--stderr--\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let raw = fs::read(&out).unwrap_or_else(|e| panic!("read {}: {e}", out.display()));
+    parse_mobi_file(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", out.display()))
+}
+
+/// The NCX index entries of a KF8 file as `(flow offset, fid, offset in
+/// fragment)`, in entry order.
+fn kf8_ncx_targets(parsed: &ParsedMobi) -> Vec<(usize, usize, usize)> {
+    let kf8 = parsed.kf8_or_kf7();
+    let raw = kf8.header.ncx_index;
+    assert_ne!(raw, 0xFFFFFFFF, "the book has no KF8 NCX index");
+    let ncx = parse_indx(parsed, kf8.record_idx + raw as usize).expect("parse the NCX index");
+    ncx.entries
+        .iter()
+        .map(|e| {
+            (
+                e.tag_value(1, 0).expect("NCX entry tag 1 (flow offset)") as usize,
+                e.tag_value(6, 0)
+                    .expect("NCX entry tag 6 idx 0 (fragment id)") as usize,
+                e.tag_value(6, 1)
+                    .expect("NCX entry tag 6 idx 1 (offset in fragment)") as usize,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_long_chapter_is_split_into_fragments_that_tile_its_payload() {
+    let parsed = build_long_chapter("kf8_chunks");
+    let frags = kf8_fragment_spans(&parsed).expect("KF8 fragment index");
+    assert!(
+        frags.len() > 3,
+        "the fixture should need several chunks, got {}",
+        frags.len()
+    );
+
+    let mut next_start = 0usize;
+    for (id, (file, start, len)) in frags.iter().enumerate() {
+        assert_eq!(*file, 0, "fragment {id} should belong to the only document");
+        assert_eq!(
+            *start, next_start,
+            "fragment {id} starts at {start}, so it would leave a gap or overlap"
+        );
+        assert!(*len > 0, "fragment {id} claims no bytes");
+        assert!(
+            *len <= FRAG_CHUNK_BYTES,
+            "fragment {id} is not a chunk: {len} bytes"
+        );
+        if id + 1 < frags.len() {
+            assert_eq!(*len, FRAG_CHUNK_BYTES, "fragment {id} is not a full chunk");
+        }
+        next_start += len;
+    }
+
+    // The skeleton index must promise the reader exactly the chunks that
+    // follow: a wrong count makes it attach another skeleton's payload.
+    let kf8 = parsed.kf8_or_kf7();
+    let skel_raw = kf8.header.skeleton_index;
+    assert_ne!(skel_raw, 0xFFFFFFFF, "the book has no KF8 skeleton index");
+    let skel = parse_indx(&parsed, kf8.record_idx + skel_raw as usize).expect("parse SKEL");
+    assert_eq!(skel.entries.len(), 1, "one spine file, one skeleton");
+    let chunk_count = skel.entries[0]
+        .tag_value(1, 0)
+        .expect("SKEL entry tag 1 (chunk count)") as usize;
+    assert_eq!(
+        chunk_count,
+        frags.len(),
+        "SKEL claims {chunk_count} chunks, the FRAG index has {}",
+        frags.len()
+    );
+}
+
+#[test]
+fn a_jump_target_in_a_late_chunk_is_addressed_by_that_chunk() {
+    let parsed = build_long_chapter("kf8_chunk_targets");
+    let frags = kf8_fragment_spans(&parsed).expect("KF8 fragment index");
+    let parts: Vec<String> = reconstruct_parts_from_mobi(&parsed)
+        .expect("reconstruct KF8 parts")
+        .into_iter()
+        .map(|p| String::from_utf8(p).expect("KF8 part is UTF-8"))
+        .collect();
+    let part = &parts[0];
+    let base = body_content_start(part);
+
+    // The table of contents. Tag 6 must name the same byte as tag 1 does:
+    // the flow offset a reader uses for the reading position and the
+    // (chunk, offset) pair a "Go To" jump uses are two views of one place.
+    let targets = kf8_ncx_targets(&parsed);
+    assert!(targets.len() > 3, "expected several nav entries");
+    let mut late_chunks = 0usize;
+    for (flow_offset, fid, off) in &targets {
+        let (file, pos) = resolve_pos(&frags, &parts, *fid, *off);
+        assert_eq!(file, 0, "the fixture has one document");
+        if *flow_offset == 0 {
+            // The base node keeps its span at the skeleton start so the
+            // nodes tile the whole book (issue #15), and jumps to this
+            // document's first anchor.
+            assert!(
+                part[pos..].starts_with("<h1 id=\"h0\""),
+                "the base node should jump to the first heading, got {:?}",
+                &part[pos..(pos + 30).min(part.len())]
+            );
+        } else {
+            assert_eq!(
+                pos, *flow_offset,
+                "nav target (chunk {fid}, offset {off}) lands at part byte {pos}, \
+                 but the entry's flow offset says {flow_offset}"
+            );
+        }
+        assert!(
+            part[pos..].starts_with("<h1 id=\"h"),
+            "nav target {pos} is not a heading start: {:?}",
+            &part[pos..(pos + 30).min(part.len())]
+        );
+        if *fid > 0 {
+            late_chunks += 1;
+        }
+    }
+    assert!(
+        late_chunks > 0,
+        "no nav target needed a later chunk, so the fixture proves nothing"
+    );
+
+    // And the links in the text, which take the same route out of the writer.
+    let mut checked = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = part[from..].find("kindle:pos:fid:") {
+        let at = from + rel;
+        let fid = decode_base32(&part[at + 15..at + 19]);
+        let off = decode_base32(&part[at + 24..at + 34]);
+        let tag_start = part[..at].rfind('<').unwrap();
+        let label = link_label(part, tag_start);
+        if let Some(n) = label.trim().strip_prefix("to heading ") {
+            let (file, pos) = resolve_pos(&frags, &parts, fid, off);
+            assert_eq!(file, 0, "the link should stay in the document");
+            let expected = format!("<h1 id=\"h{n}\"");
+            assert!(
+                part[pos..].starts_with(&expected),
+                "{label:?} (chunk {fid}, offset {off}) reached {:?}, \
+                 expected {expected:?}",
+                &part[pos..(pos + 30).min(part.len())]
+            );
+            checked += 1;
+        }
+        from = at + 34;
+    }
+    assert!(checked > 0, "no fixture link was checked");
+    assert!(
+        part[base..].len() > FRAG_CHUNK_BYTES,
+        "the fixture is not longer than one chunk"
+    );
 }
 
 // ---------------------------------------------------------------------------
