@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Bare Cover CSS Fixture</dc:title>
+    <dc:language>en</dc:language>
+    <dc:identifier id="BookId">kindling-bare-cover-css</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="cover-img" href="cover.png" media-type="image/png" properties="cover-image"/>
+    <item id="cover" href="bare-cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover-css" href="css/cover.css" media-type="text/css"/>
+    <item id="body-css" href="css/body.css" media-type="text/css"/>
+  </manifest>
+  <spine>
+    <itemref idref="cover"/>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>
