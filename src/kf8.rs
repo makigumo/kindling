@@ -186,6 +186,12 @@ pub fn build_kf8_section(
     let mut tbs_entries: Vec<TbsEntry> = ncx_entries
         .iter()
         .enumerate()
+        // A zero-length entry (a nav target that repeats another entry's) is
+        // a table-of-contents row, not a reading position: it owns no bytes,
+        // and leaving it out keeps the TBS bytes identical to those of a book
+        // with no duplicate targets. Its NCX number is still its breadth-first
+        // position, which is what the remaining entries reference.
+        .filter(|(_, e)| e.length > 0)
         .map(|(i, e)| TbsEntry {
             index: i,
             start: e.offset,
@@ -279,10 +285,14 @@ struct NcxNode {
 struct NcxIndexEntry {
     /// Absolute byte offset of the entry start in the HTML flow.
     offset: usize,
-    /// Byte length of the entry's whole subtree: it runs to the next
-    /// entry at the same or a shallower depth (kindlegen semantics — a
-    /// volume's length covers all its chapters), the last entry running
-    /// to the end of the HTML flow.
+    /// Byte length of the entry's whole subtree: it runs to the nearest
+    /// entry beginning later at the same or a shallower depth (kindlegen
+    /// semantics — a volume's length covers all its chapters and a child
+    /// never runs past its parent's end), the last entry running to the end
+    /// of the HTML flow. An entry that repeats an earlier entry's target
+    /// keeps its row and label but takes the span only when it is the last
+    /// row at that offset and depth, so no two rows ever describe the same
+    /// bytes twice.
     length: usize,
     /// Display label.
     label: String,
@@ -327,6 +337,12 @@ pub(crate) struct Kf7NcxEntry {
 /// the skeleton so the nodes tile the whole book (issue #15); kindlegen
 /// instead starts at the first anchor and leaves any front matter
 /// uncovered.
+///
+/// A nav entry that repeats a target another entry already has keeps its
+/// entry (its label, its depth, its jump target) like every other one;
+/// `resolve_ncx_hierarchy` gives the span to the last row at that offset and
+/// depth, so the TOC lists every source entry while no pair of rows describes
+/// the same bytes twice.
 fn build_ncx_nodes(
     skeleton_entries: &[SkeletonEntry],
     fragment_entries: &[FragmentEntry],
@@ -375,6 +391,13 @@ fn build_ncx_nodes(
             .map(|f| f.insert_pos)
             .unwrap_or(frag_phys_start);
         let payload = &kf8_html[frag_phys_start..end];
+        // Ids on this document's `<html>`/`<body>` wrappers. The merge drops
+        // those elements, so a nav entry naming one means the document start
+        // rather than a missing anchor.
+        let wrapper_anchors = html_parts
+            .get(i)
+            .map(|part| crate::links::scan_document_anchors(part))
+            .unwrap_or_default();
 
         // The base node's jump target: the first entry's anchor when it
         // has one that resolves (tag 1 stays at the skeleton start so the
@@ -393,32 +416,50 @@ fn build_ncx_nodes(
             depth: base_depth,
         });
 
-        // Extra nodes for the remaining anchored entries of this file.
+        // Extra nodes for the remaining entries of this file: an anchored
+        // target gets its own node at the anchor, a bare file target (or one
+        // whose fragment names the document wrapper) gets a node at the file
+        // start. Unresolvable anchors are still skipped.
         let mut extras: Vec<NcxNode> = nav_points
             .iter()
             .skip(1)
             .filter(|p| !p.label.is_empty())
-            .filter_map(|p| {
-                let frag = p.fragment.as_deref()?;
-                let off = find_anchor_offset(payload, frag)?;
-                Some(NcxNode {
-                    offset: insert_pos + off,
+            .filter_map(|p| match p.fragment.as_deref() {
+                Some(frag) => {
+                    if let Some(off) = find_anchor_offset(payload, frag) {
+                        Some(NcxNode {
+                            offset: insert_pos + off,
+                            label: p.label.clone(),
+                            fid: i,
+                            frag_off: off,
+                            depth: Some(p.depth),
+                        })
+                    } else if wrapper_anchors.contains(frag) {
+                        Some(NcxNode {
+                            offset: skel.start_pos,
+                            label: p.label.clone(),
+                            fid: i,
+                            frag_off: 0,
+                            depth: Some(p.depth),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                None => Some(NcxNode {
+                    offset: skel.start_pos,
                     label: p.label.clone(),
                     fid: i,
-                    frag_off: off,
+                    frag_off: 0,
                     depth: Some(p.depth),
-                })
+                }),
             })
             .collect();
         extras.sort_by_key(|n| n.offset);
-        // Keep offsets strictly increasing so the nodes tile.
-        let mut last_offset = skel.start_pos;
-        for extra in extras {
-            if extra.offset > last_offset && extra.offset < end {
-                last_offset = extra.offset;
-                nodes.push(extra);
-            }
-        }
+        // Offsets stay non-decreasing so the nodes keep the source's document
+        // order. A repeated target is kept rather than dropped, because its
+        // label is still a table-of-contents entry the source asked for.
+        nodes.extend(extras.into_iter().filter(|n| n.offset < end));
     }
     nodes
 }
@@ -435,12 +476,17 @@ fn build_ncx_nodes(
 /// numbering kindlegen uses for the NCX labels and the parent/child tags
 /// (verified against kindlegen output for 2- and 3-level books).
 ///
-/// Lengths follow kindlegen's subtree semantics: an entry runs to the next
-/// document-order entry at the same or a shallower depth (so a volume
-/// spans all its chapters), the last run of entries all ending at
-/// `html_length`. For a flat book this degenerates to the previous
-/// behavior — each node runs to the next, the last to the end of the HTML
-/// flow — so flat output is unchanged.
+/// Lengths follow kindlegen's subtree semantics: an entry runs to the
+/// nearest entry beginning later at the same or a shallower depth (so a
+/// volume spans all its chapters and a chapter never runs past its volume),
+/// the last entry in a run ending at `html_length`. A nav entry that repeats
+/// a target another entry already has keeps its row, but only the *last* row
+/// at a given offset and depth carries the span; the earlier ones — and any
+/// row whose next same-or-shallower neighbour starts where it does — are
+/// zero-length. That is what kindlegen writes for both a flat and a nested
+/// table of contents, and it keeps every pair of rows byte-disjoint. For a
+/// flat book with no repeated target this is the previous behavior: each node
+/// runs to the next, the last to the end of the HTML flow.
 fn resolve_ncx_hierarchy(nodes: &[NcxNode], html_length: usize) -> Vec<NcxIndexEntry> {
     let n = nodes.len();
 
@@ -456,13 +502,39 @@ fn resolve_ncx_hierarchy(nodes: &[NcxNode], html_length: usize) -> Vec<NcxIndexE
         depths.push(d);
     }
 
+    // Subtree spans. A boundary is the nearest entry that begins after this
+    // one at the same or a shallower depth, which is what makes a volume cover
+    // its chapters and bounds the last chapter by the next volume (rather
+    // than by the end of the book); the last such entry runs to the flow end.
+    // Rows sharing an offset contribute no boundary to each other, and only
+    // the last of them at the same depth owns the span.
+    let mut length: Vec<usize> = vec![0; n];
+    for i in 0..n {
+        let end = (0..n)
+            .filter(|&j| nodes[j].offset > nodes[i].offset && depths[j] <= depths[i])
+            .map(|j| nodes[j].offset)
+            .min()
+            .unwrap_or(html_length);
+        length[i] = end.saturating_sub(nodes[i].offset);
+    }
+    for i in 0..n {
+        let repeated_later =
+            (i + 1..n).any(|j| nodes[j].offset == nodes[i].offset && depths[j] == depths[i]);
+        if repeated_later {
+            length[i] = 0;
+        }
+    }
+
     // Parent (document order): nearest preceding node one level shallower.
+    // A zero-length node owns no bytes, so it cannot be an ancestor.
     let mut parent_doc: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
         if depths[i] == 0 {
             continue;
         }
-        parent_doc[i] = (0..i).rev().find(|&j| depths[j] == depths[i] - 1);
+        parent_doc[i] = (0..i)
+            .rev()
+            .find(|&j| depths[j] == depths[i] - 1 && length[j] > 0);
     }
 
     // Breadth-first numbering: sort document positions by (depth, position).
@@ -473,14 +545,6 @@ fn resolve_ncx_hierarchy(nodes: &[NcxNode], html_length: usize) -> Vec<NcxIndexE
         bfs_of_doc[doc] = bfs;
     }
 
-    // Subtree length: to the next same-or-shallower node, last to flow end.
-    let end_of = |i: usize| -> usize {
-        (i + 1..n)
-            .find(|&j| depths[j] <= depths[i])
-            .map(|j| nodes[j].offset)
-            .unwrap_or(html_length)
-    };
-
     order
         .iter()
         .map(|&doc| {
@@ -490,7 +554,7 @@ fn resolve_ncx_hierarchy(nodes: &[NcxNode], html_length: usize) -> Vec<NcxIndexE
                 .collect();
             NcxIndexEntry {
                 offset: nodes[doc].offset,
-                length: end_of(doc).saturating_sub(nodes[doc].offset),
+                length: length[doc],
                 label: nodes[doc].label.clone(),
                 fid: nodes[doc].fid,
                 frag_off: nodes[doc].frag_off,
@@ -2899,6 +2963,62 @@ mod tests {
             })
             .collect();
         resolve_ncx_hierarchy(&nodes, html_length)
+    }
+
+    #[test]
+    fn a_repeated_target_keeps_its_ncx_entry_with_no_span() {
+        // Two chapters and a nav entry that repeats the second one's target.
+        // The duplicate keeps its label and its place in the TOC but owns no
+        // bytes: the spans still tile 0..200 exactly once. The *earlier* row is
+        // the zero-length one, which is what kindlegen writes: in its own
+        // dictionary build a repeated `Validate` / `Validate again` pair is
+        // offset 485 length 0 followed by offset 485 length 88.
+        let entries = entries_for(
+            &[
+                (0, "One", Some(0)),
+                (100, "Two", Some(0)),
+                (100, "Two again", Some(0)),
+                (200, "Three", Some(0)),
+            ],
+            300,
+        );
+        let got: Vec<(&str, usize, usize)> = entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.offset, e.length))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("One", 0, 100),
+                ("Two", 100, 0),
+                ("Two again", 100, 100),
+                ("Three", 200, 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_target_is_not_a_parent() {
+        // A childless zero-length entry at a volume's offset must not take the
+        // children that follow it; they belong to the row that owns the bytes,
+        // which for a repeated target is the last one at that offset and depth.
+        let entries = entries_for(
+            &[
+                (0, "Part", Some(0)),
+                (0, "Part again", Some(0)),
+                (100, "Chapter", Some(1)),
+            ],
+            200,
+        );
+        let chapter = entries.iter().find(|e| e.label == "Chapter").unwrap();
+        let first = entries.iter().position(|e| e.label == "Part").unwrap();
+        let owner = entries
+            .iter()
+            .position(|e| e.label == "Part again")
+            .unwrap();
+        assert_eq!(entries[first].length, 0);
+        assert!(entries[owner].length > 0);
+        assert_eq!(chapter.parent, Some(owner));
     }
 
     /// `(label, entry)` pairs shaped like TOC entries: a four-digit label and
