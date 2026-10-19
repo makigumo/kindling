@@ -4359,7 +4359,6 @@ pub(crate) fn strip_idx_markup(html: &str) -> String {
     static STYLE_ATTR: OnceLock<Regex> = OnceLock::new();
     static STYLE_ATTR_SQ: OnceLock<Regex> = OnceLock::new();
     static WS: OnceLock<Regex> = OnceLock::new();
-    static TAG_SPACE: OnceLock<Regex> = OnceLock::new();
     static DOCTYPE_RE: OnceLock<Regex> = OnceLock::new();
     static HTML_OPEN: OnceLock<Regex> = OnceLock::new();
     static HTML_CLOSE: OnceLock<Regex> = OnceLock::new();
@@ -4405,7 +4404,6 @@ pub(crate) fn strip_idx_markup(html: &str) -> String {
     // them (three in, three out, verified on the same source), and so does
     // this now.
     let ws = WS.get_or_init(|| Regex::new(r"[ \t\n\r\x0B\x0C]+").unwrap());
-    let tag_space = TAG_SPACE.get_or_init(|| Regex::new(r">\s+<").unwrap());
     let doctype_re = DOCTYPE_RE.get_or_init(|| Regex::new(r"(?i)<!DOCTYPE[^>]*>\s*").unwrap());
     let html_open = HTML_OPEN.get_or_init(|| Regex::new(r"(?i)<html\b[^>]*>\s*").unwrap());
     let html_close = HTML_CLOSE.get_or_init(|| Regex::new(r"(?i)\s*</html\s*>").unwrap());
@@ -4548,8 +4546,8 @@ pub(crate) fn strip_idx_markup(html: &str) -> String {
     // Collapse whitespace
     result = std::borrow::Cow::Owned(ws.replace_all(&result, " ").to_string());
 
-    // Clean up spaces around HTML tags
-    result = std::borrow::Cow::Owned(tag_space.replace_all(&result, "><").to_string());
+    // Clean up spaces around HTML tags, keeping the ones the reader shows
+    result = std::borrow::Cow::Owned(keep_inline_spaces_between_tags(&result));
 
     // Restore important spaces (cheap literal replaces)
     let mut result = result.into_owned();
@@ -4579,6 +4577,91 @@ pub(crate) fn strip_idx_markup(html: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+/// Elements that sit in the text flow. A space between two of them is the
+/// space between two words, and the reader renders it.
+fn is_inline_element(name: &str) -> bool {
+    const INLINE: [&str; 28] = [
+        "a", "b", "big", "br", "cite", "code", "em", "font", "i", "img", "kbd", "q", "rb", "rp",
+        "rt", "ruby", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "tt", "u",
+        "var", "wbr",
+    ];
+    INLINE.iter().any(|known| name.eq_ignore_ascii_case(known))
+}
+
+/// The element name of the tag that opens at `open`, or `None` if the bytes
+/// there do not spell one.
+fn element_name_at(text: &str, open: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'<') {
+        return None;
+    }
+    let mut at = open + 1;
+    if bytes.get(at) == Some(&b'/') {
+        at += 1;
+    }
+    let start = at;
+    while let Some(&byte) = bytes.get(at) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_') {
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    if at == start {
+        None
+    } else {
+        Some(&text[start..at])
+    }
+}
+
+/// Remove the whitespace between two tags, except where it separates two
+/// inline elements — the one case a reader renders as a space between words —
+/// and except around an image.
+///
+/// kindlegen keeps a single space between elements and the popup shows it:
+/// `【×戌】<span><font size="-3">2</font></span> <span><i>n.</i></span>` reads
+/// `2 n.`, a card measured on device, while welding the two tags reads `2n.`
+/// — as kindling's did until this pass kept the gap. Between block elements
+/// the space never reaches the screen, and dropping it is what keeps the
+/// entry text (and so the file) small.
+///
+/// Only ASCII whitespace counts as the gap: a non-breaking space is a
+/// character the author wrote on purpose and is left alone.
+fn keep_inline_spaces_between_tags(text: &str) -> String {
+    use std::sync::OnceLock;
+    static PAIR: OnceLock<Regex> = OnceLock::new();
+    let pair = PAIR.get_or_init(|| Regex::new(r">[ \t\n\r\x0B\x0C]+<").unwrap());
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for m in pair.find_iter(text) {
+        out.push_str(&text[last..m.start()]);
+        out.push('>');
+        let opens_before = text[..m.start()].rfind('<');
+        let left = opens_before.and_then(|at| element_name_at(text, at));
+        let right = element_name_at(text, m.end() - 1);
+        if let (Some(left), Some(right)) = (left, right) {
+            // An image is laid out as a block of its own, so a space beside it
+            // is not a word space — but the MOBI7 engine still gives that space
+            // a line of its own, and kindlegen keeps it. Measured on the cover
+            // of the Wadoku build: kindlegen writes `<p> <img/> </p>` for the
+            // logo and its first line of body text sits 12 px lower than
+            // kindling's, which wrote `<p><img/></p>`; the space is the whole
+            // difference, so it is kept wherever an image is one of the two
+            // neighbours.
+            if (is_inline_element(left) && is_inline_element(right))
+                || left.eq_ignore_ascii_case("img")
+                || right.eq_ignore_ascii_case("img")
+            {
+                out.push(' ');
+            }
+        }
+        out.push('<');
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 /// Put a space back between `tag` and the opening tag that follows it.
@@ -5422,6 +5505,50 @@ mod record_split_tests {
         assert!(
             out.contains("<b>a</b>") && out.contains("<b>b</b>"),
             "{out}"
+        );
+    }
+
+    /// An image is laid out as a block of its own, so the whitespace beside it
+    /// is not a word space — but the MOBI7 engine gives that whitespace a line
+    /// of its own, and kindlegen keeps it. Measured on the Wadoku cover:
+    /// kindlegen writes `<p> <img/> </p>` for the logo, kindling welded it to
+    /// `<p><img/></p>`, and every line below the logo sat 12 px higher.
+    #[test]
+    fn a_space_beside_an_image_ships() {
+        let out = strip_idx_markup(
+            "<body><p>\n   <img src=\"logo.png\" alt=\"logo\"/>\n</p><p>text</p></body>",
+        );
+        assert!(
+            out.contains("<p> <img src=\"logo.png\" alt=\"logo\"/> </p>"),
+            "the space either side of the image is kept: {out}"
+        );
+    }
+
+    /// The gap between two inline elements is a word space, and kindlegen
+    /// ships it: on device the card reads `2 n.`, and a build that welds the
+    /// tags reads `2n.`. Between two block elements the same gap never reaches
+    /// the screen, so it stays dropped and the entry text stays small.
+    #[test]
+    fn a_space_between_inline_elements_ships() {
+        let html = concat!(
+            "<idx:entry><idx:orth><b>\u{72ac}</b></idx:orth>",
+            "<span><font size=\"-3\">2</font></span>\n  <span><i>n.</i></span>",
+            "<ruby><rb>\u{620c}\u{5e74}</rb> <rt>\u{3069}\u{3057}</rt></ruby>",
+            "</blockquote>\n<div>next block</div>",
+            "</idx:entry>"
+        );
+        let out = strip_idx_markup(html);
+        assert!(
+            out.contains("</span> <span><i>n.</i></span>"),
+            "the gap between the two spans is a word space: {out}"
+        );
+        assert!(
+            out.contains("</rb> <rt>"),
+            "the ruby base and its reading stay apart: {out}"
+        );
+        assert!(
+            out.contains("</blockquote><div>"),
+            "a gap between blocks is dropped: {out}"
         );
     }
 
