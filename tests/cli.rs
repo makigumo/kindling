@@ -530,6 +530,102 @@ mod validate {
     }
 
     #[test]
+    fn a_nav_entry_list_is_the_toc_not_one_row_per_spine_file() {
+        // A chapter split across several spine files is still one chapter.
+        // Labelling every skeleton from its own <title> put the book title in
+        // the Contents panel dozens of times and pushed the real chapter names
+        // out of sight. The nav document names the chapters, so only its rows
+        // belong in the NCX; the file in between is a continuation page.
+        let dir = TempDir::new("nav_only_toc");
+        std::fs::write(
+            dir.path().join("book.opf"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book Title</dc:title><dc:language>de</dc:language><dc:identifier id="uid">nav-only-toc</dc:identifier></metadata>
+<manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine toc="ncx"><itemref idref="c0"/><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("toc.ncx"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="nav-only-toc"/></head><docTitle><text>Book Title</text></docTitle><navMap>
+<navPoint id="n1" playOrder="1"><navLabel><text>Kapitel 1</text></navLabel><content src="ch0.xhtml"/></navPoint>
+<navPoint id="n2" playOrder="2"><navLabel><text>Kapitel 3</text></navLabel><content src="ch2.xhtml"/></navPoint>
+</navMap></ncx>"#,
+        )
+        .unwrap();
+        for (i, title) in ["Kapitel 1", "Kapitel 2", "Kapitel 3"].iter().enumerate() {
+            std::fs::write(
+                dir.path().join(format!("ch{i}.xhtml")),
+                format!(
+                    r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body><h1>{title}</h1><p>Text.</p></body></html>"#
+                ),
+            )
+            .unwrap();
+        }
+        let out = dir.path().join("book.azw3");
+        let built = Command::new(kindling_bin())
+            .args([
+                "build",
+                dir.path().join("book.opf").to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--no-validate",
+            ])
+            .output()
+            .expect("spawn kindling-cli");
+        assert!(built.status.success(), "build failed\n{}", dump(&built));
+
+        let b = std::fs::read(&out).unwrap();
+        let be32 = |o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes([b[76], b[77]]) as usize;
+        let offsets: Vec<usize> = (0..count)
+            .map(|i| be32(78 + 8 * i))
+            .chain([b.len()])
+            .collect();
+        let rec = |i: usize| &b[offsets[i]..offsets[i + 1]];
+        let ncx = u32::from_be_bytes(rec(0)[0xF4..0xF8].try_into().unwrap()) as usize;
+        assert_ne!(ncx, 0xFFFF_FFFF, "no KF8 NCX index");
+        let primary = rec(ncx);
+        let data_records = u32::from_be_bytes(primary[24..28].try_into().unwrap()) as usize;
+        let cncx_records = u32::from_be_bytes(primary[52..56].try_into().unwrap()) as usize;
+        let data: Vec<&[u8]> = (0..data_records).map(|k| rec(ncx + 1 + k)).collect();
+        let cncx: Vec<&[u8]> = (0..cncx_records)
+            .map(|k| rec(ncx + 1 + data_records + k))
+            .collect();
+        let entries = indx_entries(primary, &data);
+        assert_eq!(
+            entries.len(),
+            2,
+            "only the two nav entries are chapters, got {} rows",
+            entries.len()
+        );
+
+        let mut labels = Vec::new();
+        for (_row, values) in &entries {
+            let offset = values
+                .iter()
+                .find(|(tag, _)| *tag == 3)
+                .map(|(_, v)| v[0])
+                .expect("NCX row tag 3 (CNCX label)") as usize;
+            let s = cncx[offset >> 16];
+            let mut at = offset & 0xFFFF;
+            let mut len = 0usize;
+            loop {
+                let byte = s[at];
+                at += 1;
+                len = (len << 7) | usize::from(byte & 0x7F);
+                if byte & 0x80 != 0 {
+                    break;
+                }
+            }
+            labels.push(String::from_utf8(s[at..at + len].to_vec()).unwrap());
+        }
+        assert_eq!(labels, vec!["Kapitel 1", "Kapitel 3"]);
+    }
+
+    #[test]
     fn a_book_with_thousands_of_chapters_gets_sound_skeleton_and_fragment_indexes() {
         // One skeleton entry and at least one fragment entry per chapter: in
         // one record, the skeleton index wrapped past about 2,300 chapters and
