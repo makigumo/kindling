@@ -734,6 +734,13 @@ fn a_long_chapter_is_split_into_fragments_that_tile_its_payload() {
         "the fixture should need several chunks, got {}",
         frags.len()
     );
+    let parts: Vec<String> = reconstruct_parts_from_mobi(&parsed)
+        .expect("reconstruct KF8 parts")
+        .into_iter()
+        .map(|p| String::from_utf8(p).expect("KF8 part is UTF-8"))
+        .collect();
+    let part = &parts[0];
+    let base = body_content_start(part);
 
     let mut next_start = 0usize;
     for (id, (file, start, len)) in frags.iter().enumerate() {
@@ -744,14 +751,31 @@ fn a_long_chapter_is_split_into_fragments_that_tile_its_payload() {
         );
         assert!(*len > 0, "fragment {id} claims no bytes");
         assert!(
-            *len <= FRAG_CHUNK_BYTES,
-            "fragment {id} is not a chunk: {len} bytes"
+            part.is_char_boundary(base + next_start),
+            "fragment {id} begins inside a character at {next_start}"
         );
         if id + 1 < frags.len() {
-            assert_eq!(*len, FRAG_CHUNK_BYTES, "fragment {id} is not a full chunk");
+            // A chunk is cut just past a tag close, never at a fixed width:
+            // the reader parses one fragment at a time, so a fragment that
+            // opens on the tail of a tag (`p aid="2S">`) is read as text.
+            assert!(
+                *len >= FRAG_CHUNK_BYTES,
+                "fragment {id} is {len} bytes, under one chunk"
+            );
+            assert_eq!(
+                part.as_bytes()[base + next_start - 1],
+                b'>',
+                "fragment {id} begins at {next_start}, which is not a tag close: {:?}",
+                &part[base + next_start - 12..base + next_start + 12]
+            );
         }
         next_start += len;
     }
+    assert_eq!(
+        Some(base + next_start),
+        part.find("</body>"),
+        "the chunks should cover the document's body content exactly"
+    );
 
     // The skeleton index must promise the reader exactly the chunks that
     // follow: a wrong count makes it attach another skeleton's payload.
