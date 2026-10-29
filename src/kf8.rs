@@ -414,6 +414,14 @@ fn build_ncx_nodes(
         // addressed as (chunk, offset within that chunk), so an anchor deep
         // in a long chapter lands in a later chunk than the document start.
         let first_fid = first_chunk.map(|f| f.sequence_number).unwrap_or(0);
+        // The document's cut points, in payload order. Chunks are not a fixed
+        // width, so the chunk that holds an anchor is found by search over
+        // these rather than by dividing the offset.
+        let chunk_starts: Vec<usize> = fragment_entries
+            .iter()
+            .filter(|f| f.file_number == i)
+            .map(|f| f.start_pos)
+            .collect();
         let payload = &kf8_html[frag_phys_start..end];
         // Ids on this document's `<html>`/`<body>` wrappers. The merge drops
         // those elements, so a nav entry naming one means the document start
@@ -432,7 +440,7 @@ fn build_ncx_nodes(
             .and_then(|frag| find_anchor_offset(payload, frag))
             .unwrap_or(0);
 
-        let base_target = fragment_target(first_fid, base_frag_off);
+        let base_target = fragment_target(&chunk_starts, first_fid, base_frag_off);
         nodes.push(NcxNode {
             offset: skel.start_pos,
             label,
@@ -452,7 +460,7 @@ fn build_ncx_nodes(
             .filter_map(|p| match p.fragment.as_deref() {
                 Some(frag) => {
                     if let Some(off) = find_anchor_offset(payload, frag) {
-                        let target = fragment_target(first_fid, off);
+                        let target = fragment_target(&chunk_starts, first_fid, off);
                         Some(NcxNode {
                             offset: insert_pos + off,
                             label: p.label.clone(),
@@ -461,7 +469,7 @@ fn build_ncx_nodes(
                             depth: Some(p.depth),
                         })
                     } else if wrapper_anchors.contains(frag) {
-                        let target = fragment_target(first_fid, 0);
+                        let target = fragment_target(&chunk_starts, first_fid, 0);
                         Some(NcxNode {
                             offset: skel.start_pos,
                             label: p.label.clone(),
@@ -474,7 +482,7 @@ fn build_ncx_nodes(
                     }
                 }
                 None => {
-                    let target = fragment_target(first_fid, 0);
+                    let target = fragment_target(&chunk_starts, first_fid, 0);
                     Some(NcxNode {
                         offset: skel.start_pos,
                         label: p.label.clone(),
@@ -638,30 +646,111 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Bytes of one fragment chunk.
+/// Smallest fragment chunk kindling writes.
 ///
 /// kindlegen writes one FRAG row per skeleton only for a small chapter: on a
-/// large one it splits the skeleton's payload into ~8 KB fragments (measured
-/// on a 1.29 MB single-chapter book: 160 rows of 7,992–8,510 bytes, spans
-/// tiling the payload exactly). A reader then touches a page's worth of text
-/// instead of one multi-megabyte record. This is the chunk size kindling
-/// uses; a payload at or under it still gets exactly one row, as before.
+/// large one it splits the skeleton's payload into fragments just past 8 KB
+/// (measured on this book: 82 interior cuts, every one of them at a tag close,
+/// spans tiling the payload exactly). A reader then touches a page's worth of
+/// text instead of one multi-megabyte record. A payload at or under this size
+/// still gets exactly one row, as before; a longer one is cut at the first tag
+/// close at or past it (see [`fragment_chunk_bounds`]), so on this book every
+/// chunk but each skeleton's last is 8,192–8,579 bytes long.
 const FRAG_CHUNK_BYTES: usize = 8192;
+
+/// Cut points for one skeleton's payload, as byte offsets from its first byte.
+///
+/// Returns `chunk_count + 1` offsets: the first is 0, the last is the payload
+/// length, and every interior cut is at least [`FRAG_CHUNK_BYTES`] past the
+/// previous one and sits immediately after a tag's `>`.
+///
+/// Where a fragment begins matters because the reader lays a page out from a
+/// run of fragments, and a fragment is only usable from a place its text can
+/// start: one that opens on a UTF-8 continuation byte cannot be decoded from
+/// its first byte, and one that opens with the tail of a tag (`p aid="2S">`)
+/// is not markup. kindlegen never writes either: every one of the 82 interior
+/// cuts in its build of this book lands right after a `>` (next byte `\n` or
+/// `<`). kindling's earlier fixed-width 8,192-byte cuts put 30 of this book's
+/// 54 interior cuts inside a character and 8 more inside a tag, and on a
+/// Paperwhite 3 the reader then drops the run that starts at the bad fragment:
+/// the page ends at the previous fragment boundary and resumes 16,384 bytes
+/// later (see `analysis/index-audit/DEVICE-CHUNKS.md`).
+///
+/// A `>` inside a quoted attribute value (`<a title="x>y">`) does not close the
+/// tag, so the scan tracks quotes while inside one. A payload with no tag past
+/// the threshold grows that chunk instead of being cut unsafely — the
+/// one-row-per-skeleton shape kindling wrote before it chunked at all.
+fn fragment_chunk_bounds(payload: &[u8]) -> Vec<usize> {
+    let len = payload.len();
+    if len == 0 {
+        // An empty payload still gets exactly one (zero-length) row.
+        return vec![0, 0];
+    }
+    let mut bounds = vec![0usize];
+    let mut start = 0usize;
+    let mut in_tag = false;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in payload.iter().enumerate() {
+        if !in_tag {
+            in_tag = b == b'<';
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => {
+                    in_tag = false;
+                    // The byte after a tag close starts a text run or the next
+                    // tag: a character boundary, outside any tag, so a
+                    // fragment may begin there.
+                    let next = i + 1;
+                    if next - start >= FRAG_CHUNK_BYTES {
+                        bounds.push(next);
+                        start = next;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    if *bounds.last().unwrap() != len {
+        bounds.push(len);
+    }
+    bounds
+}
 
 /// Map a byte offset inside a skeleton's payload to the fragment that owns
 /// it: `(fragment id, offset within that fragment)`.
 ///
 /// A fragment id is the FRAG entry's sequence number (tag 4), numbered across
 /// the whole book, and a skeleton's chunks are consecutive, so the id is the
-/// skeleton's first chunk plus the chunk ordinal. These are the two values a
-/// `kindle:pos:fid:FFFF:off:OOOOOOOOOO` URL carries, and the two values the
-/// NCX's tag 6 carries; both address the same coordinate space, which is why
-/// the same function resolves both.
-fn fragment_target(first_fid: usize, payload_offset: usize) -> (usize, usize) {
-    (
-        first_fid + payload_offset / FRAG_CHUNK_BYTES,
-        payload_offset % FRAG_CHUNK_BYTES,
-    )
+/// skeleton's first chunk plus the index of the chunk that holds the offset.
+/// These are the two values a `kindle:pos:fid:FFFF:off:OOOOOOOOOO` URL
+/// carries, and the two values the NCX's tag 6 carries; both address the same
+/// coordinate space, which is why the same function resolves both.
+///
+/// `chunk_starts` is the skeleton's own cut list without the trailing payload
+/// length (see [`fragment_chunk_bounds`]); chunks are not a fixed width, so
+/// the chunk is found by search rather than by division.
+fn fragment_target(
+    chunk_starts: &[usize],
+    first_fid: usize,
+    payload_offset: usize,
+) -> (usize, usize) {
+    let Some((&first, _)) = chunk_starts.split_first() else {
+        return (first_fid, payload_offset);
+    };
+    debug_assert_eq!(first, 0, "a skeleton's first chunk starts at offset zero");
+    let chunk = match chunk_starts.binary_search(&payload_offset) {
+        Ok(index) => index,
+        Err(index) => index.saturating_sub(1),
+    };
+    (first_fid + chunk, payload_offset - chunk_starts[chunk])
 }
 
 /// Build KF8 HTML with aid attributes, kindle:embed image URLs, and the
@@ -707,6 +796,10 @@ fn build_kf8_html(
     // Fragment id of each spine document's first chunk, so a link or nav
     // target that lands in a later chunk can work out that chunk's id.
     let mut first_fid_per_file: Vec<usize> = Vec::new();
+    // Each document's chunk cut points (payload offsets), for the same reason:
+    // a chunk is not a fixed width, so an offset is resolved against the cut
+    // list the fragment rows were built from.
+    let mut chunk_starts_per_file: Vec<Vec<usize>> = Vec::new();
     // Anchor tables and link sites, filled in as each part is emitted and
     // resolved once every fragment's contents are final. `fragment_anchors`
     // holds offsets relative to a fragment's own text, which is exactly
@@ -790,7 +883,6 @@ fn build_kf8_html(
         //    nothing here moves relative to the skeleton.
         let frag_start = combined.len();
         combined.extend_from_slice(body_inner);
-        let frag_len = body_inner.len();
 
         // 5b. Record what this part contributes to link resolution: the
         //     anchors a link can land on, at offsets relative to the
@@ -826,10 +918,11 @@ fn build_kf8_html(
         //     bytes. A payload shorter than the chunk size (including an
         //     empty body) still gets exactly one row.
         first_fid_per_file.push(global_seq);
-        let chunk_count = frag_len.div_ceil(FRAG_CHUNK_BYTES).max(1);
-        for chunk_idx in 0..chunk_count {
-            let chunk_start = chunk_idx * FRAG_CHUNK_BYTES;
-            let chunk_end = (chunk_start + FRAG_CHUNK_BYTES).min(frag_len);
+        let bounds = fragment_chunk_bounds(body_inner);
+        let chunk_count = bounds.len() - 1;
+        chunk_starts_per_file.push(bounds[..chunk_count].to_vec());
+        for chunk in bounds.windows(2) {
+            let (chunk_start, chunk_end) = (chunk[0], chunk[1]);
             fragment_entries.push(FragmentEntry {
                 insert_pos: insert_pos + chunk_start,
                 selector: format!("P-//*[@aid='{}']", split.body_aid),
@@ -873,7 +966,11 @@ fn build_kf8_html(
         match offset {
             Some(offset) => {
                 let first_fid = first_fid_per_file.get(file).copied().unwrap_or(0);
-                let (fid, local_off) = fragment_target(first_fid, offset);
+                let chunk_starts = chunk_starts_per_file
+                    .get(file)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let (fid, local_off) = fragment_target(chunk_starts, first_fid, offset);
                 let encoded_fid = links::encode_base32(fid, KINDLE_POS_FID_LEN);
                 let fid_at = at + KINDLE_POS_SCHEME.len();
                 combined[fid_at..fid_at + encoded_fid.len()]
@@ -3569,5 +3666,64 @@ mod tests {
             !html.contains("image/jpeg"),
             "KF8 HTML must NOT contain 'image/jpeg' - Kindle firmware rejects it"
         );
+    }
+
+    #[test]
+    fn chunk_bounds_of_an_empty_payload_are_one_empty_row() {
+        assert_eq!(fragment_chunk_bounds(b""), vec![0, 0]);
+    }
+
+    #[test]
+    fn chunk_bounds_never_cut_inside_a_character() {
+        let mut payload = String::new();
+        for i in 0..600 {
+            payload.push_str(&format!(
+                "<p id=\"p{i}\">段落{i}、これは三バイトの文字で書かれた本文である。</p>"
+            ));
+        }
+        let bytes = payload.as_bytes();
+        let bounds = fragment_chunk_bounds(bytes);
+        assert!(bounds.len() > 3, "the payload should need several chunks");
+        assert_eq!(bounds.first().copied(), Some(0));
+        assert_eq!(bounds.last().copied(), Some(bytes.len()));
+        for w in bounds.windows(2) {
+            let (start, end) = (w[0], w[1]);
+            assert!(end > start, "an empty chunk at {start}");
+            assert!(
+                payload.is_char_boundary(end),
+                "cut at {end} splits a character"
+            );
+            if end != bytes.len() {
+                assert!(
+                    end - start >= FRAG_CHUNK_BYTES,
+                    "chunk [{start}..{end}) is under the chunk size"
+                );
+                assert_eq!(bytes[end - 1], b'>', "cut at {end} is not at a tag close");
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_bounds_skip_a_gt_inside_a_quoted_attribute() {
+        // The first `>` at or past the threshold sits inside an attribute
+        // value, so a naive scan cuts the fragment inside the tag.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"<p>");
+        payload.resize(8190, b'x');
+        payload.extend_from_slice(b"<a title=\"a>b\">link</a>");
+        let after_tag = 8190 + b"<a title=\"a>b\">".len();
+        assert_eq!(payload[after_tag - 1], b'>');
+        assert_eq!(
+            fragment_chunk_bounds(&payload),
+            vec![0, after_tag, payload.len()]
+        );
+    }
+
+    #[test]
+    fn chunk_bounds_leave_an_untagged_payload_as_one_row() {
+        // Nothing to cut at, so the reader gets one row — the shape kindling
+        // wrote before it chunked, never a fragment that starts mid-character.
+        let payload = vec![b'a'; 3 * FRAG_CHUNK_BYTES];
+        assert_eq!(fragment_chunk_bounds(&payload), vec![0, payload.len()]);
     }
 }
