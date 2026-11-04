@@ -646,55 +646,157 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Smallest fragment chunk kindling writes.
+/// Target size of one fragment chunk, in bytes.
 ///
-/// kindlegen writes one FRAG row per skeleton only for a small chapter: on a
-/// large one it splits the skeleton's payload into fragments just past 8 KB
-/// (measured on this book: 82 interior cuts, every one of them at a tag close,
-/// spans tiling the payload exactly). A reader then touches a page's worth of
-/// text instead of one multi-megabyte record. A payload at or under this size
-/// still gets exactly one row, as before; a longer one is cut at the first tag
-/// close at or past it (see [`fragment_chunk_bounds`]), so on this book every
-/// chunk but each skeleton's last is 8,192–8,579 bytes long.
+/// kindlegen's `FullFragmentor` takes this from its `fragsize` setting and
+/// falls back to 8192 when the setting is zero: `sub_1001559B0` stores
+/// `if (size) size else 0x2000` in the object's field at `+104`, and its
+/// constructor does the same. On its build of this book every chunk but a
+/// skeleton's last is at least this long; the overshoot is one whole element,
+/// because a cut may only land on an element boundary.
 const FRAG_CHUNK_BYTES: usize = 8192;
 
-/// Cut points for one skeleton's payload, as byte offsets from its first byte.
+/// Whether `name` is an element whose children are separate layout blocks.
 ///
-/// Returns `chunk_count + 1` offsets: the first is 0, the last is the payload
-/// length, and every interior cut is at least [`FRAG_CHUNK_BYTES`] past the
-/// previous one and sits immediately after a tag's `>`.
+/// Only a block container provides a safe point to start a fragment: its
+/// child is a complete element, so cutting before the child leaves no inline
+/// run (a text emphasis, a link, or a ruby annotation) straddling the cut.
+fn chunk_is_block_container(name: &[u8]) -> bool {
+    const CONTAINERS: &[&[u8]] = &[
+        b"address",
+        b"article",
+        b"aside",
+        b"blockquote",
+        b"body",
+        b"caption",
+        b"center",
+        b"colgroup",
+        b"dd",
+        b"details",
+        b"dir",
+        b"div",
+        b"dl",
+        b"dt",
+        b"fieldset",
+        b"figcaption",
+        b"figure",
+        b"footer",
+        b"form",
+        b"h1",
+        b"h2",
+        b"h3",
+        b"h4",
+        b"h5",
+        b"h6",
+        b"header",
+        b"legend",
+        b"li",
+        b"main",
+        b"menu",
+        b"nav",
+        b"noscript",
+        b"ol",
+        b"p",
+        b"pre",
+        b"section",
+        b"summary",
+        b"tbody",
+        b"td",
+        b"tfoot",
+        b"th",
+        b"thead",
+        b"tr",
+        b"ul",
+    ];
+    CONTAINERS
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Elements that are complete with only an opening tag.
+fn chunk_is_void(name: &[u8]) -> bool {
+    const VOID: &[&[u8]] = &[
+        b"area", b"base", b"br", b"col", b"embed", b"hr", b"img", b"input", b"link", b"meta",
+        b"param", b"source", b"track", b"wbr",
+    ];
+    VOID.iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Ruby and its annotation children. A ruby run is atomic for fragmentation:
+/// kindlegen never starts a fragment inside one, nor immediately before one.
+fn chunk_is_ruby(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"ruby")
+        || name.eq_ignore_ascii_case(b"rt")
+        || name.eq_ignore_ascii_case(b"rp")
+}
+
+fn chunk_is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.')
+}
+
+/// One opening or closing tag, scanned quote-aware.
+struct ChunkTag<'a> {
+    name: &'a [u8],
+    closing: bool,
+    self_closing: bool,
+    end: usize,
+}
+
+/// Scan the tag at `at`, or return `None` when the `<` is literal text.
 ///
-/// Where a fragment begins matters because the reader lays a page out from a
-/// run of fragments, and a fragment is only usable from a place its text can
-/// start: one that opens on a UTF-8 continuation byte cannot be decoded from
-/// its first byte, and one that opens with the tail of a tag (`p aid="2S">`)
-/// is not markup. kindlegen never writes either: every one of the 82 interior
-/// cuts in its build of this book lands right after a `>` (next byte `\n` or
-/// `<`). kindling's earlier fixed-width 8,192-byte cuts put 30 of this book's
-/// 54 interior cuts inside a character and 8 more inside a tag, and on a
-/// Paperwhite 3 the reader then drops the run that starts at the bad fragment:
-/// the page ends at the previous fragment boundary and resumes 16,384 bytes
-/// later (see `analysis/index-audit/DEVICE-CHUNKS.md`).
-///
-/// A `>` inside a quoted attribute value (`<a title="x>y">`) does not close the
-/// tag, so the scan tracks quotes while inside one. A payload with no tag past
-/// the threshold grows that chunk instead of being cut unsafely — the
-/// one-row-per-skeleton shape kindling wrote before it chunked at all.
-fn fragment_chunk_bounds(payload: &[u8]) -> Vec<usize> {
+/// Comments, CDATA, declarations, and processing instructions come back with
+/// an empty name so the caller can skip them without reading their contents
+/// as elements.
+fn chunk_scan_tag<'a>(payload: &'a [u8], at: usize) -> Option<ChunkTag<'a>> {
     let len = payload.len();
-    if len == 0 {
-        // An empty payload still gets exactly one (zero-length) row.
-        return vec![0, 0];
+    let mut i = at + 1;
+    if i >= len {
+        return None;
     }
-    let mut bounds = vec![0usize];
-    let mut start = 0usize;
-    let mut in_tag = false;
+    if payload[i] == b'!' {
+        let end = if payload[i..].starts_with(b"!--") {
+            chunk_find_after(payload, i + 3, b"-->").map_or(len, |found| found + 3)
+        } else if payload[i..].starts_with(b"![CDATA[") {
+            chunk_find_after(payload, i + 8, b"]]>").map_or(len, |found| found + 3)
+        } else {
+            memchr::memchr(b'>', &payload[i..]).map_or(len, |offset| i + offset + 1)
+        };
+        return Some(ChunkTag {
+            name: b"",
+            closing: true,
+            self_closing: true,
+            end,
+        });
+    }
+    if payload[i] == b'?' {
+        let end = chunk_find_after(payload, i + 1, b"?>")
+            .map(|found| found + 2)
+            .or_else(|| memchr::memchr(b'>', &payload[i..]).map(|offset| i + offset + 1))
+            .unwrap_or(len);
+        return Some(ChunkTag {
+            name: b"",
+            closing: true,
+            self_closing: true,
+            end,
+        });
+    }
+    let closing = payload[i] == b'/';
+    if closing {
+        i += 1;
+    }
+    if i >= len || !payload[i].is_ascii_alphabetic() {
+        return None;
+    }
+    let name_start = i;
+    while i < len && chunk_is_name_byte(payload[i]) {
+        i += 1;
+    }
+    let name_end = i;
+    let name = &payload[name_start..name_end];
     let mut quote: Option<u8> = None;
-    for (i, &b) in payload.iter().enumerate() {
-        if !in_tag {
-            in_tag = b == b'<';
-            continue;
-        }
+    while i < len {
+        let b = payload[i];
         match quote {
             Some(q) => {
                 if b == q {
@@ -703,25 +805,295 @@ fn fragment_chunk_bounds(payload: &[u8]) -> Vec<usize> {
             }
             None => match b {
                 b'"' | b'\'' => quote = Some(b),
-                b'>' => {
-                    in_tag = false;
-                    // The byte after a tag close starts a text run or the next
-                    // tag: a character boundary, outside any tag, so a
-                    // fragment may begin there.
-                    let next = i + 1;
-                    if next - start >= FRAG_CHUNK_BYTES {
-                        bounds.push(next);
-                        start = next;
-                    }
-                }
+                b'>' => break,
                 _ => {}
             },
         }
+        i += 1;
     }
-    if *bounds.last().unwrap() != len {
+    let end = if i < len { i + 1 } else { len };
+    let mut before_close = i.min(len);
+    while before_close > name_end && payload[before_close - 1].is_ascii_whitespace() {
+        before_close -= 1;
+    }
+    let self_closing =
+        (before_close > name_end && payload[before_close - 1] == b'/') || chunk_is_void(name);
+    Some(ChunkTag {
+        name,
+        closing,
+        self_closing,
+        end,
+    })
+}
+
+/// First occurrence of `needle` at or after `from`.
+fn chunk_find_after(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if from > haystack.len() || needle.is_empty() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| offset + from)
+}
+
+/// End of a raw-text element such as `<script>` or `<style>`, including its
+/// closing tag. Its body is not XHTML: a `<` in it must not be read as a tag.
+fn chunk_find_raw_end(payload: &[u8], from: usize, name: &[u8]) -> Option<usize> {
+    let mut pos = from;
+    while pos < payload.len() {
+        let lt = pos + memchr::memchr(b'<', &payload[pos..])?;
+        let mut cursor = lt + 1;
+        if payload.get(cursor) == Some(&b'/') {
+            cursor += 1;
+            let name_start = cursor;
+            while cursor < payload.len() && chunk_is_name_byte(payload[cursor]) {
+                cursor += 1;
+            }
+            if payload[name_start..cursor].eq_ignore_ascii_case(name) {
+                return memchr::memchr(b'>', &payload[cursor..])
+                    .map(|offset| cursor + offset + 1)
+                    .or(Some(payload.len()));
+            }
+        }
+        pos = lt + 1;
+    }
+    None
+}
+
+/// Cut points for one skeleton's payload, as byte offsets from its first byte.
+///
+/// Returns `chunk_count + 1` offsets: the first is 0, the last is the payload
+/// length, and every interior cut starts at an element's opening `<` and is
+/// at least [`FRAG_CHUNK_BYTES`] past the previous cut. A payload with no such
+/// boundary stays one chunk.
+///
+/// kindlegen's rule, recovered from its output and from `FullFragmentor`:
+///
+/// * It packs the direct children of a block container until the next child
+///   would cross the target, then starts a fragment at that child. A wrapper
+///   larger than the target is entered, so a chapter wrapped in one `<div>`
+///   is still split at its paragraphs; a wrapper below the target stays whole.
+/// * Ruby is never entered and never starts a fragment. A 100 KB paragraph
+///   full of `<ruby>` annotations stays one fragment.
+/// * A table is never entered: its rows and cells stay in one chunk.
+/// * A complete inline child of a block container is a legal boundary; in
+///   probe books kindlegen cut before `<a>`, `<b>`, `<i>`, `<sup>`, `<span>`,
+///   and `<br/>`.
+///
+/// kindling keeps one insertion point per skeleton (the `<body>` aid) rather
+/// than kindlegen's nested skeleton markers. It therefore does not need the
+/// hierarchy: any element start whose parent is a block container is already
+/// a safe boundary, so this scans the element tree iteratively and cuts at
+/// the first such boundary at or past the target. That preserves the
+/// invariants that matter: no cut inside a tag, a UTF-8 character, a ruby
+/// annotation, a table, or an inline run whose parent is inline.
+fn fragment_chunk_bounds(payload: &[u8]) -> Vec<usize> {
+    let len = payload.len();
+    if len == 0 {
+        // An empty payload still gets exactly one (zero-length) row.
+        return vec![0, 0];
+    }
+    let mut bounds = vec![0usize];
+    let mut start = 0usize;
+    // Open elements as (name, is_block_container). `ruby` and `table` need
+    // their own depths because their descendants are never cut points.
+    let mut stack: Vec<(&[u8], bool)> = Vec::new();
+    let mut ruby_depth = 0usize;
+    let mut table_depth = 0usize;
+    let mut pos = 0usize;
+    while pos < len {
+        if payload[pos] != b'<' {
+            pos = memchr::memchr(b'<', &payload[pos..]).map_or(len, |offset| pos + offset);
+            continue;
+        }
+        let Some(tag) = chunk_scan_tag(payload, pos) else {
+            // A literal `<` in text, not markup.
+            pos += 1;
+            continue;
+        };
+        if tag.name.is_empty() {
+            // Comment, CDATA, declaration, or processing instruction.
+            pos = tag.end;
+            continue;
+        }
+        if tag.closing {
+            if let Some(index) = stack
+                .iter()
+                .rposition(|(name, _)| name.eq_ignore_ascii_case(tag.name))
+            {
+                while stack.len() > index {
+                    let (name, _) = stack.pop().expect("stack is non-empty");
+                    if name.eq_ignore_ascii_case(b"ruby") {
+                        ruby_depth -= 1;
+                    }
+                    if name.eq_ignore_ascii_case(b"table") {
+                        table_depth -= 1;
+                    }
+                }
+            }
+            pos = tag.end;
+            continue;
+        }
+        let parent_is_block = match stack.last() {
+            Some((_, is_block)) => *is_block,
+            None => true,
+        };
+        // Cut before a child of a block container, never inside ruby or a
+        // table. Cutting before `<ruby>` itself is safe, but kindlegen keeps
+        // ruby with its surrounding run, so do that too.
+        if ruby_depth == 0
+            && table_depth == 0
+            && parent_is_block
+            && !chunk_is_ruby(tag.name)
+            && pos - start >= FRAG_CHUNK_BYTES
+        {
+            bounds.push(pos);
+            start = pos;
+        }
+        if tag.self_closing {
+            pos = tag.end;
+            continue;
+        }
+        if tag.name.eq_ignore_ascii_case(b"script") || tag.name.eq_ignore_ascii_case(b"style") {
+            pos = chunk_find_raw_end(payload, tag.end, tag.name).unwrap_or(len);
+            continue;
+        }
+        if tag.name.eq_ignore_ascii_case(b"ruby") {
+            ruby_depth += 1;
+        }
+        if tag.name.eq_ignore_ascii_case(b"table") {
+            table_depth += 1;
+        }
+        stack.push((tag.name, chunk_is_block_container(tag.name)));
+        pos = tag.end;
+    }
+    if bounds.last().copied() != Some(len) {
         bounds.push(len);
     }
     bounds
+}
+
+#[cfg(test)]
+mod fragment_rule_tests {
+    use super::{FRAG_CHUNK_BYTES, fragment_chunk_bounds};
+
+    fn assert_cuts_are_element_starts(payload: &[u8], bounds: &[usize]) {
+        assert_eq!(bounds[0], 0);
+        assert_eq!(*bounds.last().unwrap(), payload.len());
+        assert!(bounds.windows(2).all(|pair| pair[0] < pair[1]));
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert_eq!(
+                payload[bound], b'<',
+                "a fragment begins at {bound}, which is not an element start"
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_is_never_cut() {
+        let ruby = "<ruby>東京<rt>とうきょう</rt></ruby>";
+        let mut payload = String::from("<div><p>");
+        payload.push_str(&"a".repeat(FRAG_CHUNK_BYTES - 24));
+        let ruby_start = payload.len();
+        payload.push_str(ruby);
+        let ruby_end = payload.len();
+        payload.push_str(&"<span>after</span>".repeat(300));
+        payload.push_str("</p></div>");
+        let bytes = payload.as_bytes();
+        let bounds = fragment_chunk_bounds(bytes);
+        assert!(bounds.len() > 2, "the fixture should need a cut");
+        assert_cuts_are_element_starts(bytes, &bounds);
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert!(
+                bound <= ruby_start || bound >= ruby_end,
+                "fragment boundary {bound} is inside the ruby run {ruby_start}..{ruby_end}"
+            );
+        }
+        assert!(bounds.iter().any(|&bound| bound > ruby_end));
+
+        // kindlegen left a 100 KB ruby-only paragraph as one fragment, and a
+        // ruby run is not a boundary even when the target is crossed.
+        let mut ruby_only = String::from("<p>");
+        ruby_only.push_str(&ruby.repeat(2000));
+        ruby_only.push_str("</p>");
+        assert_eq!(
+            fragment_chunk_bounds(ruby_only.as_bytes()),
+            vec![0, ruby_only.len()]
+        );
+    }
+
+    #[test]
+    fn a_table_is_atomic_but_its_next_sibling_is_a_boundary() {
+        let mut payload = String::from("<div><table>");
+        for i in 0..300 {
+            payload.push_str(&format!(
+                "<tr><td>Cell {i:03}. abcdefghij klmnopqrst uvwxyz0123 456789</td></tr>"
+            ));
+        }
+        payload.push_str("</table><p>tail paragraph</p></div>");
+        let table_end = payload.find("</table>").unwrap() + "</table>".len();
+        let bytes = payload.as_bytes();
+        let bounds = fragment_chunk_bounds(bytes);
+        assert!(bounds.len() > 2, "the tail paragraph should start a chunk");
+        assert_cuts_are_element_starts(bytes, &bounds);
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert!(
+                bound >= table_end,
+                "fragment boundary {bound} is inside the table (ends at {table_end})"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_siblings_of_a_block_container_are_boundaries() {
+        let mut payload = String::from("<p>");
+        for i in 0..400 {
+            payload.push_str(&format!(
+                "<span>Span {i:03}. abcdefghij klmnopqrstuvwx</span>"
+            ));
+        }
+        payload.push_str("</p>");
+        let bytes = payload.as_bytes();
+        let bounds = fragment_chunk_bounds(bytes);
+        assert!(bounds.len() > 2, "the fixture should need a cut");
+        assert_cuts_are_element_starts(bytes, &bounds);
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert!(
+                payload[bound..].starts_with("<span>"),
+                "fragment at {bound} should begin at a span"
+            );
+        }
+        for pair in bounds.windows(2).take(bounds.len() - 2) {
+            assert!(
+                pair[1] - pair[0] >= FRAG_CHUNK_BYTES,
+                "non-final chunk {}..{} is shorter than the target",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapper_does_not_hide_paragraph_boundaries() {
+        let mut payload = String::from("<div class=\"wrap\">");
+        for i in 0..400 {
+            payload.push_str(&format!(
+                "<p>Paragraph {i:03}. abcdefghij klmnopqrst uvwxyz0123</p>"
+            ));
+        }
+        payload.push_str("</div>");
+        let bytes = payload.as_bytes();
+        let bounds = fragment_chunk_bounds(bytes);
+        assert!(bounds.len() > 2, "the wrapper should be split internally");
+        assert_cuts_are_element_starts(bytes, &bounds);
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert!(
+                payload[bound..].starts_with("<p>"),
+                "fragment at {bound} should begin at a paragraph"
+            );
+        }
+    }
 }
 
 /// Map a byte offset inside a skeleton's payload to the fragment that owns
@@ -3706,17 +4078,23 @@ mod tests {
     #[test]
     fn chunk_bounds_skip_a_gt_inside_a_quoted_attribute() {
         // The first `>` at or past the threshold sits inside an attribute
-        // value, so a naive scan cuts the fragment inside the tag.
+        // value, so a scan that looks for the next `>` cuts the fragment inside
+        // the tag. The chunk has to start at the element itself instead.
         let mut payload = Vec::new();
         payload.extend_from_slice(b"<p>");
-        payload.resize(8190, b'x');
-        payload.extend_from_slice(b"<a title=\"a>b\">link</a>");
-        let after_tag = 8190 + b"<a title=\"a>b\">".len();
-        assert_eq!(payload[after_tag - 1], b'>');
-        assert_eq!(
-            fragment_chunk_bounds(&payload),
-            vec![0, after_tag, payload.len()]
-        );
+        payload.resize(FRAG_CHUNK_BYTES, b'x');
+        payload.extend_from_slice(b"<a title=\"a>b\">link</a></p>");
+        let tag_start = FRAG_CHUNK_BYTES;
+        let tag_end = tag_start + b"<a title=\"a>b\">".len();
+        assert_eq!(payload[tag_end - 1], b'>');
+        let bounds = fragment_chunk_bounds(&payload);
+        assert_eq!(bounds, vec![0, tag_start, payload.len()]);
+        for &bound in &bounds[1..bounds.len() - 1] {
+            assert!(
+                bound <= tag_start || bound >= tag_end,
+                "fragment boundary {bound} falls inside the tag {tag_start}..{tag_end}"
+            );
+        }
     }
 
     #[test]
