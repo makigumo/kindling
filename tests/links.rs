@@ -755,18 +755,21 @@ fn a_long_chapter_is_split_into_fragments_that_tile_its_payload() {
             "fragment {id} begins inside a character at {next_start}"
         );
         if id + 1 < frags.len() {
-            // A chunk is cut just past a tag close, never at a fixed width:
-            // the reader parses one fragment at a time, so a fragment that
-            // opens on the tail of a tag (`p aid="2S">`) is read as text.
+            // A chunk starts at an element tag, never at a fixed width: the
+            // reader parses one fragment at a time, so a fragment that opens
+            // on the tail of a tag (`p aid="2S">`) is read as text.
             assert!(
                 *len >= FRAG_CHUNK_BYTES,
                 "fragment {id} is {len} bytes, under one chunk"
             );
+            let at = base + next_start;
+            let from = at.saturating_sub(12);
+            let to = (at + 12).min(part.len());
             assert_eq!(
-                part.as_bytes()[base + next_start - 1],
-                b'>',
-                "fragment {id} begins at {next_start}, which is not a tag close: {:?}",
-                &part[base + next_start - 12..base + next_start + 12]
+                part.as_bytes()[at],
+                b'<',
+                "fragment {id} begins at {next_start}, which is not an element start: {:?}",
+                &part[from..to]
             );
         }
         next_start += len;
