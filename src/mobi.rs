@@ -8558,7 +8558,17 @@ fn build_record0(
 
     put32(&mut mobi, 76, mobi_locale_code(&opf.language));
     put32(&mut mobi, 80, mobi_locale_code(&opf.dict_in_language));
-    put32(&mut mobi, 84, mobi_locale_code(&opf.dict_out_language));
+    // kindlegen writes the book's dc:Language into the output-language slot
+    // when the OPF omits <DictionaryOutLanguage>, so a source-only dictionary
+    // still names a target language. This is the same fallback EXTH 532 uses.
+    // Evidence: a dictionary with dc:Language=ja, DictionaryInLanguage=fr and
+    // no <DictionaryOutLanguage> gets dict_out=0x11 (ja), not 0x0C (fr).
+    let dict_out_lang = if opf.dict_out_language.is_empty() {
+        opf.language.as_str()
+    } else {
+        opf.dict_out_language.as_str()
+    };
+    put32(&mut mobi, 84, mobi_locale_code(dict_out_lang));
     put32(&mut mobi, 88, version); // min version = same as file version
     put32(&mut mobi, 92, first_image_record as u32); // first image record
     // Where the huffdic model lives, when the text is compressed with one.
