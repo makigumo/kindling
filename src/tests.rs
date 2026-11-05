@@ -9395,6 +9395,39 @@ p { margin: 0.3em 0; }
     }
 
     #[test]
+    fn test_dict_header_languages_are_zero_without_in_language() {
+        // An out-only OPF still builds as a dictionary and keeps EXTH 532, but
+        // kindlegen stores 0 in both header language words instead of the
+        // out-language code. The fixture also moves dc:Language off "en" so
+        // the assertion cannot be satisfied by the en-neutral fallback.
+        let dir = TempDir::new("dict_hdr_no_in_lang");
+        let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
+        let text = fs::read_to_string(&opf).unwrap();
+        let text = text
+            .replace(
+                "<dc:language xmlns:dc=\"http://purl.org/dc/elements/1.1/\">en</dc:language>",
+                "<dc:language xmlns:dc=\"http://purl.org/dc/elements/1.1/\">ja</dc:language>",
+            )
+            .replace(
+                "      <DictionaryInLanguage>en</DictionaryInLanguage>\n      <DictionaryOutLanguage>en</DictionaryOutLanguage>",
+                "      <DictionaryOutLanguage>de</DictionaryOutLanguage>",
+            );
+        assert!(!text.contains("DictionaryInLanguage"));
+        assert!(text.contains("<DictionaryOutLanguage>de</DictionaryOutLanguage>"));
+        fs::write(&opf, text).unwrap();
+
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        assert_eq!(read_u32_be(rec0, 16 + 80), 0, "dict_in must be zero");
+        assert_eq!(read_u32_be(rec0, 16 + 84), 0, "dict_out must be zero");
+        let exth = parse_exth_records(rec0);
+        assert!(!exth.contains_key(&531), "no EXTH 531 without an in-language");
+        let out = exth.get(&532).expect("EXTH 532 should still carry de");
+        assert_eq!(std::str::from_utf8(&out[0]).unwrap(), "de");
+    }
+
+    #[test]
     fn test_dict_exth_535_creator() {
         let dir = TempDir::new("dict_exth_535");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
