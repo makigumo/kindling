@@ -7783,8 +7783,8 @@ p { margin: 0.3em 0; }
     #[test]
     fn test_dict_without_image_still_works() {
         // A dictionary with no images still has to name a real record here:
-        // kindlegen points this word at the resource record after its index
-        // block, and kindling at the record after its own indices.
+        // kindlegen points this word at its RESC resource record after the
+        // index block, and kindling now writes that record in the same place.
         let dir = TempDir::new("dict_no_img");
         let opf = create_dict_fixture(dir.path(), &[("test", &["tests"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
@@ -7804,8 +7804,8 @@ p { margin: 0.3em 0; }
         );
         assert_eq!(
             &get_record(&data, &offsets, first_img as usize)[0..4],
-            b"FLIS",
-            "first_image should point at the first record after the indices"
+            b"RESC",
+            "first_image should point at the RESC resource record after the indices"
         );
 
         let exth = parse_exth_records(rec0);
@@ -9180,8 +9180,9 @@ p { margin: 0.3em 0; }
         let rec0 = get_record(&data, &offsets, 0);
         let val = value_125(rec0);
         assert_eq!(
-            val, 0,
-            "a dictionary with no images or fonts must claim 0 resources, got {}",
+            val, 1,
+            "a dictionary with no images still ships the RESC record, so it \
+             must claim one resource, got {}",
             val
         );
 
@@ -9193,13 +9194,13 @@ p { margin: 0.3em 0; }
         let rec0 = get_record(&data, &offsets, 0);
         let val = value_125(rec0);
         assert_eq!(
-            val, 2,
-            "a dictionary with a cover also ships its generated thumbnail, so it \
-             must claim two resources, got {}",
+            val, 3,
+            "a dictionary with a cover ships cover, RESC and thumbnail, so it \
+             must claim three resources, got {}",
             val
         );
         println!(
-            "  \u{2713} Dict EXTH 125: no images = 0, cover + thumbnail = {}",
+            "  \u{2713} Dict EXTH 125: no images = 1, cover + RESC + thumbnail = {}",
             val
         );
     }
@@ -9251,8 +9252,15 @@ p { margin: 0.3em 0; }
         let thumb = read_u32_be(&exth.get(&202).expect("EXTH 202")[0], 0);
         assert_eq!(cover, 0, "the cover is the first image record, got {cover}");
         assert_eq!(
-            thumb, 1,
-            "the generated thumbnail must follow the cover in the image pool, got {thumb}"
+            thumb, 2,
+            "the RESC record sits between the cover and the tile, so the tile is \
+             pool offset 2, got {thumb}"
+        );
+        let resc = get_record(&data, &offsets, first_img + 1);
+        assert_eq!(
+            &resc[..4],
+            b"RESC",
+            "the image pool must carry the RESC record before the tile"
         );
         let thumb_rec = get_record(&data, &offsets, first_img + thumb as usize);
         assert_eq!(
@@ -9265,6 +9273,56 @@ p { margin: 0.3em 0; }
             cover,
             thumb,
             first_img + thumb as usize
+        );
+    }
+
+    /// kindlegen ships a RESC record with every dictionary; with no images it
+    /// is the record the header's first-image word names.
+    #[test]
+    fn test_dict_without_images_ships_a_resc_record() {
+        let dir = TempDir::new("dict_resc");
+        let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        let first_img = read_u32_be(rec0, 108) as usize;
+
+        let resc = get_record(&data, &offsets, first_img);
+        assert_eq!(
+            &resc[..4],
+            b"RESC",
+            "first_image_index must name the RESC record, got {:?}",
+            &resc[..4]
+        );
+        assert_eq!(resc.len(), 4112, "kindlegen pads RESC to 4112 bytes");
+
+        let desc_len = read_u32_be(resc, 12) as usize;
+        let desc = std::str::from_utf8(&resc[16..16 + desc_len]).expect("descriptor");
+        assert!(
+            desc.starts_with("size=") && desc.ends_with("&version=1&type=1"),
+            "unexpected RESC descriptor {desc}"
+        );
+        let xml = String::from_utf8_lossy(&resc[16 + desc_len..16 + desc_len + 512]);
+        assert!(
+            xml.starts_with("<?xml") && xml.contains("<spine>"),
+            "RESC must carry the OPF-like spine manifest, got {xml}"
+        );
+        assert!(
+            xml.contains("<itemref idref=\"content\" skelid=\"0\"/>"),
+            "the first spine itemref keeps its id and skelid, got {xml}"
+        );
+
+        let exth = parse_exth_records(rec0);
+        let count = read_u32_be(&exth.get(&125).expect("EXTH 125")[0], 0);
+        assert_eq!(
+            count, 1,
+            "the RESC record itself must be counted by EXTH 125, got {count}"
+        );
+        println!(
+            "  \u{2713} Dict RESC at {}: {} bytes, descriptor {desc}, EXTH 125={}",
+            first_img,
+            resc.len(),
+            count
         );
     }
 
@@ -9476,9 +9534,8 @@ p { margin: 0.3em 0; }
     #[test]
     fn test_dict_header_first_image_points_past_the_indices() {
         // kindlegen never leaves the first-image word at NULL: its dictionary
-        // output points it at the resource record that follows the index
-        // block. kindling writes no RESC record for dictionaries, so the
-        // equivalent position is the first record after its own indices.
+        // output points it at the RESC resource record that follows the index
+        // block, and kindling writes one in the same position.
         let dir = TempDir::new("dict_hdr_first_image");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
@@ -9489,8 +9546,14 @@ p { margin: 0.3em 0; }
             .find(|&index| get_record(&data, &offsets, index).starts_with(b"FLIS"))
             .expect("a dictionary should carry a FLIS record");
         assert_eq!(
-            first_image, flis,
-            "no-image dictionary should point at the record after its indices"
+            first_image,
+            flis - 1,
+            "no-image dictionary should point at its RESC record, just before FLIS"
+        );
+        assert_eq!(
+            &get_record(&data, &offsets, first_image)[..4],
+            b"RESC",
+            "the record the word names must be RESC"
         );
         assert_ne!(first_image, 0xFFFFFFFF);
     }
