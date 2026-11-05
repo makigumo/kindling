@@ -727,10 +727,20 @@ pub fn build_exth(
         records.push(exth_record(105, subj.as_bytes()));
     }
 
-    // Dictionary languages
+    // Dictionary languages. kindlegen falls back to the book's dc:Language
+    // for the output language: an OPF whose <x-metadata> declares only
+    // DictionaryInLanguage still produces EXTH 532 with the dc:Language value
+    // (probe: DictionaryInLanguage=ja, dc:Language=ja and no
+    // DictionaryOutLanguage yields 531=ja, 532=ja). Before this, kindling
+    // emitted 531 only.
     if !dict_in_language.is_empty() {
         records.push(exth_record(531, dict_in_language.as_bytes()));
     }
+    let dict_out_language = if dict_out_language.is_empty() {
+        language
+    } else {
+        dict_out_language
+    };
     if !dict_out_language.is_empty() {
         records.push(exth_record(532, dict_out_language.as_bytes()));
     }
@@ -1394,5 +1404,31 @@ mod tests {
             "Dict should not have EXTH 112"
         );
         println!("  \u{2713} Dict EXTH: matching 113/504, has 531/532, no 501/112");
+    }
+
+    /// kindlegen writes EXTH 532 from dc:Language when the OPF has no
+    /// `<DictionaryOutLanguage>`, so a source-only dictionary still carries a
+    /// target language record.
+    #[test]
+    fn dict_exth_532_falls_back_to_dc_language() {
+        let chars = HashSet::new();
+        let exth = build_exth(
+            "Test Dict",
+            "Author",
+            "",
+            &[],
+            "ja",
+            "ja",
+            "",
+            "TestDictionaryIdentity",
+            &chars,
+            false,
+            None,
+            0,
+        );
+        let records = parse_exth_records(&exth);
+        assert!(find_record(&records, 531).is_some(), "531 must survive");
+        let out = find_record(&records, 532).expect("532 should fall back to dc:Language");
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "ja");
     }
 }
