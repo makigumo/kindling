@@ -705,11 +705,6 @@ fn build_dictionary_mobi(
     // the text moves along by the number of model records.
     let first_non_book = text_records.len() + 1;
     let after_model = text_records.len() + 1 + num_model;
-    let first_image_record = if num_image_records > 0 {
-        after_model
-    } else {
-        0xFFFFFFFF
-    };
     let orth_index_record = after_model + num_image_records;
     let names_index_record = orth_index_record + names_index_offset;
     let infl_index_record = 0xFFFFFFFFusize;
@@ -720,6 +715,18 @@ fn build_dictionary_mobi(
     };
     let after_indices =
         orth_index_record + indx_records.len() + kf7_ncx_records.len() + kf7_ncx_cncx_records.len();
+    // kindlegen always writes a real record number here: a dictionary with no
+    // images points at the RESC resource record, which sits directly after the
+    // index block (probe baseline: 0x9, and record 9 is RESC). kindling writes
+    // no RESC for dictionaries, so the equivalent position is the record that
+    // follows its own indices. 0xFFFFFFFF was a sentinel no kindlegen
+    // dictionary build writes, and it left EXTH 125's resource count describing
+    // a range that starts nowhere.
+    let first_image_record = if num_image_records > 0 {
+        after_model
+    } else {
+        after_indices
+    };
     // DATP goes directly before FLIS, where kindlegen puts it, which also
     // makes it the last content record (flis_record - 1) as kindlegen has it.
     let datp_index = datp_record.as_ref().map(|_| after_indices);
