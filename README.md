@@ -646,7 +646,7 @@ EXTH records are type-length-value metadata entries in Record 0, following the M
 | 525 | Writing mode | Both | UTF-8 string | `"horizontal-lr"` or `"horizontal-rl"` |
 | 527 | Page progression | Books | UTF-8 string | Fixed-layout page direction |
 | 531 | Dict input language | Dicts | UTF-8 string | Source language ISO 639 code (e.g. `"el"`) |
-| 532 | Dict output language | Dicts | UTF-8 string | Target language ISO 639 code (e.g. `"en"`) |
+| 532 | Dict output language | Dicts | UTF-8 string | Target language ISO 639 code (e.g. `"en"`); falls back to `dc:Language` when the OPF omits `DictionaryOutLanguage` |
 | 535 | Creator string | Both | UTF-8 string | `"0730-890adc2"` for *kindlegen* compat, `"kindling-X.Y.Z"` with `--creator-tag` |
 | 536 | HD image geometry | Books | UTF-8 string | `"WxH:start-end\|"` format for HD image container |
 | 542 | Content hash | Both | 4 bytes | MD5 prefix of title |
