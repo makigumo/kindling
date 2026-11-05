@@ -363,6 +363,20 @@ fn build_dictionary_mobi(
         );
     }
 
+    // kindlegen ships a RESC resource record with every dictionary: a 4 KiB
+    // record carrying a one-entry descriptor and an OPF-like manifest of the
+    // spine. When the dictionary has images it sits at the end of the image
+    // pool, before the generated tile (which is why kindlegen's EXTH 202 counts
+    // it); with no images it follows the index block, where the header's
+    // first-image word points at it.
+    let resc_record = build_resc_record(opf, cover_href.as_deref());
+    let standalone_resc: Option<Vec<u8>> = if image_records.is_empty() {
+        Some(resc_record)
+    } else {
+        image_records.push(resc_record);
+        None
+    };
+
     // kindlegen also writes a library-grid thumbnail for a dictionary cover and
     // points EXTH 202 at it (image probe: 201=1, 202=3 with a cover and an
     // inline image). Reusing the cover as the thumbnail instead makes the
@@ -399,6 +413,9 @@ fn build_dictionary_mobi(
     };
 
     let num_image_records = image_records.len();
+    // Every record in the image pool is a resource record, and a standalone
+    // RESC is one too.
+    let resource_count = num_image_records + usize::from(standalone_resc.is_some());
 
     // Build the text content (stripped HTML for all spine items)
     eprintln!("Building text content...");
@@ -762,10 +779,13 @@ fn build_dictionary_mobi(
     } else {
         after_indices
     };
+    // A standalone RESC record sits directly after the index block, so every
+    // record from there on shifts by one.
+    let resc_offset = usize::from(standalone_resc.is_some());
     // DATP goes directly before FLIS, where kindlegen puts it, which also
     // makes it the last content record (flis_record - 1) as kindlegen has it.
-    let datp_index = datp_record.as_ref().map(|_| after_indices);
-    let flis_record = after_indices + num_datp;
+    let datp_index = datp_record.as_ref().map(|_| after_indices + resc_offset);
+    let flis_record = after_indices + num_datp + resc_offset;
     let fcis_record = flis_record + 1;
     let srcs_record_idx = if srcs_record.is_some() {
         Some(fcis_record + 1)
@@ -781,6 +801,7 @@ fn build_dictionary_mobi(
         + kf7_ncx_cncx_records.len()
         + num_datp
         + 3
+        + resc_offset
         + num_optional;
 
     // Collect unique headword characters for fontsignature
@@ -817,12 +838,10 @@ fn build_dictionary_mobi(
         None, // no HD images for dictionaries
         creator_tag,
         None, // no doc_type for dictionaries
-        // EXTH 125: the dictionary section's resource records — its images,
-        // the generated library thumbnail included. A MOBI7-only dictionary
-        // carries no embedded fonts and no RESC record, so this is the image
-        // count; kindlegen's number is one higher because it counts the RESC
-        // resource record it writes as well.
-        num_image_records as u32,
+        // EXTH 125: the dictionary section's resource records — its images, the
+        // generated library thumbnail and the RESC record, which kindlegen
+        // counts too. A MOBI7-only dictionary carries no embedded fonts.
+        resource_count as u32,
         huffdic_model,
         datp_index,
         kf7_ncx_index_record,
@@ -836,6 +855,9 @@ fn build_dictionary_mobi(
     all_records.extend(indx_records);
     all_records.extend(kf7_ncx_records);
     all_records.extend(kf7_ncx_cncx_records);
+    if let Some(resc) = standalone_resc {
+        all_records.push(resc);
+    }
     if let Some(datp) = datp_record {
         all_records.push(datp);
     }
@@ -2320,6 +2342,81 @@ fn encode_under_cap(img: &image::DynamicImage, quality: u8) -> Option<Vec<u8>> {
 ///
 /// Returns None if the input cannot be decoded; the caller should fall back
 /// to emitting no thumbnail rather than failing the build.
+/// Minimal base-32 encoding of a size, digits `0-9A-V`, no leading zeroes.
+///
+/// This is the form kindlegen uses in a RESC descriptor: the probe builds
+/// encode their manifest lengths 280, 284, 308, 316, 332 and 366 as `8O`, `8S`,
+/// `9K`, `9S`, `AC` and `BE`.
+fn encode_resc_size(mut value: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[value % 32]);
+        value /= 32;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base-32 digits are ASCII")
+}
+
+/// Build the RESC resource record kindlegen writes for every dictionary.
+///
+/// The layout is a 16-byte header (`RESC`, header length 0x10, one entry, then
+/// the descriptor length), a `size=<base32>&version=1&type=1` descriptor, and
+/// an OPF-like manifest of the spine, padded to 4112 bytes. The descriptor's
+/// size is the manifest length in base 32, not decimal, and the manifest names
+/// the cover item when the OPF does. kindlegen points its header's first-image
+/// word and EXTH 202/125 at this record, so its position is load-bearing.
+pub(crate) fn build_resc_record(opf: &OPFData, cover_href: Option<&str>) -> Vec<u8> {
+    // `meta name="cover"` names a manifest item id, and kindlegen copies that
+    // id verbatim (probe: content="cov" for the item with id cov).
+    let cover_id = cover_href.and_then(|href| {
+        opf.manifest
+            .iter()
+            .find(|(_, (item_href, _))| item_href.as_str() == href)
+            .map(|(id, _)| id.as_str())
+    });
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><metadata version=\"2.0\" \
+         unique-identifier=\"uid\" xmlns=\"http://www.idpf.org/2007/opf\">\
+         <dc-metadata xmlns:dc=\"http://purl.org/metadata/dublin_core\"></dc-metadata>",
+    );
+    if let Some(id) = cover_id {
+        xml.push_str("<meta name=\"cover\" content=\"");
+        xml.push_str(id);
+        xml.push_str("\"/>");
+    }
+    xml.push_str("<x-metadata></x-metadata></metadata><spine>");
+    for (index, (id, _href)) in opf.spine_items.iter().enumerate() {
+        // Only the first itemref carries a skeleton id; kindlegen leaves the
+        // rest to be numbered implicitly.
+        if index == 0 {
+            xml.push_str(&format!("<itemref idref=\"{id}\" skelid=\"0\"/>"));
+        } else {
+            xml.push_str(&format!("<itemref idref=\"{id}\"/>"));
+        }
+    }
+    xml.push_str("</spine>");
+
+    let descriptor = format!("size={}&version=1&type=1", encode_resc_size(xml.len()));
+    let needed = 16 + descriptor.len() + xml.len();
+    // kindlegen writes the record in a fixed 4112-byte block. The manifest
+    // never approaches that, but honour a larger one rather than truncating.
+    let record_len = needed.max(4112);
+    let mut record = Vec::with_capacity(record_len);
+    record.extend_from_slice(b"RESC");
+    record.extend_from_slice(&0x10u32.to_be_bytes());
+    record.extend_from_slice(&1u32.to_be_bytes());
+    record.extend_from_slice(&(descriptor.len() as u32).to_be_bytes());
+    record.extend_from_slice(descriptor.as_bytes());
+    record.extend_from_slice(xml.as_bytes());
+    record.resize(record_len, 0);
+    record
+}
+
 pub(crate) fn build_thumbnail_record(cover_bytes: &[u8]) -> Option<Vec<u8>> {
     // Target bounding box. Calibre's AZW3 output uses 160x240 for thumbnails
     // on a typical 2:3 cover, which gives about 10 KB per JPEG at q80.
