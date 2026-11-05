@@ -7782,7 +7782,9 @@ p { margin: 0.3em 0; }
 
     #[test]
     fn test_dict_without_image_still_works() {
-        // Verify that dictionaries without images still produce 0xFFFFFFFF
+        // A dictionary with no images still has to name a real record here:
+        // kindlegen points this word at the resource record after its index
+        // block, and kindling at the record after its own indices.
         let dir = TempDir::new("dict_no_img");
         let opf = create_dict_fixture(dir.path(), &[("test", &["tests"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
@@ -7790,9 +7792,20 @@ p { margin: 0.3em 0; }
         let rec0 = get_record(&data, &offsets, 0);
 
         let first_img = read_u32_be(rec0, 108);
-        assert_eq!(
+        assert_ne!(
             first_img, 0xFFFFFFFF,
-            "Dictionary without images should have first_image = 0xFFFFFFFF"
+            "Dictionary without images must not leave first_image at NULL"
+        );
+        assert!(
+            (first_img as usize) < offsets.len(),
+            "first_image ({}) is not a record index ({} records)",
+            first_img,
+            offsets.len()
+        );
+        assert_eq!(
+            &get_record(&data, &offsets, first_img as usize)[0..4],
+            b"FLIS",
+            "first_image should point at the first record after the indices"
         );
 
         let exth = parse_exth_records(rec0);
@@ -7800,7 +7813,7 @@ p { margin: 0.3em 0; }
             !exth.contains_key(&201),
             "Dictionary without images should not have EXTH 201"
         );
-        println!("  \u{2713} Dict without images: first_image=0xFFFFFFFF, no EXTH 201");
+        println!("  \u{2713} Dict without images: first_image={first_img}, no EXTH 201");
     }
 
     #[test]
@@ -9425,6 +9438,28 @@ p { margin: 0.3em 0; }
         assert!(!exth.contains_key(&531), "no EXTH 531 without an in-language");
         let out = exth.get(&532).expect("EXTH 532 should still carry de");
         assert_eq!(std::str::from_utf8(&out[0]).unwrap(), "de");
+    }
+
+    #[test]
+    fn test_dict_header_first_image_points_past_the_indices() {
+        // kindlegen never leaves the first-image word at NULL: its dictionary
+        // output points it at the resource record that follows the index
+        // block. kindling writes no RESC record for dictionaries, so the
+        // equivalent position is the first record after its own indices.
+        let dir = TempDir::new("dict_hdr_first_image");
+        let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        let first_image = read_u32_be(rec0, 16 + 92) as usize;
+        let flis = (1..offsets.len())
+            .find(|&index| get_record(&data, &offsets, index).starts_with(b"FLIS"))
+            .expect("a dictionary should carry a FLIS record");
+        assert_eq!(
+            first_image, flis,
+            "no-image dictionary should point at the record after its indices"
+        );
+        assert_ne!(first_image, 0xFFFFFFFF);
     }
 
     #[test]
