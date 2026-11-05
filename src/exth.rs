@@ -632,7 +632,10 @@ fn derive_uuid(seed: &str) -> String {
 
 /// Build the complete EXTH header with metadata records for dictionaries.
 ///
-/// Record order matches kindlegen output for maximum compatibility.
+/// Record order matches kindlegen output for maximum compatibility. EXTH 202 is
+/// the library-thumbnail offset: `thumb_offset` when the build generated a tile
+/// and `cover_offset` otherwise, which is what kindlegen's dictionary output
+/// does when it has no thumbnail of its own.
 // As with `build_book_exth`, each parameter is one EXTH record and the order is
 // kindlegen's record order, so grouping them into a struct would obscure that.
 #[allow(clippy::too_many_arguments)]
@@ -648,6 +651,7 @@ pub fn build_exth(
     headword_chars: &HashSet<u32>,
     creator_tag: bool,
     cover_offset: Option<u32>,
+    thumb_offset: Option<u32>,
     resource_count: u32,
 ) -> Vec<u8> {
     let mut records: Vec<Vec<u8>> = Vec::new();
@@ -776,10 +780,14 @@ pub fn build_exth(
     // Creator build (207)
     records.push(exth_record(207, &0u32.to_be_bytes())); // build = 0
 
-    // Cover image offset (201) and thumb offset (202)
+    // Cover image offset (201) and thumb offset (202), both 0-based offsets
+    // into the image pool. 202 is the generated library tile when the build
+    // made one; otherwise it stays the cover, which is where the firmware has
+    // always found an image for dictionaries that carry no tile.
     if let Some(offset) = cover_offset {
         records.push(exth_record(201, &offset.to_be_bytes()));
-        records.push(exth_record(202, &offset.to_be_bytes()));
+        let thumb = thumb_offset.unwrap_or(offset);
+        records.push(exth_record(202, &thumb.to_be_bytes()));
     }
 
     // EXTH 203 (undocumented u32=0). kindlegen emits this on every
@@ -881,6 +889,7 @@ mod tests {
             &chars,
             false,
             None,
+            None,
             0,
         );
         let records = parse_exth_records(&exth);
@@ -914,6 +923,7 @@ mod tests {
             &chars,
             false,
             None,
+            None,
             0,
         );
         let records = parse_exth_records(&exth);
@@ -941,6 +951,7 @@ mod tests {
             "TestDictionaryIdentity",
             &chars,
             false,
+            None,
             None,
             0,
         );
@@ -1373,6 +1384,7 @@ mod tests {
             &chars,
             false,
             None,
+            None,
             0,
         );
         assert_eq!(&exth[0..4], b"EXTH");
@@ -1423,6 +1435,7 @@ mod tests {
             "TestDictionaryIdentity",
             &chars,
             false,
+            None,
             None,
             0,
         );

@@ -363,6 +363,41 @@ fn build_dictionary_mobi(
         );
     }
 
+    // kindlegen also writes a library-grid thumbnail for a dictionary cover and
+    // points EXTH 202 at it (image probe: 201=1, 202=3 with a cover and an
+    // inline image). Reusing the cover as the thumbnail instead makes the
+    // device downscale a full-size image for the tile. Dictionaries have no HD
+    // container, so the LD record is the only source.
+    let thumb_offset: Option<u32> = match cover_offset {
+        Some(cov) => {
+            let cover_bytes = image_records.get(cov as usize).cloned().unwrap_or_default();
+            if cover_bytes.is_empty() {
+                None
+            } else {
+                match build_thumbnail_record(&cover_bytes) {
+                    Some(thumb) => {
+                        let thumb_idx = image_records.len();
+                        image_records.push(thumb);
+                        eprintln!(
+                            "Generated library thumbnail (recindex {}, EXTH 202={})",
+                            thumb_idx + 1,
+                            thumb_idx
+                        );
+                        Some(thumb_idx as u32)
+                    }
+                    None => {
+                        eprintln!(
+                            "Warning: could not decode cover image to generate thumbnail; \
+                             library tile will fall back to the cover"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+
     let num_image_records = image_records.len();
 
     // Build the text content (stripped HTML for all spine items)
@@ -773,7 +808,7 @@ fn build_dictionary_mobi(
         true, // is_dictionary
         first_image_record,
         cover_offset,
-        None, // dictionaries have no library thumbnail slot
+        thumb_offset,
         None, // dictionaries have no KF8 cover URI
         None, // no fixed-layout for dictionaries
         None, // no version override (use default 7)
@@ -782,10 +817,11 @@ fn build_dictionary_mobi(
         None, // no HD images for dictionaries
         creator_tag,
         None, // no doc_type for dictionaries
-        // EXTH 125: the dictionary section's resource records, which are its
-        // images. A MOBI7-only dictionary carries no embedded fonts and no
-        // RESC record, so this is the image count (kindlegen writes the same
-        // thing plus one per RESC record).
+        // EXTH 125: the dictionary section's resource records — its images,
+        // the generated library thumbnail included. A MOBI7-only dictionary
+        // carries no embedded fonts and no RESC record, so this is the image
+        // count; kindlegen's number is one higher because it counts the RESC
+        // resource record it writes as well.
         num_image_records as u32,
         huffdic_model,
         datp_index,
@@ -8680,6 +8716,7 @@ fn build_record0(
             headword_chars,
             creator_tag,
             cover_offset,
+            thumb_offset,
             resource_count,
         )
     } else {

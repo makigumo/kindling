@@ -9193,12 +9193,13 @@ p { margin: 0.3em 0; }
         let rec0 = get_record(&data, &offsets, 0);
         let val = value_125(rec0);
         assert_eq!(
-            val, 1,
-            "a dictionary with one image record must claim one resource, got {}",
+            val, 2,
+            "a dictionary with a cover also ships its generated thumbnail, so it \
+             must claim two resources, got {}",
             val
         );
         println!(
-            "  \u{2713} Dict EXTH 125: no images = 0, one cover = {}",
+            "  \u{2713} Dict EXTH 125: no images = 0, cover + thumbnail = {}",
             val
         );
     }
@@ -9233,6 +9234,38 @@ p { margin: 0.3em 0; }
             "Dict with images should have EXTH 201 (CoverOffset)"
         );
         println!("  \u{2713} Dict EXTH 201 (CoverOffset) present with images");
+    }
+
+    #[test]
+    fn test_dict_cover_gets_a_library_thumbnail() {
+        let dir = TempDir::new("dict_thumb");
+        let jpeg = make_test_jpeg();
+        let opf = create_dict_fixture_with_cover(dir.path(), &[("word", &["words"])], &jpeg);
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        let exth = parse_exth_records(rec0);
+        let first_img = read_u32_be(rec0, 108) as usize;
+
+        let cover = read_u32_be(&exth.get(&201).expect("EXTH 201")[0], 0);
+        let thumb = read_u32_be(&exth.get(&202).expect("EXTH 202")[0], 0);
+        assert_eq!(cover, 0, "the cover is the first image record, got {cover}");
+        assert_eq!(
+            thumb, 1,
+            "the generated thumbnail must follow the cover in the image pool, got {thumb}"
+        );
+        let thumb_rec = get_record(&data, &offsets, first_img + thumb as usize);
+        assert_eq!(
+            &thumb_rec[..2],
+            &[0xFF, 0xD8],
+            "the thumbnail record must be a JPEG"
+        );
+        println!(
+            "  \u{2713} Dict thumbnail: 201={}, 202={}, JPEG at {}",
+            cover,
+            thumb,
+            first_img + thumb as usize
+        );
     }
 
     #[test]
