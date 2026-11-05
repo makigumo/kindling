@@ -8557,7 +8557,6 @@ fn build_record0(
     put32(&mut mobi, 64, first_non_book_record as u32);
 
     put32(&mut mobi, 76, mobi_locale_code(&opf.language));
-    put32(&mut mobi, 80, mobi_locale_code(&opf.dict_in_language));
     // kindlegen writes the book's dc:Language into the output-language slot
     // when the OPF omits <DictionaryOutLanguage>, so a source-only dictionary
     // still names a target language. This is the same fallback EXTH 532 uses.
@@ -8568,7 +8567,21 @@ fn build_record0(
     } else {
         opf.dict_out_language.as_str()
     };
-    put32(&mut mobi, 84, mobi_locale_code(dict_out_lang));
+    // Both dictionary language slots stay zero unless the OPF names an input
+    // language. An OPF with only <DictionaryOutLanguage> is still built as a
+    // dictionary (EXTH 532 is written), but kindlegen stores 0 in both header
+    // words rather than the out-language code (probe `only_out`:
+    // dc:Language=ja, out=de -> dict_in=0, dict_out=0, EXTH 532="de").
+    let (dict_in_code, dict_out_code) = if is_dictionary && opf.dict_in_language.is_empty() {
+        (0, 0)
+    } else {
+        (
+            mobi_locale_code(&opf.dict_in_language),
+            mobi_locale_code(dict_out_lang),
+        )
+    };
+    put32(&mut mobi, 80, dict_in_code);
+    put32(&mut mobi, 84, dict_out_code);
     put32(&mut mobi, 88, version); // min version = same as file version
     put32(&mut mobi, 92, first_image_record as u32); // first image record
     // Where the huffdic model lives, when the text is compressed with one.
