@@ -156,6 +156,18 @@ impl OPFData {
         reader.config_mut().allow_dangling_amp = true;
 
         let mut in_metadata = false;
+        // kindlegen does not look for `<x-metadata>` only under `<metadata>`.
+        // Its OPF loader scans every element node in the document for the
+        // literal name (OPF/OEB namespace) and remembers the LAST match, then
+        // reads DictionaryInLanguage / DictionaryOutLanguage /
+        // DefaultLookupIndex / EmbeddedCover from inside that one element.
+        // So the block may sit directly under `<package>`, inside
+        // `<dc-metadata>`, inside `<manifest>`, or anywhere else, and a later
+        // block replaces an earlier one wholesale instead of merging with it.
+        // `xmetadata_stack` holds the generation of each open block so fields
+        // are only read from the newest one.
+        let mut xmetadata_stack: Vec<usize> = Vec::new();
+        let mut xmetadata_generation: usize = 0;
         let mut in_manifest = false;
         let mut in_spine = false;
         let mut in_guide = false;
@@ -167,7 +179,10 @@ impl OPFData {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                Ok(ref ev @ (Event::Start(ref e) | Event::Empty(ref e))) => {
+                    let is_empty_element = matches!(ev, Event::Empty(_));
+                    let in_current_xmetadata =
+                        xmetadata_stack.last().copied() == Some(xmetadata_generation);
                     current_text.clear();
                     let local_name = local_tag_name(e.name().as_ref());
                     // OEB 1.x uses capitalized DC elements (<dc:Title>,
@@ -264,16 +279,27 @@ impl OPFData {
                         "type" if in_metadata => {
                             current_tag = "type".to_string();
                         }
-                        "dictionaryinlanguage" if in_metadata => {
+                        "x-metadata" => {
+                            // A new block supersedes every block before it.
+                            self.dict_in_language.clear();
+                            self.dict_out_language.clear();
+                            self.default_lookup_index = String::from("default");
+                            self.embedded_cover_href = None;
+                            xmetadata_generation += 1;
+                            if !is_empty_element {
+                                xmetadata_stack.push(xmetadata_generation);
+                            }
+                        }
+                        "dictionaryinlanguage" if in_current_xmetadata => {
                             current_tag = "DictionaryInLanguage".to_string();
                         }
-                        "dictionaryoutlanguage" if in_metadata => {
+                        "dictionaryoutlanguage" if in_current_xmetadata => {
                             current_tag = "DictionaryOutLanguage".to_string();
                         }
-                        "defaultlookupindex" if in_metadata => {
+                        "defaultlookupindex" if in_current_xmetadata => {
                             current_tag = "DefaultLookupIndex".to_string();
                         }
-                        "embeddedcover" if in_metadata => {
+                        "embeddedcover" if in_current_xmetadata => {
                             current_tag = "EmbeddedCover".to_string();
                         }
                         "meta" if in_metadata => {
@@ -400,62 +426,80 @@ impl OPFData {
                     }
                 }
                 Ok(ref event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
-                    if in_metadata && !current_tag.is_empty() {
+                    // `current_tag` is only set for elements this parser reads,
+                    // and those now live either in `<metadata>` or in an
+                    // `<x-metadata>` block anywhere in the document.
+                    if !current_tag.is_empty() {
                         crate::xml_text::append(&mut current_text, event);
                     }
                 }
                 Ok(Event::End(ref e)) => {
                     let text = current_text.trim();
-                    if !text.is_empty() && in_metadata {
+                    let in_current_xmetadata =
+                        xmetadata_stack.last().copied() == Some(xmetadata_generation);
+                    if !text.is_empty() {
                         let text = text.to_owned();
-                        match current_tag.as_str() {
-                            "title" => self.title = text,
-                            "creator" => self.author = text,
-                            "language" => {
-                                self.language = text;
-                                self.language_specified = true;
+                        // Dictionary fields only count inside the newest
+                        // `<x-metadata>` block; everything else only counts
+                        // inside `<metadata>`.
+                        if in_current_xmetadata {
+                            match current_tag.as_str() {
+                                "DictionaryInLanguage" => self.dict_in_language = text,
+                                "DictionaryOutLanguage" => self.dict_out_language = text,
+                                "DefaultLookupIndex" => self.default_lookup_index = text,
+                                "EmbeddedCover" => self.embedded_cover_href = Some(text),
+                                _ => {}
                             }
-                            "identifier" => {
-                                // The package's `unique-identifier` attribute names the
-                                // authoritative dc:identifier. If an older OEB source does
-                                // not declare that binding, retain the first identifier
-                                // rather than silently changing identity to the last one.
-                                if self.identifier.is_empty()
-                                    || (!package_unique_identifier_id.is_empty()
-                                        && current_identifier_id == package_unique_identifier_id)
-                                {
-                                    self.identifier = text.clone();
+                        } else if in_metadata {
+                            match current_tag.as_str() {
+                                "title" => self.title = text,
+                                "creator" => self.author = text,
+                                "language" => {
+                                    self.language = text;
+                                    self.language_specified = true;
                                 }
-                                self.dc_identifiers.push(text);
-                            }
-                            "date" => self.date = text,
-                            // Every subject is kept: kindlegen emits one
-                            // EXTH 105 per `<dc:subject>`, and which one a
-                            // publisher lists first is their choice. An OPF
-                            // that leads with anything other than
-                            // "Dictionaries" (Wadoku leads with "Reference")
-                            // lost the marker when only the first was kept.
-                            "subject" => {
-                                if self.subject.is_empty() {
-                                    self.subject = text.clone();
+                                "identifier" => {
+                                    // The package's `unique-identifier` attribute names the
+                                    // authoritative dc:identifier. If an older OEB source does
+                                    // not declare that binding, retain the first identifier
+                                    // rather than silently changing identity to the last one.
+                                    if self.identifier.is_empty()
+                                        || (!package_unique_identifier_id.is_empty()
+                                            && current_identifier_id
+                                                == package_unique_identifier_id)
+                                    {
+                                        self.identifier = text.clone();
+                                    }
+                                    self.dc_identifiers.push(text);
                                 }
-                                self.subjects.push(text);
+                                "date" => self.date = text,
+                                // Every subject is kept: kindlegen emits one
+                                // EXTH 105 per `<dc:subject>`, and which one a
+                                // publisher lists first is their choice. An OPF
+                                // that leads with anything other than
+                                // "Dictionaries" (Wadoku leads with "Reference")
+                                // lost the marker when only the first was kept.
+                                "subject" => {
+                                    if self.subject.is_empty() {
+                                        self.subject = text.clone();
+                                    }
+                                    self.subjects.push(text);
+                                }
+                                "type" => self.dc_types.push(text),
+                                "rendition:layout" if text == "pre-paginated" => {
+                                    self.is_fixed_layout = true;
+                                }
+                                _ => {}
                             }
-                            "type" => self.dc_types.push(text),
-                            "DictionaryInLanguage" => self.dict_in_language = text,
-                            "DictionaryOutLanguage" => self.dict_out_language = text,
-                            "DefaultLookupIndex" => self.default_lookup_index = text,
-                            "EmbeddedCover" => self.embedded_cover_href = Some(text),
-                            "rendition:layout" if text == "pre-paginated" => {
-                                self.is_fixed_layout = true;
-                            }
-                            _ => {}
                         }
                     }
                     current_text.clear();
                     let local_name = local_tag_name(e.name().as_ref());
                     match local_name.to_ascii_lowercase().as_str() {
                         "metadata" => in_metadata = false,
+                        "x-metadata" => {
+                            xmetadata_stack.pop();
+                        }
                         "manifest" => in_manifest = false,
                         "spine" => in_spine = false,
                         "guide" => in_guide = false,
@@ -1534,6 +1578,101 @@ verb
         let extras = data.find_unreferenced_images();
         assert_eq!(extras.len(), 1);
         assert_eq!(extras[0].0, "my glyph.png");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// kindlegen's OPF loader scans the whole document for `x-metadata`, so a
+    /// block directly under `<package>` carries the dictionary fields just as
+    /// a block under `<metadata>` does. Before this, such an OPF parsed as a
+    /// plain book (`dict_in_language` empty) and `kindling build` refused it
+    /// with "KF8-only output is not supported for dictionaries" because the
+    /// CLI's up-front detection disagreed with the content check.
+    #[test]
+    fn finds_x_metadata_block_outside_metadata() {
+        let dir = temp_dir("xmeta_package");
+        let opf = r#"<?xml version="1.0" encoding="utf-8"?>
+<package version="2.0" unique-identifier="uid" xmlns="http://www.idpf.org/2007/opf">
+<metadata>
+<dc-metadata xmlns:dc="http://purl.org/metadata/dublin_core">
+<dc:Title>T</dc:Title><dc:Language>en</dc:Language><dc:Identifier id="uid">x</dc:Identifier>
+</dc-metadata>
+</metadata>
+<x-metadata>
+<DictionaryInLanguage>fr</DictionaryInLanguage>
+<DictionaryOutLanguage>de</DictionaryOutLanguage>
+<DefaultLookupIndex>alt</DefaultLookupIndex>
+<EmbeddedCover>cover.png</EmbeddedCover>
+</x-metadata>
+<manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c"/></spine>
+</package>"#;
+        let opf_path = dir.join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = OPFData::parse(&opf_path).unwrap();
+        assert_eq!(data.dict_in_language, "fr");
+        assert_eq!(data.dict_out_language, "de");
+        assert_eq!(data.default_lookup_index, "alt");
+        assert_eq!(data.embedded_cover_href.as_deref(), Some("cover.png"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// kindlegen keeps the LAST `x-metadata` element in document order and
+    /// reads every dictionary field from inside that one element. A later
+    /// block therefore replaces an earlier one wholesale: fields the later
+    /// block omits must not fall back to the earlier block's values.
+    #[test]
+    fn last_x_metadata_block_replaces_previous_blocks() {
+        let dir = temp_dir("xmeta_last");
+        let opf = r#"<?xml version="1.0" encoding="utf-8"?>
+<package version="2.0" unique-identifier="uid" xmlns="http://www.idpf.org/2007/opf">
+<metadata>
+<dc-metadata xmlns:dc="http://purl.org/metadata/dublin_core">
+<dc:Title>T</dc:Title><dc:Language>en</dc:Language><dc:Identifier id="uid">x</dc:Identifier>
+</dc-metadata>
+<x-metadata>
+<DictionaryInLanguage>ja</DictionaryInLanguage>
+<DictionaryOutLanguage>de</DictionaryOutLanguage>
+<DefaultLookupIndex>main</DefaultLookupIndex>
+</x-metadata>
+</metadata>
+<x-metadata><DictionaryInLanguage>fr</DictionaryInLanguage></x-metadata>
+<manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c"/></spine>
+</package>"#;
+        let opf_path = dir.join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = OPFData::parse(&opf_path).unwrap();
+        assert_eq!(data.dict_in_language, "fr");
+        assert_eq!(data.dict_out_language, "", "earlier block must not leak");
+        assert_eq!(data.default_lookup_index, "default");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without an `x-metadata` wrapper kindlegen never reads the dictionary
+    /// fields, even when they sit directly in `<metadata>`.
+    #[test]
+    fn dictionary_fields_without_x_metadata_wrapper_are_ignored() {
+        let dir = temp_dir("xmeta_missing");
+        let opf = r#"<?xml version="1.0" encoding="utf-8"?>
+<package version="2.0" unique-identifier="uid" xmlns="http://www.idpf.org/2007/opf">
+<metadata>
+<dc-metadata xmlns:dc="http://purl.org/metadata/dublin_core">
+<dc:Title>T</dc:Title><dc:Language>en</dc:Language><dc:Identifier id="uid">x</dc:Identifier>
+</dc-metadata>
+<DictionaryInLanguage>ja</DictionaryInLanguage>
+<DictionaryOutLanguage>de</DictionaryOutLanguage>
+</metadata>
+<manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c"/></spine>
+</package>"#;
+        let opf_path = dir.join("content.opf");
+        fs::write(&opf_path, opf).unwrap();
+
+        let data = OPFData::parse(&opf_path).unwrap();
+        assert!(data.dict_in_language.is_empty());
+        assert!(data.dict_out_language.is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 }
