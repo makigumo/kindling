@@ -624,11 +624,24 @@ fn build_dictionary_mobi(
             .collect(),
         None => text_records,
     };
+    // kindlegen rounds the text out to a 4-byte boundary with a zero record of
+    // its own before the index records: a 157-byte text gets a 3-byte record
+    // and a 9019-byte text a single byte in the probe builds. It is a record,
+    // not tail padding inside the last text record, so it occupies a record
+    // slot in every pointer that follows.
+    let text_pad_len = (4 - (text_records.last().map_or(0, Vec::len) % 4)) % 4;
+    let text_pad_record: Option<Vec<u8>> = if text_pad_len > 0 {
+        Some(vec![0u8; text_pad_len])
+    } else {
+        None
+    };
+    let num_text_pad = usize::from(text_pad_record.is_some());
+
     // The model sits directly after the text, so every record index past the
     // text shifts by its size.
     let num_model = model_records.len();
     let huffdic_model = if num_model > 0 {
-        Some((text_records.len() + 1, num_model))
+        Some((text_records.len() + 1 + num_text_pad, num_model))
     } else {
         None
     };
@@ -755,8 +768,8 @@ fn build_dictionary_mobi(
     // The huffdic model sits directly after the text, which is where
     // kindlegen puts it and where huff_rec_index points, so everything past
     // the text moves along by the number of model records.
-    let first_non_book = text_records.len() + 1;
-    let after_model = text_records.len() + 1 + num_model;
+    let first_non_book = text_records.len() + 1 + num_text_pad;
+    let after_model = text_records.len() + 1 + num_text_pad + num_model;
     let orth_index_record = after_model + num_image_records;
     let names_index_record = orth_index_record + names_index_offset;
     let infl_index_record = 0xFFFFFFFFusize;
@@ -794,6 +807,7 @@ fn build_dictionary_mobi(
     };
     let total_records = 1
         + text_records.len()
+        + num_text_pad
         + num_model
         + num_image_records
         + indx_records.len()
@@ -850,6 +864,9 @@ fn build_dictionary_mobi(
     // Assemble all records
     let mut all_records = vec![record0];
     all_records.extend(text_records);
+    if let Some(pad) = text_pad_record {
+        all_records.push(pad);
+    }
     all_records.extend(model_records);
     all_records.extend(image_records);
     all_records.extend(indx_records);

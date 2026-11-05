@@ -6898,11 +6898,16 @@ p { margin: 0.3em 0; }
         let text_record_count = read_u16_be(rec0, 8) as usize;
 
         // The first non-text record after record 0 should be INDX (for dicts).
-        // orth_index_record tells us where INDX starts; text records are 1..orth_idx-1
+        // orth_index_record tells us where INDX starts, but the zero pad record
+        // kindlegen writes after the text sits in that range too, so count only
+        // records that are not a short all-zero pad.
         let orth_idx = read_u32_be(rec0, 40) as usize;
-        // Text records = records 1 through orth_idx-1
-        // So actual count = orth_idx - 1
-        let actual_text_records = orth_idx - 1;
+        let actual_text_records = (1..orth_idx)
+            .filter(|&index| {
+                let record = get_record(&data, &offsets, index);
+                !(record.len() < 4 && record.iter().all(|byte| *byte == 0))
+            })
+            .count();
 
         assert_eq!(
             text_record_count, actual_text_records,
