@@ -210,16 +210,19 @@ pub fn build_mobi_from_extracted_with_fonts(
     }
 }
 
-/// Check if any HTML content file contains dictionary markup (idx:entry tags).
+/// Decide whether this build is a dictionary.
+///
+/// kindlegen keys this off the OPF's `<x-metadata>` dictionary fields, not off
+/// `idx:entry` markup in the content: an OPF that carries index markup but no
+/// dictionary metadata is built as an ordinary book (kindlegen only warns that
+/// the index is unsupported). Reading the same signal here also keeps this
+/// decision in step with the CLI's up-front `detect_is_dictionary`, which picks
+/// KF8-only output from the OPF before any content is scanned. When the two
+/// disagreed, an OPF with unwrapped `DictionaryInLanguage` parsed as a book up
+/// front but as a dictionary here, and the build aborted with a KF8-only error
+/// instead of producing the plain book kindlegen produces.
 fn detect_dictionary(opf: &OPFData) -> bool {
-    for html_path in opf.get_content_html_paths() {
-        if let Ok(content) = std::fs::read_to_string(&html_path) {
-            if content.contains("<idx:entry") {
-                return true;
-            }
-        }
-    }
-    false
+    opf.is_dictionary()
 }
 
 /// Kindle publishing limit: maximum size per HTML chunk (30 MB).
