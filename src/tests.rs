@@ -9357,6 +9357,44 @@ p { margin: 0.3em 0; }
     }
 
     #[test]
+    fn test_dict_header_output_language_falls_back_to_dc_language() {
+        // kindlegen fills the MOBI header's output-language slot from
+        // dc:Language when the OPF has no <DictionaryOutLanguage>. The
+        // fixture's own dc:Language (en) equals both dictionary languages, so
+        // switch it to ja: a fallback to DictionaryInLanguage would then still
+        // look the same, but reading 0x11 proves the dc:Language value won.
+        let dir = TempDir::new("dict_hdr_out_lang");
+        let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
+        let text = fs::read_to_string(&opf).unwrap();
+        let text = text
+            .replace(
+                "<dc:language xmlns:dc=\"http://purl.org/dc/elements/1.1/\">en</dc:language>",
+                "<dc:language xmlns:dc=\"http://purl.org/dc/elements/1.1/\">ja</dc:language>",
+            )
+            .replace(
+                "      <DictionaryOutLanguage>en</DictionaryOutLanguage>\n",
+                "",
+            );
+        assert!(text.contains(">ja</dc:language>"));
+        assert!(!text.contains("DictionaryOutLanguage"));
+        fs::write(&opf, text).unwrap();
+
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let (_, _, offsets) = parse_palmdb(&data);
+        let rec0 = get_record(&data, &offsets, 0);
+        let header_out = read_u32_be(rec0, 16 + 84);
+        assert_eq!(
+            header_out, 0x11,
+            "dict_out header should fall back to dc:Language (ja, 0x11), got 0x{header_out:X}"
+        );
+        let exth = parse_exth_records(rec0);
+        let out = exth
+            .get(&532)
+            .expect("EXTH 532 should fall back to dc:Language too");
+        assert_eq!(std::str::from_utf8(&out[0]).unwrap(), "ja");
+    }
+
+    #[test]
     fn test_dict_exth_535_creator() {
         let dir = TempDir::new("dict_exth_535");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
