@@ -561,6 +561,42 @@ pub fn book_asin(dc_identifiers: &[String], title: &str, author: &str) -> String
     ))
 }
 
+/// Pick the stable local content identifier used by a sideloaded dictionary.
+///
+/// EXTH 113 is the ASIN the reader exposes: `MobiDictionary.getASIN()` reads
+/// `BookItem.getAsin()`, and the MOBI EXTH parser fills that field only from
+/// record 113. Vocabulary Builder keys its `DICT_INFO` row on the ASIN, so
+/// without this record it has no dictionary key and records no lookups. EXTH
+/// 504 carries the same value because Amazon's own MOBI dictionaries ship
+/// both; the metadata parser does not read it.
+///
+/// Prefer an OPF UUID verbatim. A non-UUID package identifier is still the
+/// publication's authoritative identity, so derive a UUID from that value
+/// alone; title and author changes must not turn an updated dictionary into a
+/// different one. Sources without any identifier fall back to stable metadata.
+pub fn dictionary_content_id(
+    identifier: &str,
+    title: &str,
+    author: &str,
+    dict_in_language: &str,
+    dict_out_language: &str,
+) -> String {
+    let identifier = identifier.trim();
+    let candidate = identifier
+        .strip_prefix("urn:uuid:")
+        .unwrap_or(identifier)
+        .to_ascii_lowercase();
+    if is_uuid(&candidate) {
+        return candidate;
+    }
+    if !identifier.is_empty() {
+        return derive_uuid(identifier);
+    }
+    derive_uuid(&format!(
+        "dictionary\u{0}{title}\u{0}{author}\u{0}{dict_in_language}\u{0}{dict_out_language}"
+    ))
+}
+
 /// 8-4-4-4-12 lowercase hex, the shape the firmware writes into the thumbnail
 /// filename. Deliberately does not police the version/variant nibbles: the
 /// point is a stable filename-safe token, not RFC 4122 conformance.
@@ -614,6 +650,7 @@ pub fn build_exth(
     language: &str,
     dict_in_language: &str,
     dict_out_language: &str,
+    identifier: &str,
     headword_chars: &HashSet<u32>,
     creator_tag: bool,
     cover_offset: Option<u32>,
@@ -638,18 +675,27 @@ pub fn build_exth(
     };
     records.push(exth_record(100, author_out.as_bytes()));
 
-    // EXTH 113/504 (ASIN/ASIN2) are deliberately absent. kindlegen writes
-    // neither, and the MOBI7 extractor reads either one as the book's ASIN:
-    // with a key present it asks coverArtService for the library tile, and a
-    // sideloaded dictionary's UUID has no store entry, so the request fails
-    // and the tile stays blank. Without the tags the extractor synthesizes
-    // its `*SHA1` key and builds the tile from the embedded cover (verified
-    // on 5.16.2.1.1: the catalog then holds a thumbnail file that exists).
+    // Stable dictionary identity. The reader's Dictionary.getASIN() is this
+    // 113 value (MobiDictionary -> BookItem.getAsin -> EXTH 113); Vocabulary
+    // Builder keys DICT_INFO on it, so withdrawing the tag silently disables
+    // lookup recording. 504 mirrors the value for parity with Amazon's store
+    // dictionaries; the MOBI EXTH parser does not read 504. EXTH 501 stays
+    // absent: kindlegen omits it and Vocabulary Builder does not need it.
+    let content_id = dictionary_content_id(
+        identifier,
+        title,
+        author_out,
+        dict_in_language,
+        dict_out_language,
+    );
+    records.push(exth_record(113, content_id.as_bytes()));
 
     // Updated title (503). Dictionaries are always reflowable, so safe to emit.
     if !title.is_empty() {
         records.push(exth_record(503, title.as_bytes()));
     }
+
+    records.push(exth_record(504, content_id.as_bytes()));
 
     // EXTH 542 - content-dependent 4-byte hash
     let title_bytes = if title.is_empty() {
@@ -844,6 +890,7 @@ mod tests {
             "de",
             "ja",
             "de",
+            "TestDictionaryIdentity",
             &chars,
             false,
             None,
@@ -877,6 +924,7 @@ mod tests {
             "en",
             "en",
             "fr",
+            "TestDictionaryIdentity",
             &chars,
             false,
             None,
@@ -905,6 +953,7 @@ mod tests {
             "en",
             "el",
             "en",
+            "TestDictionaryIdentity",
             &chars,
             false,
             None,
@@ -1291,7 +1340,40 @@ mod tests {
     }
 
     #[test]
-    fn test_dictionary_exth_omits_asins_and_501() {
+    fn dictionary_content_id_prefers_an_opf_uuid() {
+        assert_eq!(
+            dictionary_content_id(
+                "urn:uuid:22CB9524-8A52-4B75-B5CB-C4FDF9BA169C",
+                "Dictionary",
+                "Author",
+                "el",
+                "en",
+            ),
+            "22cb9524-8a52-4b75-b5cb-c4fdf9ba169c"
+        );
+    }
+
+    #[test]
+    fn dictionary_content_id_derives_only_from_a_non_uuid_identifier() {
+        let first = dictionary_content_id("LemmaGreekENEL", "Old title", "Old author", "el", "en");
+        let rebuilt =
+            dictionary_content_id("LemmaGreekENEL", "New title", "New author", "el", "en");
+        let distinct =
+            dictionary_content_id("LemmaGreekELEL", "New title", "New author", "el", "el");
+
+        assert!(is_uuid(&first));
+        assert_eq!(
+            first, rebuilt,
+            "metadata edits must not change dictionary identity"
+        );
+        assert_ne!(
+            first, distinct,
+            "different OPF identifiers must stay distinct"
+        );
+    }
+
+    #[test]
+    fn test_dictionary_exth_carries_matching_content_ids_without_501() {
         let mut chars = HashSet::new();
         chars.insert(0x0041); // A
         chars.insert(0x03B1); // alpha
@@ -1303,6 +1385,7 @@ mod tests {
             "en",
             "el",
             "en",
+            "TestDictionaryIdentity",
             &chars,
             false,
             None,
@@ -1320,18 +1403,15 @@ mod tests {
             find_record(&records, 532).is_some(),
             "Dict should have EXTH 532"
         );
-        // An ASIN routes the library tile to coverArtService, which has no
-        // entry for a sideloaded dictionary and leaves the tile blank.
+        let id_113 = find_record(&records, 113).expect("Dict should have EXTH 113");
+        let id_504 = find_record(&records, 504).expect("Dict should have EXTH 504");
         assert!(
-            find_record(&records, 113).is_none(),
-            "Dict must not carry EXTH 113"
+            !id_113.is_empty(),
+            "Dict content identifier must not be empty"
         );
-        assert!(
-            find_record(&records, 504).is_none(),
-            "Dict must not carry EXTH 504"
-        );
-        // Dictionaries never carry a document type: it is not needed and
-        // changes the reader chrome.
+        assert_eq!(id_113, id_504, "EXTH 113 and 504 must carry the same value");
+        // Vocabulary Builder does not need a document type, and dictionaries
+        // must retain their existing navigation behavior.
         assert!(
             find_record(&records, 501).is_none(),
             "Dict should not have EXTH 501"
@@ -1340,7 +1420,7 @@ mod tests {
             find_record(&records, 112).is_none(),
             "Dict should not have EXTH 112"
         );
-        println!("  \u{2713} Dict EXTH: no 113/504, has 531/532, no 501/112");
+        println!("  \u{2713} Dict EXTH: matching 113/504, has 531/532, no 501/112");
     }
 
     /// kindlegen writes EXTH 532 from dc:Language when the OPF has no
@@ -1357,6 +1437,7 @@ mod tests {
             "ja",
             "ja",
             "",
+            "TestDictionaryIdentity",
             &chars,
             false,
             None,

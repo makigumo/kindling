@@ -9281,6 +9281,53 @@ p { margin: 0.3em 0; }
         );
     }
 
+    /// kindlegen and the five store MOBI dictionaries all ship 240-high
+    /// library tiles. A 3:4 cover is the widest case in that set and lands on
+    /// 180x240; the old 330x470 box produced 330x440.
+    #[test]
+    fn dictionary_thumbnail_is_240_high() {
+        let img = image::RgbImage::from_fn(600, 800, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let tile = mobi::build_thumbnail_record(&jpeg).expect("tile");
+        let decoded = image::load_from_memory(&tile).expect("decode tile");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (180, 240),
+            "a 3:4 cover must become a 180x240 tile"
+        );
+    }
+
+    /// A dictionary carries 113/504 but no 501, so `kindling thumbnail` has to
+    /// fall back to the CDE type the firmware itself uses for that shape:
+    /// `EBOK`. The catalog observed on a Paperwhite 3 named the file
+    /// `thumbnail_<uuid>_EBOK_portrait.jpg`.
+    #[test]
+    fn dictionary_device_thumbnail_defaults_to_ebok() {
+        let dir = TempDir::new("dict_device_thumb");
+        let jpeg = make_test_jpeg();
+        let opf = create_dict_fixture_with_cover(dir.path(), &[("word", &["words"])], &jpeg);
+        let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
+        let path = dir.path().join("dictionary.mobi");
+        fs::write(&path, &data).unwrap();
+
+        let thumb = crate::mobi_rewrite::extract_device_thumbnail(&path)
+            .expect("a dictionary with 113 and a tile must yield a device thumbnail");
+        assert!(!thumb.asin.is_empty(), "EXTH 113 must supply the ASIN");
+        assert_eq!(
+            thumb.cde_type, "EBOK",
+            "a 113-bearing MOBI without 501 is filed under EBOK"
+        );
+        assert_eq!(&thumb.image[..2], &[0xFF, 0xD8], "tile must be a JPEG");
+    }
+
     /// kindlegen ships a RESC record with every dictionary; with no images it
     /// is the record the header's first-image word names.
     #[test]
@@ -9373,19 +9420,34 @@ p { margin: 0.3em 0; }
     }
 
     #[test]
-    fn test_dict_exth_omits_asin_tags() {
-        let dir = TempDir::new("dict_exth_asin");
+    fn test_dict_exth_113_and_504_are_matching_stable_ids() {
+        let dir = TempDir::new("dict_exth_identity");
         let opf = create_dict_fixture(dir.path(), &[("word", &["words"])]);
         let data = build_mobi_bytes(&opf, dir.path(), true, false, None);
         let (_, _, offsets) = parse_palmdb(&data);
         let rec0 = get_record(&data, &offsets, 0);
         let exth = parse_exth_records(rec0);
 
-        // Both tags read as the ASIN, which sends the library tile to
-        // coverArtService; a sideloaded dictionary has no store entry there,
-        // so the tile never gets a file.
-        assert!(!exth.contains_key(&113), "EXTH 113 must remain absent");
-        assert!(!exth.contains_key(&504), "EXTH 504 must remain absent");
+        let id_113 = exth
+            .get(&113)
+            .and_then(|values| values.first())
+            .expect("Dict EXTH 113 should be present");
+        let id_504 = exth
+            .get(&504)
+            .and_then(|values| values.first())
+            .expect("Dict EXTH 504 should be present");
+        assert!(!id_113.is_empty(), "Dict identity must not be empty");
+        assert_eq!(id_113, id_504, "EXTH 113 and 504 must match");
+        assert_eq!(
+            std::str::from_utf8(id_113).unwrap(),
+            crate::exth::dictionary_content_id(
+                "TestDictionaryIdentity",
+                "Test Dict",
+                "Tester",
+                "en",
+                "en",
+            )
+        );
         assert!(!exth.contains_key(&501), "EXTH 501 must remain absent");
     }
 

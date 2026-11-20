@@ -206,8 +206,8 @@ pub enum RewriteError {
     NoCoverRecord,
     /// Cover image bytes did not look like a supported image format.
     UnsupportedCoverFormat,
-    /// The book carries no EXTH 113 / 501 pair (or no EXTH 202 thumbnail), so
-    /// the firmware has no filename to file a device-side cover under.
+    /// The file carries no EXTH 113 (or no EXTH 202 thumbnail), so the
+    /// firmware has no filename to file a device-side cover under.
     NoDeviceCoverKey,
 }
 
@@ -218,8 +218,8 @@ impl fmt::Display for RewriteError {
             RewriteError::NotAMobi(s) => write!(f, "not a MOBI file: {}", s),
             RewriteError::NoDeviceCoverKey => write!(
                 f,
-                "no EXTH 113/501 pair and thumbnail to build a device cover from; \
-                 rebuild the book with --doc-type ebok"
+                "no EXTH 113 and EXTH 202 thumbnail to build a device cover from; \
+                 books need --doc-type ebok, dictionaries carry 113 automatically"
             ),
             RewriteError::DrmEncrypted => write!(f, "file is DRM-encrypted; refusing to rewrite"),
             RewriteError::MalformedHeader(s) => write!(f, "malformed MOBI header: {}", s),
@@ -358,7 +358,8 @@ pub fn rewrite_mobi_metadata(
 pub struct DeviceThumbnail {
     /// EXTH 113. Half of the filename the firmware keys a cover on.
     pub asin: String,
-    /// EXTH 501, e.g. `EBOK`. The other half.
+    /// EXTH 501, e.g. `EBOK`, or the `EBOK` default the firmware files a
+    /// 113-bearing MOBI under when 501 is absent (dictionaries).
     pub cde_type: String,
     /// The image bytes from the record EXTH 202 points at.
     pub image: Vec<u8>,
@@ -366,8 +367,12 @@ pub struct DeviceThumbnail {
 
 /// Pull the device-side cover thumbnail out of a built MOBI/AZW3.
 ///
-/// Fails when the book carries no EXTH 113 / 501 pair, because without it the
-/// firmware has no filename to look under and there is nothing to write.
+/// Fails when the file carries no EXTH 113, because without it the firmware
+/// has no filename to look under and there is nothing to write. A 501 record
+/// supplies the CDE half of the filename; when it is absent the firmware files
+/// a 113-bearing MOBI under `EBOK` (the catalog path observed for a wadoku
+/// dictionary was `thumbnail_<uuid>_EBOK_portrait.jpg`), so the same default
+/// is used here.
 pub fn extract_device_thumbnail(input: &Path) -> Result<DeviceThumbnail, RewriteError> {
     let bytes = fs::read(input)?;
     let parsed = parse_mobi(&bytes)?;
@@ -383,7 +388,9 @@ pub fn extract_device_thumbnail(input: &Path) -> Result<DeviceThumbnail, Rewrite
     };
 
     let asin = exth_string(EXTH_ASIN_IDENTIFIER).ok_or(RewriteError::NoDeviceCoverKey)?;
-    let cde_type = exth_string(EXTH_CDE_TYPE).ok_or(RewriteError::NoDeviceCoverKey)?;
+    // 501 is optional: the firmware defaults a 113-bearing MOBI to EBOK when
+    // the record is absent, which is the path a sideloaded dictionary takes.
+    let cde_type = exth_string(EXTH_CDE_TYPE).unwrap_or_else(|| "EBOK".to_string());
 
     // A path separator in either half would let the filename escape
     // system/thumbnails. Both come from a file we did not necessarily build.
@@ -392,7 +399,7 @@ pub fn extract_device_thumbnail(input: &Path) -> Result<DeviceThumbnail, Rewrite
         .any(|s| s.contains(['/', '\\']) || s == &".." || s.is_empty())
     {
         return Err(RewriteError::MalformedHeader(format!(
-            "EXTH 113/501 are {asin:?}/{cde_type:?}, which cannot form a filename"
+            "EXTH 113/CDE are {asin:?}/{cde_type:?}, which cannot form a filename"
         )));
     }
 

@@ -2352,10 +2352,9 @@ fn encode_under_cap(img: &image::DynamicImage, quality: u8) -> Option<Vec<u8>> {
 
 /// Downscale an image to a library-thumbnail sized JPEG.
 ///
-/// Produces a JPEG at roughly 160x240 (Calibre's convention) so that modern
-/// Kindle firmwares can render the library grid tile without decoding the
-/// full-size cover. The aspect ratio of the source is preserved and the
-/// image is fit inside the bounding box.
+/// Produces a height-240 JPEG, the height kindlegen and all five store MOBI
+/// dictionaries use (their widths are 150-180 for the covers in hand). The
+/// aspect ratio is preserved and the image is fit inside the bounding box.
 ///
 /// Returns None if the input cannot be decoded; the caller should fall back
 /// to emitting no thumbnail rather than failing the build.
@@ -2435,10 +2434,12 @@ pub(crate) fn build_resc_record(opf: &OPFData, cover_href: Option<&str>) -> Vec<
 }
 
 pub(crate) fn build_thumbnail_record(cover_bytes: &[u8]) -> Option<Vec<u8>> {
-    // Target bounding box. Calibre's AZW3 output uses 160x240 for thumbnails
-    // on a typical 2:3 cover, which gives about 10 KB per JPEG at q80.
+    // Target bounding box. Height is the normalized dimension: kindlegen and
+    // the five store MOBI dictionaries all write 240-high tiles. The wide box
+    // leaves a 3:4 cover at 180x240 while a 2:3 cover lands on 150x240, both
+    // of which occur in the store set.
     const THUMB_BOX_W: u32 = 330;
-    const THUMB_BOX_H: u32 = 470;
+    const THUMB_BOX_H: u32 = 240;
     const THUMB_QUALITY: u8 = 80;
 
     // A transparent cover would otherwise reach the JPEG encoder with its
@@ -8844,6 +8845,7 @@ fn build_record0(
             &opf.language,
             &opf.dict_in_language,
             &opf.dict_out_language,
+            &opf.identifier,
             headword_chars,
             creator_tag,
             cover_offset,

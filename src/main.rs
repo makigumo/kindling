@@ -609,17 +609,19 @@ enum Commands {
         dictionary: Option<Vec<String>>,
     },
 
-    /// Install a book's cover thumbnail onto a mounted Kindle so the library
-    /// tile shows real art.
+    /// Install a book's or dictionary's cover thumbnail onto a mounted Kindle
+    /// so the library tile shows real art.
     ///
-    /// Only useful for books built with `--doc-type ebok`. That flag buys a
-    /// lock screen cover, but it also makes the firmware treat EXTH 113 as a
-    /// real ASIN: it queries the Amazon store, finds nothing for a sideloaded
-    /// identifier, and caches a "No image available" image as the library
-    /// tile. This overwrites that cached file with the book's own thumbnail,
-    /// which fixes the tile and leaves the lock screen cover working. A copy
-    /// also goes to `amazon-cover-bug/` so it can be restored after a sync
-    /// clobbers it, the same convention calibre uses.
+    /// Use it for content that carries EXTH 113: books built with `--doc-type
+    /// ebok`, and dictionaries (which carry 113/504). That tag buys a lock
+    /// screen cover and the Vocabulary Builder key, but it also makes the
+    /// firmware treat EXTH 113 as a real ASIN: it queries the Amazon store,
+    /// finds nothing for a sideloaded identifier, and caches a "No image
+    /// available" image as the library tile. This overwrites that cached file
+    /// with the content's own thumbnail, which fixes the tile and leaves the
+    /// lock screen cover working. A copy also goes to `amazon-cover-bug/` so it
+    /// can be restored after a sync clobbers it, the same convention calibre
+    /// uses.
     #[command(version)]
     Thumbnail {
         /// Built MOBI/AZW3 to take the thumbnail from
@@ -1561,10 +1563,10 @@ fn main() {
     }
 }
 
-/// Install a book's own thumbnail over the store placeholder the firmware
-/// cached, so the library tile shows the cover instead of "No image
-/// available". See `src/thumbnail.rs` for why this cannot be done from inside
-/// the book.
+/// Install a book's or dictionary's own thumbnail over the store placeholder
+/// the firmware cached, so the library tile shows the cover instead of "No
+/// image available". See `src/thumbnail.rs` for why this cannot be done from
+/// inside the file.
 fn do_thumbnail(input: &Path, kindle: &Path) {
     match kindling::thumbnail::install(input, kindle) {
         Ok(installed) => {

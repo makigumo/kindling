@@ -2,15 +2,17 @@
 //!
 //! ## Why this exists
 //!
-//! A sideloaded book gets a lock screen cover only if it carries EXTH 113 and
-//! EXTH 501 (see `--doc-type ebok` and issue #26). But those same records make
-//! the firmware treat 113 as a real ASIN: it asks the Amazon store, finds
-//! nothing for a sideloaded UUID, and caches an Amazon "No image available"
-//! image at `system/thumbnails/thumbnail_<113>_<501>_portrait.jpg`. That
-//! cached file becomes the library tile, so opting into a lock screen cover
-//! costs you the shelf art.
+//! Sideloaded content that carries EXTH 113 (books built with `--doc-type
+//! ebok`, and dictionaries, which write 113/504) gets a lock screen cover and
+//! a Vocabulary Builder key. But the firmware treats 113 as a real ASIN: it
+//! asks the Amazon store, finds nothing for a sideloaded UUID, and caches an
+//! Amazon "No image available" image at
+//! `system/thumbnails/thumbnail_<113>_<CDE>_portrait.jpg`. That cached file
+//! becomes the library tile, so opting into a lock screen cover costs you the
+//! shelf art. The CDE half is EXTH 501 when present; a 113-bearing dictionary
+//! without 501 is filed under `EBOK`, which is the name written here.
 //!
-//! Overwriting that file with the book's own thumbnail fixes the tile and
+//! Overwriting that file with the content's own thumbnail fixes the tile and
 //! leaves the lock screen cover working, both verified on a Paperwhite 5
 //! running 5.19.2. This is the same move calibre makes, and its
 //! `amazon-cover-bug/` directory is a backup copy for restoring the file after
