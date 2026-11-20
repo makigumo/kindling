@@ -4100,27 +4100,21 @@ fn build_text_content_by_letter(
                 // Carries idx markup but produced no entry, so nothing else
                 // will emit it. Read as front matter rather than dropped.
             }
-            // Non-dictionary file: clean it and extract body content.
+            // Non-dictionary file: extract its body and keep the classes for
+            // now. The stylesheet is compiled after every file has been read,
+            // and the TOC's `.toctext { text-indent: 1em }` has to reach this
+            // body as `width="1em"` before the strip removes the class.
             //
-            // strip_idx_markup removes the `<body>` tags before this runs, so
-            // body_re can never match here and the whole cleaned document is
-            // the body. That includes the `<head><guide></guide></head>` the
-            // strip rewrites the head into, which then sits inside the blob's
-            // own `<body>`. Drop it: the assembler writes the document's one
+            // The `<head><guide></guide></head>` a strip would leave behind is
+            // dropped here instead: the assembler writes the document's one
             // real head, and a second one in mid-body is junk the reader has
             // to skip past.
-            // Compile the one declaration the dictionary pass would otherwise
-            // throw away with the `style=` attribute it sits in: the cover's
-            // `<h1 style="text-align: center">`, which kindlegen ships as
-            // `align="center"`. Without it the cover's title lines render
-            // left-aligned above a centred logo.
             let centred = translate_css_for_legacy_readers(&content);
-            let cleaned = strip_idx_markup(&centred);
-            let cleaned = head_in_body_re.replace_all(&cleaned, "").into_owned();
-            let body = match body_re.captures(&cleaned) {
+            let body = match body_re.captures(&centred) {
                 Some(cap) => cap.get(1).unwrap().as_str().trim().to_string(),
-                None => cleaned,
+                None => centred,
             };
+            let body = head_in_body_re.replace_all(&body, "").into_owned();
             let doc_href = doc_hrefs.get(file_index).map(|s| s.as_str()).unwrap_or("");
             let (body, pending) =
                 replace_hrefs_with_filepos(&body, doc_href, file_index, &documents);
@@ -4148,6 +4142,14 @@ fn build_text_content_by_letter(
     // the `idx:` markup itself.
     use rayon::prelude::*;
     let compiled_css = crate::dict_css::compile_style_blocks(&dict_styles.concat());
+    // Front matter gets the same stylesheet treatment as the entries. The TOC
+    // is the reason: kindlegen compiles its `.toctext` indentation to
+    // `<p width="1em">`, while a front-matter body stripped before this pass
+    // lost the class and shipped as a flat `<p>`.
+    for section in &mut front_matter_sections {
+        let inlined = crate::dict_css::apply(section, &compiled_css.effects);
+        *section = strip_idx_markup(&inlined);
+    }
     // Cross-references are rewritten here, per entry, and deliberately before
     // the needles below are cut: replacing an href changes the entry's byte
     // length, and a needle taken from the pre-rewrite text would match

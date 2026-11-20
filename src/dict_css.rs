@@ -146,6 +146,9 @@ pub(crate) struct Effect {
     pub indent: bool,
     /// A top margin, as the value of the element's own `height` attribute.
     pub height: Option<String>,
+    /// `text-indent`, as the value of the element's own `width` attribute.
+    /// kindlegen compiles the TOC's `.toctext { text-indent: 1em }` this way.
+    pub width: Option<String>,
     /// A bottom margin, as the value of a spacer `<div>` written after the
     /// element.
     pub spacer: Option<String>,
@@ -181,6 +184,7 @@ impl Effect {
             && self.background.is_none()
             && !self.indent
             && self.height.is_none()
+            && self.width.is_none()
             && self.spacer.is_none()
             && self.align.is_none()
             && self.hidden.is_none()
@@ -224,6 +228,9 @@ impl Effect {
             self.height = other.height.clone();
         } else if other.height_unset {
             self.height = None;
+        }
+        if other.width.is_some() {
+            self.width = other.width.clone();
         }
         if other.spacer.is_some() {
             self.spacer = other.spacer.clone();
@@ -322,6 +329,9 @@ impl Effect {
         let mut out = String::new();
         if let Some(h) = &self.height {
             out.push_str(&format!(" height=\"{}\"", h));
+        }
+        if let Some(w) = &self.width {
+            out.push_str(&format!(" width=\"{}\"", w));
         }
         if let Some(a) = &self.align
             && carries_align(element)
@@ -1131,6 +1141,10 @@ fn compile_declarations(block: &str, align_expressible: bool) -> (Effect, Vec<St
             }
             "margin-top" => match height_value(&value) {
                 Some(h) => effect.height = Some(h),
+                None => consumed = false,
+            },
+            "text-indent" => match height_value(&value) {
+                Some(w) => effect.width = Some(w),
                 None => consumed = false,
             },
             "margin-bottom" if unsets(&value) => {
@@ -2203,6 +2217,18 @@ v { margin-left: 0.4em; }",
         assert_eq!(
             apply("<p>t</p>", &e),
             r##"<p height="20"><blockquote>t</blockquote></p><div height="30"></div>"##
+        );
+    }
+
+    #[test]
+    fn text_indent_becomes_a_width_attribute() {
+        // The Wadoku TOC indents its rows with `.toctext { text-indent: 1em }`.
+        // kindlegen ships `<p width="1em">`; a bare `<p>` loses the whole
+        // hierarchy the TOC's headings are meant to show.
+        let e = effects_of(".toctext { text-indent: 1em; }");
+        assert_eq!(
+            apply(r#"<p class="toctext">x</p>"#, &e),
+            r#"<p class="toctext" width="1em">x</p>"#
         );
     }
 
