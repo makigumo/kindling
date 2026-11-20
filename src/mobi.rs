@@ -3978,7 +3978,9 @@ type AssembledDictionaryText = (
 ///
 /// Entries are kept in file order (matching what `find_entry_positions` expects)
 /// and split into sections separated by `<mbp:pagebreak/>` tags whenever the
-/// accumulated section size would exceed 30 MB.
+/// accumulated section size would exceed 30 MB. A page break also closes every
+/// source content document, which is where kindlegen's breaks sit; the source's
+/// own breaks are kept.
 ///
 /// Non-dictionary spine items (cover, usage guide, copyright, etc.) are included
 /// before the dictionary entries so that front matter is preserved. The
@@ -4156,12 +4158,11 @@ fn build_text_content_by_letter(
         stripped_entries.push(text);
     }
 
-    // The runs between entries, cleaned the same way (issue #42). Every entry
-    // contribution already ends `<hr/><mbp:pagebreak/>`, so a run that starts
-    // with a separator of its own would draw a second one; the front of each
-    // run is trimmed of any mix of those and whitespace. Only the front: a
-    // break at the END of a run is the one that belongs before the next
-    // entry, and an entry contributes no leading break itself.
+    // The runs between entries, cleaned the same way (issue #42). An entry
+    // contribution ends with `<hr/>`, so a run that starts with a rule of its
+    // own would draw a second one; the front of each run is trimmed of that
+    // and whitespace. A page break is left alone: kindlegen keeps the source's
+    // breaks, and those are what separate the entries in a PyGlossary build.
     let mut stripped_gaps: Vec<String> = entry_gaps
         .par_iter()
         .map(|gap| trim_leading_separators(&strip_idx_markup(gap)))
@@ -4202,14 +4203,37 @@ fn build_text_content_by_letter(
             && !current_chunk.is_empty()
             && current_chunk.len() + gap.len() + stripped.len() > KINDLE_HTML_SIZE_LIMIT
         {
+            // A split section is its own HTML document, so kindlegen puts a
+            // page break at that boundary too. Keep it off a section that
+            // already ends in one, which is what a source break leaves behind.
+            if !current_chunk.trim_end().ends_with("<mbp:pagebreak/>") {
+                current_chunk.push_str("<mbp:pagebreak/>");
+            }
             dict_sections.push(current_chunk);
             current_chunk = String::new();
         }
         current_chunk.push_str(gap);
         current_chunk.push_str(stripped);
-    }
-    for tail in &stripped_tails {
-        current_chunk.push_str(tail);
+
+        // The source files are the page boundaries kindlegen writes, not the
+        // entries: the Wadoku OPF has 71 content files and kindlegen puts a
+        // break after each one. Emit the file's tail here, where it belongs,
+        // rather than after the last entry of the whole dictionary.
+        let last_in_file = entry_files.get(i + 1).copied() != entry_files.get(i).copied();
+        if last_in_file {
+            let file = entry_files.get(i).copied().unwrap_or(0);
+            if let Some(tail_index) = tail_gap_files.iter().position(|&f| f == file) {
+                current_chunk.push_str(&stripped_tails[tail_index]);
+            }
+            // The final document gets the body tail's break, which the
+            // assembler writes after the frameset; every earlier document
+            // needs its own here.
+            if i + 1 < stripped_entries.len()
+                && !current_chunk.trim_end().ends_with("<mbp:pagebreak/>")
+            {
+                current_chunk.push_str("<mbp:pagebreak/>");
+            }
+        }
     }
     if !current_chunk.is_empty() {
         dict_sections.push(current_chunk);
@@ -4235,11 +4259,10 @@ fn build_text_content_by_letter(
     // Join front matter with pagebreaks
     let fm_body = front_matter_sections.join("<mbp:pagebreak/>");
 
-    // Every section already ends with the page break strip_idx_markup writes
-    // after its last entry, so the sections are concatenated as they are; a
-    // join separator would put two breaks in a row at every 30 MB seam. The
-    // result is wrapped in <mbp:frameset> if the source dictionary HTML used
-    // one (required for Kindle dictionary rendering).
+    // The sections are concatenated: every one but the last already ends with
+    // the page break its source-document boundary wrote. The result is wrapped
+    // in <mbp:frameset> if the source dictionary HTML used one (required for
+    // Kindle dictionary rendering).
     let dict_body = dict_sections.concat();
     let dict_body = if has_frameset {
         format!("<mbp:frameset>{}</mbp:frameset>", dict_body)
@@ -4293,22 +4316,18 @@ fn build_text_content_by_letter(
     )
 }
 
-/// Trim any run of whitespace, `<hr/>` and `<mbp:pagebreak/>` from the front
-/// of a between-entries run.
+/// Trim any run of whitespace and `<hr/>` from the front of a between-entries
+/// run.
 ///
-/// The entry before it already wrote that pair, so replaying the source's own
-/// separator here would draw it twice.
+/// The entry before it already wrote the rule, so replaying the source's own
+/// separator here would draw it twice. A page break is deliberately not in
+/// this list: kindlegen passes the source's breaks through, and removing them
+/// would make a PyGlossary dictionary lose the only breaks it has.
 fn trim_leading_separators(text: &str) -> String {
     let mut rest = text.trim_start();
     loop {
         let before = rest;
-        for sep in [
-            "<hr/>",
-            "<hr />",
-            "<hr>",
-            "<mbp:pagebreak/>",
-            "<mbp:pagebreak />",
-        ] {
+        for sep in ["<hr/>", "<hr />", "<hr>"] {
             if let Some(stripped) = rest.strip_prefix(sep) {
                 rest = stripped.trim_start();
             }
@@ -4853,22 +4872,13 @@ pub(crate) fn strip_idx_markup(html: &str) -> String {
         result = std::borrow::Cow::Owned(entry_open.replace_all(&result, "").to_string());
     }
     if result.contains("</idx:entry>") {
-        // Close the entry with a horizontal rule and a page break. The rule is
-        // what the Kindle Publishing Guidelines ask for between entries, and
-        // entry_span / is_entry_boundary key on it. The page break is what
-        // Amazon's own dictionaries put between entries; without it the lookup
-        // popup can scroll past the end of the matched entry into the next one
-        // (PR #52). A source that already carries a page break after
-        // </idx:entry> loses it, because nothing outside <idx:entry> survives
-        // (issue #42), so it is added unconditionally here. kindlegen does not
-        // add one on its own, it only keeps the source's. The scanners that
-        // look for <hr/> match it before the page break, so entry spans and
-        // record chunking are unchanged.
-        result = std::borrow::Cow::Owned(
-            entry_close
-                .replace_all(&result, "<hr/><mbp:pagebreak/>")
-                .to_string(),
-        );
+        // Close the entry with a horizontal rule. The rule is what the Kindle
+        // Publishing Guidelines ask for between entries, and entry_span /
+        // is_entry_boundary key on it. The page break is not part of an entry:
+        // kindlegen writes one at each source-document boundary, and kindling
+        // does the same in `build_text_content_by_letter`. A source that
+        // already carries one keeps it through the gap/tail pass.
+        result = std::borrow::Cow::Owned(entry_close.replace_all(&result, "<hr/>").to_string());
     }
 
     // Number ordered-list items with `value="N"` so list markers render in the
@@ -6008,24 +6018,16 @@ mod record_split_tests {
     }
 
     #[test]
-    fn entry_close_appends_pagebreak_after_hr() {
-        // A bare <hr/> between entries lets the popup scroll into the next
-        // article; every </idx:entry> must close with hr + pagebreak.
+    fn entry_close_appends_only_the_horizontal_rule() {
+        // kindlegen does not put a page break after every entry. It writes
+        // one at each source-document boundary, which the dictionary
+        // assembler does; the entry close itself is just the rule.
         let out = strip_idx_markup(
             "<idx:entry><idx:orth value=\"alpha\"><h5>alpha</h5></idx:orth><p>first</p></idx:entry>\
              <idx:entry><idx:orth value=\"bravo\"><h5>bravo</h5></idx:orth><p>second</p></idx:entry>",
         );
-        assert_eq!(
-            out.matches("<hr/><mbp:pagebreak/>").count(),
-            2,
-            "every </idx:entry> closes with hr+pagebreak: {out}"
-        );
-        for (i, _) in out.match_indices("<hr/>") {
-            assert!(
-                out[i + 5..].starts_with("<mbp:pagebreak/>"),
-                "bare <hr/> separator at byte {i}: {out}"
-            );
-        }
+        assert_eq!(out.matches("<hr/>").count(), 2, "{out}");
+        assert_eq!(out.matches("<mbp:pagebreak/>").count(), 0, "{out}");
     }
 
     #[test]

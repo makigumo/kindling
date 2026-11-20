@@ -280,12 +280,10 @@ fn parity_simple_dict() {
     }
 }
 
-/// Every `<hr/>` separator must be followed by `<mbp:pagebreak/>`: a bare rule
-/// lets the lookup popup scroll into the next entry (PR #52). The simple_dict
-/// source carries a page break after each entry, which kindlegen keeps and
-/// kindling used to drop along with everything else outside `<idx:entry>`
-/// (issue #42). The tests above compare metadata only, which is why this
-/// divergence was invisible.
+/// The simple_dict source carries a page break after each entry. kindlegen
+/// keeps those breaks and adds its own trailing one; kindling must keep the
+/// source's breaks and not add one per entry. The tests above compare metadata
+/// only, which is why this divergence was invisible.
 #[test]
 fn parity_simple_dict_inter_entry_pagebreaks() {
     let kindling = kindling_build_parsed_in(
@@ -317,46 +315,16 @@ fn parity_simple_dict_inter_entry_pagebreaks() {
              <mbp:pagebreak/> lines; regenerate both"
         ));
     }
-    if k_breaks < k_hrs {
+    // kindling and kindlegen both keep the source's four inter-entry breaks
+    // and add one trailing break, so their totals must agree.
+    if k_breaks != g_breaks {
         diff.push(format!(
-            "kindling emits {k_hrs} <hr/> separators but only {k_breaks} page breaks \
-             (kindlegen: {g_breaks}) — a bare <hr/> boundary scrolls the popup \
-             into the next entry on device"
+            "kindling emits {k_breaks} page breaks, kindlegen emits {g_breaks}; \
+             kindling must keep the source's breaks and not add one per entry"
         ));
     }
-    // One page break per entry plus the one the body tail always carries.
-    // kindling's count is not compared to kindlegen's, because kindlegen only
-    // keeps the source's breaks and this fixture happens to carry them.
-    if k_breaks != k_hrs + 1 {
-        diff.push(format!(
-            "kindling emits {k_breaks} page breaks for {k_hrs} entries; expected one \
-             per entry plus the body tail"
-        ));
-    }
-    // Every <hr/> must be followed by <mbp:pagebreak/>. Spaces in between are
-    // allowed: pad_text_for_chunking fills the last gap between two tags of a
-    // record with spaces, and on a multi-record build that gap can be this
-    // one. An <hr/> directly followed by another <hr/> is an entry's own rule
-    // before the separator, and the separator is judged on its own.
-    let mut bare = 0;
-    let mut pos = 0;
-    while let Some(off) = k_text[pos..].windows(5).position(|w| w == b"<hr/>") {
-        let hr = pos + off;
-        let mut after = hr + 5;
-        while k_text.get(after) == Some(&b' ') {
-            after += 1;
-        }
-        let rest = &k_text[after..];
-        if !rest.starts_with(b"<mbp:pagebreak/>") && !rest.starts_with(b"<hr/>") {
-            bare += 1;
-            if bare <= 3 {
-                diff.push(format!("bare <hr/> separator at byte {hr}"));
-            }
-        }
-        pos = hr + 5;
-    }
-    if bare > 3 {
-        diff.push(format!("...and {} more bare <hr/> separators", bare - 3));
+    if k_hrs != 5 {
+        diff.push(format!("expected 5 entry separators, got {k_hrs}"));
     }
 
     if !diff.is_empty() {

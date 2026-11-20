@@ -6259,7 +6259,7 @@ p { margin: 0.3em 0; }
         }
 
         // Replaying a run must not draw a second separator: every entry
-        // already ends with the pair, and the source writes its own between
+        // already ends with the rule, and the source writes its own between
         // entries.
         assert!(
             !text.contains("<hr/><mbp:pagebreak/><hr/>"),
@@ -6553,12 +6553,12 @@ p { margin: 0.3em 0; }
 
         // Verify separators appear between entries, not entries running together
         assert!(
-            text.contains("a small animal<hr/><mbp:pagebreak/>"),
-            "Entry content should be followed by <hr/><mbp:pagebreak/>"
+            text.contains("a small animal<hr/>"),
+            "Entry content should be followed by <hr/>"
         );
         assert!(
-            text.contains("a loyal animal<hr/><mbp:pagebreak/>"),
-            "Entry content should be followed by <hr/><mbp:pagebreak/>"
+            text.contains("a loyal animal<hr/>"),
+            "Entry content should be followed by <hr/>"
         );
         println!(
             "  \u{2713} <hr/> separators present between dictionary entries ({} found)",
@@ -9531,7 +9531,10 @@ p { margin: 0.3em 0; }
         assert_eq!(read_u32_be(rec0, 16 + 80), 0, "dict_in must be zero");
         assert_eq!(read_u32_be(rec0, 16 + 84), 0, "dict_out must be zero");
         let exth = parse_exth_records(rec0);
-        assert!(!exth.contains_key(&531), "no EXTH 531 without an in-language");
+        assert!(
+            !exth.contains_key(&531),
+            "no EXTH 531 without an in-language"
+        );
         let out = exth.get(&532).expect("EXTH 532 should still carry de");
         assert_eq!(std::str::from_utf8(&out[0]).unwrap(), "de");
     }
