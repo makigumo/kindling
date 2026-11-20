@@ -8844,7 +8844,6 @@ fn build_record0(
             &opf.language,
             &opf.dict_in_language,
             &opf.dict_out_language,
-            &opf.identifier,
             headword_chars,
             creator_tag,
             cover_offset,
