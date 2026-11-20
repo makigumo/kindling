@@ -3819,9 +3819,10 @@ fn insert_dictionary_ncx_markers(
     owners
 }
 
-/// Resolve the markers in the final byte stream into the four fields a KF7
-/// NCX stores. Entries are sorted by their assembled positions because the
-/// dictionary writer moves all front matter ahead of its entries.
+/// Resolve the markers in the final byte stream into the fields a KF7 NCX
+/// stores. Entries are sorted by their assembled positions because the
+/// dictionary writer moves all front matter ahead of its entries; the KF7
+/// writer then reorders the nested rows breadth-first.
 ///
 /// `owners` says which nav entry's marker each entry resolves through; a row
 /// that names a place an earlier row already names shares that row's offset
@@ -3834,29 +3835,34 @@ fn build_dictionary_ncx_entries(
     text: &[u8],
     owners: &[usize],
 ) -> Vec<crate::kf8::Kf7NcxEntry> {
-    let mut resolved: Vec<(usize, String, usize)> = Vec::new();
+    let mut resolved: Vec<(usize, String, usize, String)> = Vec::new();
     let mut unresolved = 0usize;
     for (i, point) in nav_points.iter().enumerate() {
         let marker = dictionary_ncx_marker(owners[i]);
         match find_bytes(text, marker.as_bytes()) {
-            Some(at) => resolved.push((at + marker.len(), point.label.clone(), point.depth)),
+            Some(at) => resolved.push((
+                at + marker.len(),
+                point.label.clone(),
+                point.depth,
+                point.class.clone(),
+            )),
             None => unresolved += 1,
         }
     }
 
-    resolved.sort_by_key(|(offset, _, _)| *offset);
+    resolved.sort_by_key(|(offset, _, _, _)| *offset);
     let total = text.len();
-    let mut spans: Vec<(usize, usize, String)> = Vec::with_capacity(resolved.len());
-    for (i, (offset, label, depth)) in resolved.iter().enumerate() {
+    let mut spans: Vec<(usize, usize, String, String)> = Vec::with_capacity(resolved.len());
+    for (i, (offset, label, depth, class)) in resolved.iter().enumerate() {
         let end = resolved[i + 1..]
             .iter()
-            .filter(|(next, _, next_depth)| next > offset && next_depth <= depth)
-            .map(|(next, _, _)| *next)
+            .filter(|(next, _, next_depth, _)| next > offset && next_depth <= depth)
+            .map(|(next, _, _, _)| *next)
             .min()
             .unwrap_or(total);
         let repeated_later = resolved[i + 1..]
             .iter()
-            .any(|(next, _, next_depth)| next == offset && next_depth == depth);
+            .any(|(next, _, next_depth, _)| next == offset && next_depth == depth);
         spans.push((
             *offset,
             if repeated_later {
@@ -3865,17 +3871,19 @@ fn build_dictionary_ncx_entries(
                 end.saturating_sub(*offset)
             },
             label.clone(),
+            class.clone(),
         ));
     }
 
     let mut out = Vec::with_capacity(spans.len());
-    for (i, (offset, length, label)) in spans.iter().enumerate() {
+    for (i, (offset, length, label, class)) in spans.iter().enumerate() {
         let depth = resolved[i].2;
         out.push(crate::kf8::Kf7NcxEntry {
             offset: *offset,
             length: *length,
             label: label.clone(),
             depth,
+            class: class.clone(),
         });
     }
 
@@ -3897,12 +3905,13 @@ fn build_dictionary_ncx_entries(
 /// the nearest entry that begins later at the same or a shallower depth, and
 /// when several rows share an offset at one depth only the last of them owns
 /// the span, which is what kindlegen writes for a repeated target (its
-/// earlier rows are zero-length). Rows are emitted in text order.
+/// earlier rows are zero-length). Rows are fed in text order so spans can be
+/// cut; `build_kf7_ncx_indx` writes them in kindlegen's breadth-first order.
 fn build_book_ncx_entries(
     nav_points: &[crate::nav::NavPoint],
     text: &Kf7Text,
 ) -> Vec<crate::kf8::Kf7NcxEntry> {
-    let mut rows: Vec<(usize, usize, String)> = Vec::new();
+    let mut rows: Vec<(usize, usize, String, String)> = Vec::new();
     for point in nav_points {
         if point.label.is_empty() {
             continue;
@@ -3925,26 +3934,31 @@ fn build_book_ncx_entries(
             },
         };
         if offset < text.bytes.len() {
-            rows.push((offset, point.depth, point.label.clone()));
+            rows.push((
+                offset,
+                point.depth,
+                point.label.clone(),
+                point.class.clone(),
+            ));
         }
     }
 
     // Text order, which is the order the index is written in and the order a
     // reader walks the Go To list in.
-    rows.sort_by_key(|(offset, _, _)| *offset);
+    rows.sort_by_key(|(offset, _, _, _)| *offset);
     let total = text.bytes.len();
     let mut out = Vec::with_capacity(rows.len());
-    for (i, (offset, depth, label)) in rows.iter().enumerate() {
+    for (i, (offset, depth, label, class)) in rows.iter().enumerate() {
         let end = rows
             .iter()
-            .map(|(next, next_depth, _)| (*next, *next_depth))
+            .map(|(next, next_depth, _, _)| (*next, *next_depth))
             .filter(|(next, next_depth)| next > offset && next_depth <= depth)
             .map(|(next, _)| next)
             .min()
             .unwrap_or(total);
         let repeated_later = rows[i + 1..]
             .iter()
-            .any(|(next, next_depth, _)| next == offset && next_depth == depth);
+            .any(|(next, next_depth, _, _)| next == offset && next_depth == depth);
         out.push(crate::kf8::Kf7NcxEntry {
             offset: *offset,
             length: if repeated_later {
@@ -3954,6 +3968,7 @@ fn build_book_ncx_entries(
             },
             label: label.clone(),
             depth: *depth,
+            class: class.clone(),
         });
     }
     out

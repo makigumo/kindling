@@ -25,6 +25,9 @@ pub struct NavPoint {
     /// `<navPoint>` elements in the NCX, and drives the hierarchical
     /// (volume/chapter) on-device TOC (issue #19).
     pub depth: usize,
+    /// The `class` attribute, when the navigation document carries one.
+    /// kindlegen copies an NCX `navPoint class` into KF7 tag 5.
+    pub class: String,
 }
 
 /// Parse the EPUB navigation document declared in the OPF manifest and
@@ -93,7 +96,7 @@ fn parse_nav_xhtml(content: &str, nav_dir: &str) -> Vec<NavPoint> {
     // first <ol> is a top-level (depth 0) entry.
     let mut ol_depth: usize = 0;
     // Set while collecting the text of an <a> inside the TOC nav.
-    let mut current: Option<(String, Option<String>, String, usize)> = None;
+    let mut current: Option<(String, Option<String>, String, usize, String)> = None;
     let mut saw_marked_toc = false;
     let mut buf = Vec::new();
 
@@ -126,27 +129,31 @@ fn parse_nav_xhtml(content: &str, nav_dir: &str) -> Vec<NavPoint> {
                 } else if name == "ol" && in_toc_nav {
                     ol_depth += 1;
                 } else if name == "a" && in_toc_nav && current.is_none() {
-                    let href = e
-                        .attributes()
-                        .flatten()
-                        .find(|a| a.key.as_ref() == b"href")
-                        .map(|a| String::from_utf8_lossy(&a.value).to_string())
-                        .unwrap_or_default();
+                    let mut href = String::new();
+                    let mut class = String::new();
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"href" => href = String::from_utf8_lossy(&attr.value).to_string(),
+                            b"class" => class = String::from_utf8_lossy(&attr.value).to_string(),
+                            _ => {}
+                        }
+                    }
                     if !href.is_empty() && !links::is_external_href(&href) {
                         let (file, frag) = resolve_href(nav_dir, &href);
-                        current = Some((file, frag, String::new(), ol_depth.saturating_sub(1)));
+                        current =
+                            Some((file, frag, String::new(), ol_depth.saturating_sub(1), class));
                     }
                 }
             }
             Ok(ref event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
-                if let Some((_, _, label, _)) = current.as_mut() {
+                if let Some((_, _, label, _, _)) = current.as_mut() {
                     crate::xml_text::append(label, event);
                 }
             }
             Ok(Event::End(ref e)) => {
                 let name = local_name_lower(e.name().as_ref());
                 if name == "a" {
-                    if let Some((file, frag, label, depth)) = current.take() {
+                    if let Some((file, frag, label, depth, class)) = current.take() {
                         let label = collapse_whitespace(&label);
                         if !label.is_empty() && !file.is_empty() {
                             points.push(NavPoint {
@@ -154,6 +161,7 @@ fn parse_nav_xhtml(content: &str, nav_dir: &str) -> Vec<NavPoint> {
                                 fragment: frag,
                                 label,
                                 depth,
+                                class,
                             });
                         }
                     }
@@ -190,6 +198,9 @@ fn parse_toc_ncx(content: &str, ncx_dir: &str) -> Vec<NavPoint> {
     // Pending label text awaiting its <content src>; navLabel precedes
     // content inside a navPoint per the NCX spec.
     let mut pending_label: Option<String> = None;
+    // The class belongs to the navPoint that is collecting the label, not to
+    // the content element; hold it until that content arrives.
+    let mut pending_class = String::new();
     let mut in_text = false;
     let mut buf = Vec::new();
 
@@ -207,6 +218,12 @@ fn parse_toc_ncx(content: &str, ncx_dir: &str) -> Vec<NavPoint> {
                             navpoint_depth += 1;
                         }
                         pending_label = None;
+                        pending_class = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"class")
+                            .map(|a| String::from_utf8_lossy(&a.value).to_string())
+                            .unwrap_or_default();
                     }
                     "text" if in_nav_map => {
                         in_text = true;
@@ -234,6 +251,7 @@ fn parse_toc_ncx(content: &str, ncx_dir: &str) -> Vec<NavPoint> {
                                         fragment: frag,
                                         label,
                                         depth: navpoint_depth.saturating_sub(1),
+                                        class: pending_class.clone(),
                                     });
                                 }
                             }
@@ -428,10 +446,10 @@ mod nav_tests {
 <head/>
 <docTitle><text>Book</text></docTitle>
 <navMap>
-<navPoint id="n1"><navLabel><text>One</text></navLabel><content src="ch1.xhtml"/>
-  <navPoint id="n1a"><navLabel><text>One A</text></navLabel><content src="ch1.xhtml#a"/></navPoint>
+<navPoint id="n1" class="chapter"><navLabel><text>One</text></navLabel><content src="ch1.xhtml"/>
+  <navPoint id="n1a" class="section"><navLabel><text>One A</text></navLabel><content src="ch1.xhtml#a"/></navPoint>
 </navPoint>
-<navPoint id="n2"><navLabel><text>Two &amp; more</text></navLabel><content src="sub/ch2.xhtml"/></navPoint>
+<navPoint id="n2" class="chapter"><navLabel><text>Two &amp; more</text></navLabel><content src="sub/ch2.xhtml"/></navPoint>
 </navMap>
 </ncx>"#;
         let points = parse_toc_ncx(ncx, "");
@@ -439,9 +457,11 @@ mod nav_tests {
         assert_eq!(points[0].label, "One");
         assert_eq!(points[0].file_href, "ch1.xhtml");
         assert_eq!(points[0].depth, 0);
+        assert_eq!(points[0].class, "chapter");
         assert_eq!(points[1].label, "One A");
         assert_eq!(points[1].fragment.as_deref(), Some("a"));
         assert_eq!(points[1].depth, 1);
+        assert_eq!(points[1].class, "section");
         assert_eq!(points[2].label, "Two & more");
         assert_eq!(points[2].file_href, "sub/ch2.xhtml");
         assert_eq!(points[2].depth, 0);
@@ -459,12 +479,14 @@ mod nav_tests {
                 fragment: None,
                 label: "第一章".to_string(),
                 depth: 0,
+                class: String::new(),
             },
             NavPoint {
                 file_href: "text/ch2.xhtml".to_string(),
                 fragment: Some("x".to_string()),
                 label: "Two".to_string(),
                 depth: 0,
+                class: String::new(),
             },
         ];
         let spine = vec![

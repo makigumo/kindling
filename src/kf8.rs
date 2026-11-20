@@ -324,6 +324,9 @@ pub(crate) struct Kf7NcxEntry {
     pub length: usize,
     pub label: String,
     pub depth: usize,
+    /// NCX `navPoint class`, written to KF7 tag 5 when the hierarchy uses the
+    /// full kindlegen tag set.
+    pub class: String,
 }
 
 /// Derive the NCX nodes from the EPUB nav document (toc.ncx / nav.xhtml).
@@ -2884,51 +2887,186 @@ fn build_ncx_indx(title: &str, entries: &[NcxIndexEntry]) -> (Vec<Vec<u8>>, Vec<
 
 /// Build a KF7 NCX index and its label CNCX records.
 ///
-/// This is deliberately separate from [`build_ncx_indx`].  A KF7 NCX uses
-/// tags 1 (offset), 2 (length), 3 (label) and 4 (depth), omits KF8's tag 6
-/// fragment target, and labels its index entries with uppercase hexadecimal
-/// numbers. Kindle firmware 5.19.2 accepts this index in a dictionary while
-/// its text records retain kindling's empty TBS trailers (issue #64).
+/// A flat NCX uses tags 1 (offset), 2 (length), 3 (label) and 4 (depth), and
+/// labels its index entries with uppercase hexadecimal numbers. A nested one
+/// uses kindlegen's full set: tag 5 for the navPoint class, tag 21 for the
+/// parent, and tags 22/23 for the first and last child. Without 21/22/23 the
+/// Kindle's Go To list is flat even though tag 4 carries a depth, which is
+/// what this function used to ship for dictionaries and books whose nav has
+/// sections (issue #64).
+///
+/// Kindgen orders the nested rows breadth-first: top-level entries first, then
+/// each entry's children. The indexes in tags 21–23 are positions in that
+/// order, not in the document-order input.
 pub(crate) fn build_kf7_ncx_indx(entries: &[Kf7NcxEntry]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     if entries.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
-    let tag_defs = [
-        TagMeta {
-            number: 1,
-            values_per_entry: 1,
-            mask: 0x01,
-        },
-        TagMeta {
-            number: 2,
-            values_per_entry: 1,
-            mask: 0x02,
-        },
-        TagMeta {
-            number: 3,
-            values_per_entry: 1,
-            mask: 0x04,
-        },
-        TagMeta {
-            number: 4,
-            values_per_entry: 1,
-            mask: 0x08,
-        },
-    ];
-    let tagx = build_tagx(&[(1, 1, 0x01), (2, 1, 0x02), (3, 1, 0x04), (4, 1, 0x08)]);
+    // Clamp first, exactly as the KF8 resolver does: a document-order jump of
+    // more than one level is read as one level, so the parent walk below has
+    // a real parent to find.
+    let mut depths = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let depth = if i == 0 {
+            0
+        } else {
+            entry.depth.min(depths[i - 1] + 1)
+        };
+        depths.push(depth);
+    }
+
+    // Parent in document order: the nearest earlier entry one level up.
+    let mut parent_doc = vec![None; entries.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..entries.len() {
+        while stack
+            .last()
+            .is_some_and(|&parent| depths[parent] >= depths[i])
+        {
+            stack.pop();
+        }
+        parent_doc[i] = stack.last().copied();
+        stack.push(i);
+    }
+
+    // Kindgen writes the nodes breadth-first. `bfs` maps document order to
+    // that output order, and every tag 21/22/23 value is an output position.
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (depths[i], i));
+    let mut bfs = vec![0usize; entries.len()];
+    for (position, &doc_index) in order.iter().enumerate() {
+        bfs[doc_index] = position;
+    }
+    let mut parent = vec![None; entries.len()];
+    let mut first_child = vec![None; entries.len()];
+    let mut last_child = vec![None; entries.len()];
+    for &doc_index in &order {
+        let Some(parent_doc_index) = parent_doc[doc_index] else {
+            continue;
+        };
+        let child = bfs[doc_index];
+        let parent_index = bfs[parent_doc_index];
+        parent[child] = Some(parent_index);
+        first_child[parent_index].get_or_insert(child);
+        last_child[parent_index] = Some(child);
+    }
+
+    let hierarchical = depths.iter().any(|&depth| depth > 0);
+    let (tag_defs, tagx) = if hierarchical {
+        (
+            vec![
+                TagMeta {
+                    number: 1,
+                    values_per_entry: 1,
+                    mask: 0x01,
+                },
+                TagMeta {
+                    number: 2,
+                    values_per_entry: 1,
+                    mask: 0x02,
+                },
+                TagMeta {
+                    number: 3,
+                    values_per_entry: 1,
+                    mask: 0x04,
+                },
+                TagMeta {
+                    number: 4,
+                    values_per_entry: 1,
+                    mask: 0x08,
+                },
+                TagMeta {
+                    number: 5,
+                    values_per_entry: 1,
+                    mask: 0x10,
+                },
+                TagMeta {
+                    number: 21,
+                    values_per_entry: 1,
+                    mask: 0x20,
+                },
+                TagMeta {
+                    number: 22,
+                    values_per_entry: 1,
+                    mask: 0x40,
+                },
+                TagMeta {
+                    number: 23,
+                    values_per_entry: 1,
+                    mask: 0x80,
+                },
+            ],
+            build_tagx(&[
+                (1, 1, 0x01),
+                (2, 1, 0x02),
+                (3, 1, 0x04),
+                (4, 1, 0x08),
+                (5, 1, 0x10),
+                (21, 1, 0x20),
+                (22, 1, 0x40),
+                (23, 1, 0x80),
+            ]),
+        )
+    } else {
+        (
+            vec![
+                TagMeta {
+                    number: 1,
+                    values_per_entry: 1,
+                    mask: 0x01,
+                },
+                TagMeta {
+                    number: 2,
+                    values_per_entry: 1,
+                    mask: 0x02,
+                },
+                TagMeta {
+                    number: 3,
+                    values_per_entry: 1,
+                    mask: 0x04,
+                },
+                TagMeta {
+                    number: 4,
+                    values_per_entry: 1,
+                    mask: 0x08,
+                },
+            ],
+            build_tagx(&[(1, 1, 0x01), (2, 1, 0x02), (3, 1, 0x04), (4, 1, 0x08)]),
+        )
+    };
+
     let mut cncx = CncxBuilder::new();
     let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
 
-    for (i, entry) in entries.iter().enumerate() {
+    for (position, &doc_index) in order.iter().enumerate() {
+        let entry = &entries[doc_index];
         let label_offset = cncx.add(&entry.label);
-        let index_label = format!("{i:X}").into_bytes();
-        let values: [Vec<u32>; 4] = [
-            vec![entry.offset as u32],
-            vec![entry.length as u32],
-            vec![label_offset],
-            vec![entry.depth as u32],
-        ];
+        let index_label = format!("{position:X}").into_bytes();
+        let values: Vec<Vec<u32>> = if hierarchical {
+            let class_offset = cncx.add(&entry.class);
+            vec![
+                vec![entry.offset as u32],
+                vec![entry.length as u32],
+                vec![label_offset],
+                vec![depths[doc_index] as u32],
+                vec![class_offset],
+                parent[position].map(|p| vec![p as u32]).unwrap_or_default(),
+                first_child[position]
+                    .map(|c| vec![c as u32])
+                    .unwrap_or_default(),
+                last_child[position]
+                    .map(|c| vec![c as u32])
+                    .unwrap_or_default(),
+            ]
+        } else {
+            vec![
+                vec![entry.offset as u32],
+                vec![entry.length as u32],
+                vec![label_offset],
+                vec![depths[doc_index] as u32],
+            ]
+        };
         let data = encode_indx_entry(&index_label, &tag_defs, &values);
         encoded.push((index_label, data));
     }
@@ -3742,13 +3880,18 @@ mod tests {
     }
 
     #[test]
-    fn kf7_ncx_has_four_tags_and_hexadecimal_index_labels() {
+    fn kf7_ncx_writes_kindlegens_hierarchy_tags() {
         let entries: Vec<Kf7NcxEntry> = (0..17)
             .map(|i| Kf7NcxEntry {
                 offset: i * 100,
                 length: 100,
                 label: format!("Letter {i}"),
                 depth: usize::from(i > 0),
+                class: if i == 0 {
+                    "toc".into()
+                } else {
+                    "section".into()
+                },
             })
             .collect();
         let (records, cncx) = build_kf7_ncx_indx(&entries);
@@ -3763,7 +3906,7 @@ mod tests {
             .step_by(4)
             .map(|off| primary[off])
             .collect();
-        assert_eq!(tags, vec![1, 2, 3, 4]);
+        assert_eq!(tags, vec![1, 2, 3, 4, 5, 21, 22, 23]);
 
         let data = &records[1];
         let idxt = u32::from_be_bytes(data[20..24].try_into().unwrap()) as usize;
@@ -3775,20 +3918,53 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert_eq!(label_at(9), "9");
+        // BFS output is the root, then its sixteen children.
+        assert_eq!(label_at(1), "1");
         assert_eq!(label_at(10), "A");
         assert_eq!(label_at(16), "10");
 
-        // The dictionary form has no parent/child tags, but tag 4 still
-        // carries the source TOC depth.
-        let tenth = {
-            let p = idxt + 4 + 10 * 2;
-            let off = u16::from_be_bytes(data[p..p + 2].try_into().unwrap()) as usize;
-            let next = u16::from_be_bytes(data[p + 2..p + 4].try_into().unwrap()) as usize;
-            let label_len = data[off] as usize;
-            &data[off + 1 + label_len..next]
+        // Every child carries tag 21 pointing at the root, and the root
+        // carries tags 22/23 covering its subtree. The presence of the
+        // control bits is enough here; the values are checked against the
+        // kindgen dump in tests/kindlegen_parity.rs.
+        let first = {
+            let off = u16::from_be_bytes(data[idxt + 4..idxt + 6].try_into().unwrap()) as usize;
+            data[off + 1 + data[off] as usize]
         };
-        assert_eq!(tenth.last().copied(), Some(0x81));
+        assert_eq!(first & 0x20, 0, "root has no parent tag");
+        assert_eq!(first & 0x40, 0x40, "root has a first child");
+        assert_eq!(first & 0x80, 0x80, "root has a last child");
+        let second = {
+            let p = idxt + 6;
+            let off = u16::from_be_bytes(data[p..p + 2].try_into().unwrap()) as usize;
+            data[off + 1 + data[off] as usize]
+        };
+        assert_eq!(second & 0x20, 0x20, "child has a parent tag");
+        assert_eq!(second & 0x40, 0, "child has no children");
+        assert_eq!(second & 0x80, 0, "child has no children");
+    }
+
+    #[test]
+    fn flat_kf7_ncx_keeps_the_four_tag_form() {
+        let entries: Vec<Kf7NcxEntry> = (0..5)
+            .map(|i| Kf7NcxEntry {
+                offset: i * 100,
+                length: 100,
+                label: format!("Letter {i}"),
+                depth: 0,
+                class: String::new(),
+            })
+            .collect();
+        let (records, _) = build_kf7_ncx_indx(&entries);
+        let primary = &records[0];
+        let tagx_off = u32::from_be_bytes(primary[180..184].try_into().unwrap()) as usize;
+        let tagx_len =
+            u32::from_be_bytes(primary[tagx_off + 4..tagx_off + 8].try_into().unwrap()) as usize;
+        let tags: Vec<u8> = (tagx_off + 12..tagx_off + tagx_len - 4)
+            .step_by(4)
+            .map(|off| primary[off])
+            .collect();
+        assert_eq!(tags, vec![1, 2, 3, 4]);
     }
 
     #[test]
