@@ -86,6 +86,10 @@ const EXTH_CDE_TYPE: u32 = 501;
 const EXTH_UPDATED_TITLE: u32 = 503;
 const EXTH_ASIN: u32 = 504;
 const EXTH_LANGUAGE: u32 = 524;
+/// EXTH 531/532. The dictionary's input and output languages; their presence
+/// is what makes the reader open a file as a dictionary.
+const EXTH_DICT_IN_LANGUAGE: u32 = 531;
+const EXTH_DICT_OUT_LANGUAGE: u32 = 532;
 const EXTH_TITLE_HASH: u32 = 542;
 
 // Record 0 layout constants.
@@ -209,6 +213,9 @@ pub enum RewriteError {
     /// The file carries no EXTH 113 (or no EXTH 202 thumbnail), so the
     /// firmware has no filename to file a device-side cover under.
     NoDeviceCoverKey,
+    /// The file has EXTH 113 but no EXTH 501, and it is not a dictionary.
+    /// Only a dictionary is filed under the default `EBOK` CDE.
+    NoDocumentType,
 }
 
 impl fmt::Display for RewriteError {
@@ -220,6 +227,13 @@ impl fmt::Display for RewriteError {
                 f,
                 "no EXTH 113 and EXTH 202 thumbnail to build a device cover from; \
                  books need --doc-type ebok, dictionaries carry 113 automatically"
+            ),
+            RewriteError::NoDocumentType => write!(
+                f,
+                "EXTH 113 is present but EXTH 501 is absent, and the file is not a \
+                 dictionary; only a dictionary is filed under EBOK without a document \
+                 type. Add one with `kindling rewrite-metadata --doc-type ebok`, or \
+                 rebuild the book with --doc-type ebok"
             ),
             RewriteError::DrmEncrypted => write!(f, "file is DRM-encrypted; refusing to rewrite"),
             RewriteError::MalformedHeader(s) => write!(f, "malformed MOBI header: {}", s),
@@ -359,20 +373,32 @@ pub struct DeviceThumbnail {
     /// EXTH 113. Half of the filename the firmware keys a cover on.
     pub asin: String,
     /// EXTH 501, e.g. `EBOK`, or the `EBOK` default the firmware files a
-    /// 113-bearing MOBI under when 501 is absent (dictionaries).
+    /// dictionary under when 501 is absent.
     pub cde_type: String,
     /// The image bytes from the record EXTH 202 points at.
     pub image: Vec<u8>,
+}
+
+/// Whether the EXTH records carry the dictionary language pair.
+///
+/// EXTH 531/532 are the input and output languages of a dictionary. The reader
+/// uses them to decide a file is a dictionary, and a dictionary is the only
+/// shape observed being filed under `EBOK` with no EXTH 501.
+fn has_dictionary_languages(records: &[(u32, Vec<u8>)]) -> bool {
+    records.iter().any(|(record_type, _)| {
+        matches!(*record_type, EXTH_DICT_IN_LANGUAGE | EXTH_DICT_OUT_LANGUAGE)
+    })
 }
 
 /// Pull the device-side cover thumbnail out of a built MOBI/AZW3.
 ///
 /// Fails when the file carries no EXTH 113, because without it the firmware
 /// has no filename to look under and there is nothing to write. A 501 record
-/// supplies the CDE half of the filename; when it is absent the firmware files
-/// a 113-bearing MOBI under `EBOK` (the catalog path observed for a wadoku
-/// dictionary was `thumbnail_<uuid>_EBOK_portrait.jpg`), so the same default
-/// is used here.
+/// supplies the CDE half of the filename. When 501 is absent, only a
+/// dictionary gets the `EBOK` default: the firmware filed a wadoku dictionary
+/// as `thumbnail_<uuid>_EBOK_portrait.jpg`, but nothing observed says which
+/// CDE it would use for a book, so a 113-bearing non-dictionary is refused
+/// rather than written under a guessed name.
 pub fn extract_device_thumbnail(input: &Path) -> Result<DeviceThumbnail, RewriteError> {
     let bytes = fs::read(input)?;
     let parsed = parse_mobi(&bytes)?;
@@ -388,9 +414,14 @@ pub fn extract_device_thumbnail(input: &Path) -> Result<DeviceThumbnail, Rewrite
     };
 
     let asin = exth_string(EXTH_ASIN_IDENTIFIER).ok_or(RewriteError::NoDeviceCoverKey)?;
-    // 501 is optional: the firmware defaults a 113-bearing MOBI to EBOK when
-    // the record is absent, which is the path a sideloaded dictionary takes.
-    let cde_type = exth_string(EXTH_CDE_TYPE).unwrap_or_else(|| "EBOK".to_string());
+    // 501 is optional for a dictionary: the firmware files a 113-bearing
+    // dictionary under EBOK when the record is absent. A book gets no guessed
+    // CDE, because there is no observed filename to write for it.
+    let cde_type = match exth_string(EXTH_CDE_TYPE) {
+        Some(cde) => cde,
+        None if has_dictionary_languages(&parsed.primary.exth_records) => "EBOK".to_string(),
+        None => return Err(RewriteError::NoDocumentType),
+    };
 
     // A path separator in either half would let the filename escape
     // system/thumbnails. Both come from a file we did not necessarily build.

@@ -621,7 +621,8 @@ enum Commands {
     /// with the content's own thumbnail, which fixes the tile and leaves the
     /// lock screen cover working. A copy also goes to `amazon-cover-bug/` so it
     /// can be restored after a sync clobbers it, the same convention calibre
-    /// uses.
+    /// uses. A book with EXTH 113 but no 501 is refused: only a dictionary is
+    /// filed under the default `EBOK` CDE.
     #[command(version)]
     Thumbnail {
         /// Built MOBI/AZW3 to take the thumbnail from
@@ -1082,6 +1083,15 @@ fn do_build(
                 Err(e) => {
                     eprintln!("Warning: MOBI post-build check could not run: {}", e);
                 }
+            }
+            if is_dictionary {
+                eprintln!(
+                    "Warning: this dictionary carries EXTH 113/504. The firmware reads 113 \
+                     as an ASIN, asks the Amazon store for the shelf tile, and caches a \
+                     placeholder for a sideloaded file. `kindling thumbnail {} --kindle \
+                     <volume>` is now required for the shelf tile.",
+                    output_path.display()
+                );
             }
             println!("Info(prcgen):I1036: Mobi file built successfully");
         }

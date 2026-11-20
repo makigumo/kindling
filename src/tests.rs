@@ -281,6 +281,35 @@ mod tests {
         buf
     }
 
+    /// Build a book with an explicit document type and return the raw bytes.
+    fn build_mobi_bytes_with_doc_type(
+        opf_path: &Path,
+        output_dir: &Path,
+        doc_type: &str,
+    ) -> Vec<u8> {
+        let output_path = output_dir.join("output.mobi");
+        mobi::build_mobi(
+            opf_path,
+            &output_path,
+            true,  // no_compress
+            false, // headwords_only
+            None,  // srcs_data
+            false, // include_cmet
+            false, // no_hd_images
+            false, // creator_tag
+            false, // kf8_only (dual format)
+            Some(doc_type),
+            false, // kindle_limits
+            false, // self_check
+            false, // kindlegen_parity
+            false, // strict_accents
+            false, // fold_accents
+            false, // force_user_fonts
+        )
+        .expect("build_mobi failed");
+        fs::read(&output_path).expect("could not read output MOBI")
+    }
+
     /// Build a MOBI from an OPF path and return the raw bytes.
     fn build_mobi_bytes(
         opf_path: &Path,
@@ -9326,6 +9355,56 @@ p { margin: 0.3em 0; }
             "a 113-bearing MOBI without 501 is filed under EBOK"
         );
         assert_eq!(&thumb.image[..2], &[0xFF, 0xD8], "tile must be a JPEG");
+    }
+
+    /// A book can carry EXTH 113 without 501 only if some other tool wrote
+    /// it; kindling's own book path always writes the pair. Only a dictionary
+    /// is observed being filed under the default `EBOK` CDE, so the default
+    /// must not invent a filename for a book.
+    #[test]
+    fn a_113_bearing_non_dictionary_without_501_is_refused() {
+        let dir = TempDir::new("book_device_thumb_no_cde");
+        let opf = cbr_fixture("clean_book/clean_book.opf");
+        let mut data = build_mobi_bytes_with_doc_type(&opf, dir.path(), "EBOK");
+
+        // Retag 501 in place, leaving a book that still carries 113 and a
+        // thumbnail exactly as a third-party tool could have written it.
+        let (_, _, offsets) = parse_palmdb(&data);
+        let exth_pos = data[offsets[0] as usize..offsets[1] as usize]
+            .windows(4)
+            .position(|w| w == b"EXTH")
+            .map(|p| p + offsets[0] as usize)
+            .expect("book must carry an EXTH header");
+        let count = read_u32_be(&data, exth_pos + 8);
+        let mut p = exth_pos + 12;
+        let mut retagged = false;
+        for _ in 0..count {
+            let record_type = read_u32_be(&data, p);
+            let length = read_u32_be(&data, p + 4) as usize;
+            if record_type == 501 {
+                data[p..p + 4].copy_from_slice(&1001u32.to_be_bytes());
+                retagged = true;
+            }
+            p += length;
+        }
+        assert!(retagged, "the fixture must start with EXTH 501");
+
+        let (_, _, offsets) = parse_palmdb(&data);
+        let exth = parse_exth_records(get_record(&data, &offsets, 0));
+        assert!(exth.contains_key(&113), "113 must survive the retag");
+        assert!(!exth.contains_key(&501), "501 must be gone");
+        assert!(
+            !exth.contains_key(&531) && !exth.contains_key(&532),
+            "a book must not look like a dictionary"
+        );
+
+        let path = dir.path().join("book.mobi");
+        fs::write(&path, &data).unwrap();
+        match crate::mobi_rewrite::extract_device_thumbnail(&path) {
+            Err(crate::mobi_rewrite::RewriteError::NoDocumentType) => {}
+            Err(other) => panic!("expected NoDocumentType, got {other:?}"),
+            Ok(_) => panic!("a book with 113 and no 501 has no CDE to file under"),
+        }
     }
 
     /// kindlegen ships a RESC record with every dictionary; with no images it

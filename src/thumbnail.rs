@@ -9,8 +9,10 @@
 //! Amazon "No image available" image at
 //! `system/thumbnails/thumbnail_<113>_<CDE>_portrait.jpg`. That cached file
 //! becomes the library tile, so opting into a lock screen cover costs you the
-//! shelf art. The CDE half is EXTH 501 when present; a 113-bearing dictionary
-//! without 501 is filed under `EBOK`, which is the name written here.
+//! shelf art. The CDE half is EXTH 501 when present. Only a dictionary is
+//! filed under the default `EBOK` when 501 is absent, so that default is
+//! scoped to dictionaries; a 113-bearing book without 501 is refused rather
+//! than written under a name the firmware may not read.
 //!
 //! Overwriting that file with the content's own thumbnail fixes the tile and
 //! leaves the lock screen cover working, both verified on a Paperwhite 5

@@ -275,6 +275,7 @@ kindling-cli comic input.cbz --title "My Comic" --language ja   # metadata overr
 kindling-cli comic input.cbz --doc-type ebok                    # appear under Books on Kindle (default: no shelf)
 kindling-cli build book.epub --doc-type ebok                    # Books shelf + a lock screen cover (issue #26)
 kindling-cli thumbnail book.azw3 --kindle /Volumes/Kindle       # fix the library tile that --doc-type ebok costs you
+kindling-cli thumbnail dict.mobi --kindle /Volumes/Kindle       # dictionaries carry 113/504; the shelf tile needs this
 kindling-cli comic input.cbz --cover 3                          # use page 3 as cover
 kindling-cli comic input.cbz --legacy-mobi                      # opt into legacy dual MOBI7+KF8 (.mobi)
 kindling-cli comic input.cbz --legacy-mobi                      # dual MOBI7+KF8 .mobi so sideloaded covers show (issue #20)
@@ -306,22 +307,25 @@ Kindle library field mapping (what the Kindle actually displays for sideloaded c
 | Title | EXTH 503 (books/dicts) or KF8 Record 0 full_name (comics) | EXTH 503 is emitted for reflowable books and dictionaries. For fixed-layout comics, EXTH 503 is omitted - it breaks Kindle navigation (toolbar/go-home disappear). KCC/kindlegen also omit it for comics. For dual-format `.mobi`, Kindle reads full_name from KF8 Record 0, not KF7. |
 | Author | EXTH 100 | Set via `--author` flag or ComicInfo.xml `<Writer>`/`<Penciller>`. Defaults to "kindling". |
 | Cover | EXTH 201 (cover image offset in image pool) | Cover offset is 0-based index within image records starting at `first_image`. |
-| Library thumbnail | EXTH 202 (thumbnail offset) + EXTH 129 (`kindle:embed:XXXX` thumbnail URI) | A downscaled JPEG generated from the cover and appended to the image pool. EXTH 129 is the base32 of the same 0-based offset EXTH 202 carries, matching kindlegen and calibre; it is the thumbnail, not the cover (issue #26). |
-| Lock screen cover | EXTH 113 (ASIN) + EXTH 501 (doc type) | Both records must be present for the firmware to treat a sideloaded book as lock-screen eligible; the image itself comes from the book's own cover and thumbnail records. Opt in with `--doc-type ebok`; 113 is filled in automatically (issue #26). |
+| Library thumbnail | EXTH 202 (thumbnail offset) + EXTH 129 (`kindle:embed:XXXX` thumbnail URI) | A downscaled JPEG generated from the cover and appended to the image pool, 240 px high. EXTH 129 is the base32 of the same 0-based offset EXTH 202 carries, matching kindlegen and calibre; it is the thumbnail, not the cover (issue #26). |
+| Lock screen cover | EXTH 113 (ASIN) + EXTH 501 (doc type) | For a sideloaded book, both records must be present for the firmware to treat it as lock-screen eligible; the image itself comes from the book's own cover and thumbnail records. Opt in with `--doc-type ebok`; 113 is filled in automatically (issue #26). Dictionaries write 113/504 with no 501 because Vocabulary Builder reads 113 as the dictionary's ASIN; that same record sends the shelf tile to the store, so they need `kindling thumbnail` as well. |
 | Document type | EXTH 501 | Omitted entirely by default, for comics as well as reflowable books. Its mere presence (any value) makes the Kindle reader treat the content as a non-navigable document and hide the back-to-library toolbar, trapping the reader inside (device-verified for books in issue #15, reported for comics on Paperwhite 5 firmware 5.18.1/5.19.2 in issue #21). kindlegen writes none for any content type. Set one explicitly with `--doc-type`: `PDOC` = Documents shelf, `EBOK` = Books shelf, `none` = omit (default). |
 - **Document type** (books and comics): `--doc-type pdoc` for the Documents shelf or `--doc-type ebok` for Books (default: `none`, no shelf assignment). Comics used to default to `pdoc`; they now omit the record like reflowable books do, because its presence hides the back-to-library button on some firmware and leaves no way out of the book (issue #21). Asking for a shelf is opt-in, and an unrecognized value is now an error rather than a silent fallback to `pdoc`.
 - **Lock screen covers**: with "Display book cover on lock screen" turned on, a sideloaded book shows its cover only if it carries both EXTH 113 and EXTH 501. Neither is written by default, so the wallpaper shows instead. `--doc-type ebok` writes both: it fills EXTH 113 with a UUID the EPUB already publishes, or derives a stable one from the metadata so rebuilds do not churn the identifier. This is the same combination calibre writes. Verified on a Paperwhite 5 (5.19.2) against two builds of one EPUB, with and without the pair.
 
+  Dictionaries are the exception: they always carry 113/504 because Vocabulary Builder keys lookups on 113, and they carry no 501. They therefore always need `kindling thumbnail` for the shelf tile, and the build prints a warning saying so.
+
   It is a tradeoff, not a free win. The firmware treats EXTH 113 as a real ASIN: it asks the store, finds nothing for a sideloaded UUID, and caches an Amazon "No image available" image at `system/thumbnails/thumbnail_<113>_<501>_portrait.jpg`. On the same Paperwhite 5 that gained the lock screen cover, the library tile became that placeholder. So `--doc-type ebok` trades a blank shelf tile for a placeholder one and gains the lock screen cover; the lock screen keeps working because it draws on the book's own cover, not on that cached file. This is the long-standing disappearing-cover complaint that calibre works around by keeping backups in an `amazon-cover-bug/` directory. `kindling thumbnail book.azw3 --kindle /Volumes/Kindle` does the same thing: it writes the book's own thumbnail over that cached file, which restores the tile and leaves the lock screen cover working, and drops a restore copy in `amazon-cover-bug/` for the next time a sync clobbers it. Also note issue #15: EXTH 501 is what hides the back-to-library toolbar on some firmware, though a reflowable book with 501 = EBOK navigated fine on 5.19.2.
 - **KF8-only by default**: comics output `.azw3` with only the KF8 section (no MOBI7); pass `--legacy-mobi` for the old dual-format behavior on pre-2012 Kindles
 
-### Library tiles for `--doc-type ebok` books
+### Library tiles for books and dictionaries
 
 ```bash
 kindling-cli thumbnail book.azw3 --kindle /Volumes/Kindle
+kindling-cli thumbnail dict.mobi --kindle /Volumes/Kindle
 ```
 
-Only relevant to books built with `--doc-type ebok`. That flag gets a lock screen cover, and the cost is the library tile: the firmware reads EXTH 113 as a real ASIN, asks the Amazon store, and caches a "No image available" image as the shelf art. This writes the book's own thumbnail over that cached file, which fixes the tile and leaves the lock screen cover alone, and keeps a restore copy in `amazon-cover-bug/` because a later sync can put the placeholder back. It refuses a path with no `system/` or `documents/` directory, and refuses a book with no EXTH 113/501 pair, since there would be no filename for the firmware to look under.
+Relevant to books built with `--doc-type ebok` and to every dictionary. The firmware reads EXTH 113 as a real ASIN, asks the Amazon store, and caches a "No image available" image as the shelf art. This writes the content's own thumbnail over that cached file, which fixes the tile and leaves the lock screen cover alone, and keeps a restore copy in `amazon-cover-bug/` because a later sync can put the placeholder back. A dictionary has no EXTH 501, so the filename uses `EBOK`, the CDE the firmware files it under; the build warns when a dictionary needs this step. A book with 113 but no 501 is refused, because only a dictionary is observed being filed under that default. It also refuses a path with no `system/` or `documents/` directory, and a file with no EXTH 113/202, since there would be no filename for the firmware to look under.
 
 ### Validation
 
@@ -628,13 +632,13 @@ EXTH records are type-length-value metadata entries in Record 0, following the M
 | 106 | Publishing date | Both | UTF-8 string | |
 | 112 | Source identifier | Books | UTF-8 string | Calibre writes `calibre:<uuid>` here. Never written by kindling; it is not a series field |
 | 504, 508, 517-519, 534 | No verified meaning | - | - | Proposed at various times as the series slot. None is written, and a test pins that: 504 is a second copy of the ASIN in the Amazon-delivered files available here, 534 is Amazon's own input-pipeline tag, and 508/517/518/519 appear in no file anyone here has. kindlegen writes no series record either, though its binary dates from 2015 and the Kindle library's Series feature is later, so that is evidence about kindlegen rather than about the container (issue #48) |
-| 113 | ASIN | Books, comics | UTF-8 string | Written only alongside a 501. The pair names the device-side cover file (`system/thumbnails/thumbnail_<113>_<501>_portrait.jpg`), which is what the lock screen shows. Value is a UUID the EPUB already publishes, or one derived from its metadata so rebuilds stay stable (issue #26) |
+| 113 | ASIN | Books, comics, dicts | UTF-8 string | For books and comics, written only alongside a 501; the pair names the device-side cover file (`system/thumbnails/thumbnail_<113>_<501>_portrait.jpg`), which is what the lock screen shows. Value is a UUID the EPUB already publishes, or one derived from its metadata so rebuilds stay stable (issue #26). Dictionaries write the identifier with 504 and no 501: Vocabulary Builder reads 113 as the dictionary's ASIN, and the firmware files its tile under `EBOK` |
 | 121 | KF8 boundary | Books | u32 BE | Record index of KF8 Record 0 |
 | 122 | Fixed layout | Books | `"true"` | Present only for fixed-layout content |
 | 125 | Resource records | Both | u32 BE | The number of resource records the section writes: a dictionary counts its image records (2 in the Wadoku build — its cover and its logo image — where kindlegen's 3 images plus a RESC make 4), a book its image records plus any embedded fonts (2 in the `clean_book` and `simple_book` fixtures, which is a cover and its thumbnail, where kindlegen's `simple_book` reference writes 3). A dictionary used to write a fixed 1 whatever it shipped |
 | 131 | (unknown) | Both | u32 BE = 0 | |
 | 201 | Cover offset | Books | u32 BE | Image record offset for cover |
-| 202 | Thumbnail offset | Books | u32 BE | Image record offset for thumbnail |
+| 202 | Thumbnail offset | Both | u32 BE | Image record offset for thumbnail |
 | 204 | Creator platform | Both | u32 BE | 201 = Mac (*kindlegen* compat), 300 = Kindling |
 | 205 | Creator major version | Both | u32 BE | |
 | 206 | Creator minor version | Both | u32 BE | |
