@@ -1,9 +1,12 @@
-//! Compile a dictionary's stylesheet into inline markup (issue #57).
+//! Compile a stylesheet into inline legacy markup (issue #57).
 //!
-//! The Kindle lookup popup does not apply `<style>` blocks. A dictionary can
-//! ship a perfectly good stylesheet and every entry still renders in the
-//! reader's default face, which is what every kindling dictionary did until
-//! this module existed.
+//! The Kindle lookup popup does not apply `<style>` blocks, and a MOBI6 reader
+//! applies no stylesheet at all. A dictionary can ship a perfectly good
+//! stylesheet and every entry still renders in the reader's default face,
+//! which is what every kindling dictionary did until this module existed. A
+//! `--legacy-mobi` book's KF7 half has the same gap and uses the same
+//! compiler; see `mobi::compile_book_css`, which applies these effects to each
+//! body's contents.
 //!
 //! kindlegen works around it by resolving the rules at build time into legacy
 //! presentational tags. Given `u { font-size: 260%; font-weight: bold; }` it

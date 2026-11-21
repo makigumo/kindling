@@ -3098,8 +3098,28 @@ fn build_text_content(
     let mut body_links: Vec<Vec<PendingFilepos>> = Vec::new();
     let mut first_head: Option<String> = None;
 
-    for (index, html_path) in opf.get_content_html_paths().iter().enumerate() {
-        let content = std::fs::read_to_string(html_path).unwrap_or_default();
+    // Every document is read up front because the KF7 pass is decided once for
+    // the whole book: its stylesheets come from the `<style>` blocks and
+    // `<link>`s across all of them, and whether it gets the pass at all depends
+    // on the package being reflowable. A dictionary takes its CSS through the
+    // dictionary pass instead (issue #57).
+    let documents_html: Vec<(std::path::PathBuf, String)> = opf
+        .get_content_html_paths()
+        .into_iter()
+        .map(|path| {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            (path, content)
+        })
+        .collect();
+    // Page-based content — the comic builder's pages, and any OPF that declares
+    // `pre-paginated` — carries its layout per page and is left exactly as it
+    // was. Everything else is a reflowable book and gets the pass, sheet or no
+    // sheet: an inline `display:none` and a `<pre>` are kindlegen's treatment of
+    // the text itself, measured with no `<style>` block at all.
+    let kf7_pass = !strip_idx && !opf.is_fixed_layout;
+    let book_css = kf7_pass.then(|| compile_book_css(opf, &documents_html));
+
+    for (index, (_path, content)) in documents_html.iter().enumerate() {
         let cleaned = if strip_idx {
             // A dictionary's front matter is cleaned by the dictionary pass,
             // which drops every `style=` attribute. The one declaration that
@@ -3107,27 +3127,47 @@ fn build_text_content(
             // `<h1 style="text-align: center">` — and it has to be compiled
             // before the attribute goes, or the title lines render left-
             // aligned where kindlegen centres them over the logo.
-            let centred = translate_css_for_legacy_readers(&content);
+            let centred = translate_css_for_legacy_readers(content);
             strip_idx_markup(&centred)
         } else {
-            clean_book_html(&content)
+            clean_book_html(content)
         };
-        // Both of these change byte lengths, so they have to happen before
-        // anything measures an offset.
+        // These change byte lengths, and so does the KF7 pass below, so they
+        // all have to happen before anything measures an offset.
         let cleaned = apply_recindex_lookup(&cleaned, recindex_lookup);
         let cleaned =
             String::from_utf8_lossy(&strip_kf8_flow_links(cleaned.as_bytes())).to_string();
+        // Before the compiler below: a style attribute that is exactly
+        // `text-align:center` becomes `align="center"` and is removed here, so
+        // the compiled pass cannot write a second `align` beside it.
         let cleaned = translate_css_for_legacy_readers(&cleaned);
+        // The KF7 half has no use for the sheet or the link that carried it:
+        // both are inert in MOBI6, and the link names a file this stream does
+        // not contain. Fixed-layout content keeps whatever it had.
+        let stripped = kf7_pass.then(|| strip_legacy_stylesheet_markup(&cleaned));
+        let cleaned = stripped.as_deref().unwrap_or(&cleaned);
 
-        if first_head.is_none() {
-            if let Some(cap) = head_re.captures(&cleaned) {
-                first_head = Some(cap.get(0).unwrap().as_str().to_string());
-            }
+        if first_head.is_none()
+            && let Some(cap) = head_re.captures(cleaned)
+        {
+            first_head = Some(cap.get(0).unwrap().as_str().to_string());
         }
-        wrapper_anchors.push(links::scan_document_anchors(&cleaned));
-        let body = match body_re.captures(&cleaned) {
-            Some(cap) => cap.get(1).unwrap().as_str().trim().to_string(),
-            None => cleaned.clone(),
+        wrapper_anchors.push(links::scan_document_anchors(cleaned));
+        // The rules are compiled into the body's contents rather than the
+        // document. kindlegen writes nothing for `html` or `body` — measured:
+        // `body { color: navy; font-size: 150% }` and `html { font-size: 62.5% }`
+        // leave the KF7 text untouched — and an effect wrapped around `<html>`
+        // would put markup inside the head. A document with no `<body>` is
+        // passed through as it is, for the same reason.
+        let body = match body_re.captures(cleaned) {
+            Some(cap) => {
+                let body = cap.get(1).unwrap().as_str().trim();
+                match &book_css {
+                    Some(effects) => crate::dict_css::apply(body, effects),
+                    None => std::borrow::Cow::Borrowed(body),
+                }
+            }
+            None => std::borrow::Cow::Borrowed(cleaned),
         };
 
         let doc_href = doc_hrefs.get(index).map(|s| s.as_str()).unwrap_or("");
@@ -4355,6 +4395,136 @@ fn trim_leading_separators(text: &str) -> String {
         }
     }
     rest.to_string()
+}
+
+/// The two ways a document carries stylesheet markup: a `<style>` block and a
+/// `<link>` tag. Shared by the collector and the stripper so the two cannot
+/// disagree about what counts as a sheet.
+fn stylesheet_markup_re() -> &'static Regex {
+    use std::sync::OnceLock;
+    static MARKUP: OnceLock<Regex> = OnceLock::new();
+    MARKUP.get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style>|<link\b[^>]*>").unwrap())
+}
+
+/// What a reflowable book compiles into legacy markup for its KF7 half.
+///
+/// A MOBI6 reader applies no stylesheet at all — the same gap the dictionary
+/// popup has (issue #57) — so the KF7 half of a `--legacy-mobi` book has to say
+/// its CSS in markup or say nothing. kindlegen resolves the rules at build
+/// time, and [`crate::dict_css`] is that resolution measured rule for rule, so
+/// a book runs its sheet through the same compiler.
+///
+/// Only what the spine documents actually link is collected: a `<style>` block
+/// inside one of them, or a `<link rel="stylesheet">` naming a file. A sheet
+/// the manifest declares but no page links cannot reach a reader's page, and
+/// compiling it would style text no stylesheet ever touched — a cover-only
+/// sheet is the usual case.
+///
+/// Measured on kindlegen 2.9: `h1 { font-weight: bold; color: green;
+/// text-align: center }` ships as `<h1 align="center"><font color="green"><b>`,
+/// a class rule resolves the same way, and the `<style>` block and the `<link>`
+/// are gone from the KF7 head.
+///
+/// A book with no stylesheet at all comes back with no effects, and that is
+/// still the pass that transliterates a `<pre>` and removes an inline
+/// `display:none`: measured on kindlegen 2.9 with no `<style>` block anywhere,
+/// both still happen. The caller decides whether the package is reflowable and
+/// runs this only for one that is; page-based content keeps its own markup.
+fn compile_book_css(
+    opf: &OPFData,
+    documents: &[(std::path::PathBuf, String)],
+) -> crate::dict_css::Effects {
+    // One pass per document, in document order, so two sheets keep the order a
+    // reader would cascade them in. `<style>` is matched whole; `<link>` is a
+    // candidate until its attributes say what it names.
+    let inner_re = Regex::new(r"(?is)<style\b[^>]*>(.*?)</style>").unwrap();
+    let href_re = Regex::new(r#"(?i)\bhref\s*=\s*["']([^"']+)["']"#).unwrap();
+    let mut css = String::new();
+    let mut seen_blocks: HashSet<&str> = HashSet::new();
+    let mut seen_paths: HashSet<std::path::PathBuf> = HashSet::new();
+
+    for (document, content) in documents {
+        for markup in stylesheet_markup_re().find_iter(content) {
+            let markup = markup.as_str();
+            let lower = markup.to_ascii_lowercase();
+            if lower.starts_with("<style") {
+                if let Some(block) = inner_re.captures(markup) {
+                    let text = block.get(1).unwrap().as_str();
+                    // A sheet every chapter repeats verbatim is one sheet.
+                    if seen_blocks.insert(text) {
+                        css.push_str(text);
+                        css.push('\n');
+                    }
+                }
+                continue;
+            }
+            // A `<link>` is a stylesheet only when it says so; a `rel="next"`
+            // or `rel="author"` points elsewhere.
+            if !lower.contains("stylesheet") && !lower.contains(".css") {
+                continue;
+            }
+            let Some(href) = href_re.captures(markup).map(|c| c[1].to_string()) else {
+                continue;
+            };
+            // A `kindle:` URI names a resource inside the book, not a file on
+            // disk. The KF8 flow link is one of these and has nothing to read.
+            if href.starts_with("kindle:") {
+                continue;
+            }
+            let decoded = links::percent_decode(&href);
+            let Some(css_path) = linked_stylesheet_path(document, &opf.base_dir, &decoded) else {
+                // A link naming nothing already warned during the KF8 pass.
+                continue;
+            };
+            let key = css_path.canonicalize().unwrap_or_else(|_| css_path.clone());
+            if !seen_paths.insert(key) {
+                continue;
+            }
+            if let Ok(sheet) = std::fs::read_to_string(&css_path) {
+                css.push_str(&sheet);
+                css.push('\n');
+            }
+        }
+    }
+
+    crate::dict_css::compile(&css).effects
+}
+
+/// Remove the stylesheet markup a MOBI6 reader cannot use from KF7 text.
+///
+/// Measured on kindlegen 2.9: the KF7 head is the guide and nothing else — the
+/// `<style>` blocks and `<link rel="stylesheet">` elements that carried the
+/// rules are gone, and what is left of them is the markup they compiled to.
+/// kindling used to ship both, so a book kept a link naming a file the MOBI6
+/// stream does not contain. A `kindle:flow:` link never reaches here; it is
+/// dropped earlier, in [`strip_kf8_flow_links`].
+///
+/// Only stylesheet references are taken out: a `<link rel="next">` is none of
+/// this function's business. A document with nothing to take out comes back
+/// borrowed, so the common book without a sheet costs no copy.
+fn strip_legacy_stylesheet_markup(html: &str) -> std::borrow::Cow<'_, str> {
+    let mut out: Option<String> = None;
+    let mut last = 0usize;
+    for m in stylesheet_markup_re().find_iter(html) {
+        let markup = m.as_str();
+        let lower = markup.to_ascii_lowercase();
+        // `<style>` is the sheet itself. A `<link>` is a sheet reference when
+        // its rel says stylesheet or its href names a `.css` file, which covers
+        // both spellings a source writes.
+        let is_sheet =
+            lower.starts_with("<style") || lower.contains("stylesheet") || lower.contains(".css");
+        if !is_sheet {
+            continue;
+        }
+        let out = out.get_or_insert_with(|| String::with_capacity(html.len()));
+        out.push_str(&html[last..m.start()]);
+        last = m.end();
+    }
+    let Some(mut out) = out else {
+        return std::borrow::Cow::Borrowed(html);
+    };
+    out.push_str(&html[last..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Say in markup what this stream says in CSS, because a MOBI6 reader has no

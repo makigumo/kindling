@@ -11054,6 +11054,250 @@ p { margin: 0.3em 0; }
         }
     }
 
+    /// A `--legacy-mobi` book compiles its stylesheet into KF7 markup.
+    ///
+    /// The KF7 half is read by devices that apply no CSS, so a heading styled
+    /// only by a rule used to ship bare, beside a `<link>` naming a file the
+    /// MOBI6 stream does not contain. kindlegen resolves the rules at build
+    /// time — measured: `h1 { font-weight: bold; color: green; text-align:
+    /// center }` ships as `<h1 align="center"><font color="green"><b>` — and
+    /// that is what the book now does too. The KF8 half keeps the sheet, where
+    /// a reader does apply it.
+    #[test]
+    fn a_legacy_mobi_book_compiles_its_stylesheet_into_markup() {
+        let dir = TempDir::new("book_kf7_css");
+        fs::write(
+            dir.path().join("style.css"),
+            "h1 { font-weight: bold; color: green; text-align: center; }\n\
+             body { color: navy; font-size: 150%; }\n\
+             p { padding: 11px; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ch1.html"),
+            r#"<html><head><title>One</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><h1>One</h1><p>x</p></body></html>"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ch2.html"),
+            r#"<html><head><title>Two</title><style type="text/css">.c { font-style: italic; }</style></head><body><p class="c">y</p></body></html>"#,
+        )
+        .unwrap();
+        let opf_path = dir.path().join("content.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="css" href="style.css" media-type="text/css"/>
+    <item id="a" href="ch1.html" media-type="application/xhtml+xml"/>
+    <item id="b" href="ch2.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="a"/><itemref idref="b"/></spine>
+</package>"#,
+        )
+        .unwrap();
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let kf7 = extract_text_from_uncompressed_mobi(&data);
+
+        assert!(
+            kf7.contains(r#"<h1 align="center"><font color="green"><b>One</b></font></h1>"#),
+            "the h1 rule must reach the KF7 text as markup, got: {}",
+            &kf7[..kf7.len().min(500)]
+        );
+        assert!(
+            kf7.contains("<i>y</i>"),
+            "a class rule in a <style> block must compile the same way"
+        );
+        assert!(
+            !kf7.contains("stylesheet") && !kf7.contains("<style"),
+            "KF7 must carry neither a stylesheet block nor a link to one"
+        );
+        assert!(
+            !kf7.contains("padding: 11px"),
+            "the stylesheet itself must not ship in the KF7 text"
+        );
+        assert!(
+            !kf7.contains("navy") && !kf7.contains("size=\"+2\""),
+            "kindlegen writes no markup for a body rule; neither must this"
+        );
+        assert!(
+            String::from_utf8_lossy(&data).contains("padding: 11px"),
+            "KF8 must keep the stylesheet unchanged"
+        );
+    }
+
+    /// A book's KF7 half gets kindlegen's `<pre>` and `display:none` treatment.
+    ///
+    /// Compiling a sheet brings two things that are not declarations of the
+    /// book's own: a `<pre>` is transliterated into a spacer, its indent and
+    /// `<div align="left"><tt>` even when no rule names it, and a
+    /// `display:none` element is removed from the stream. Both were measured
+    /// against kindlegen 2.9 on the same source and the generated markup is
+    /// byte-for-byte the same; kindlegen's empty `<data-AmznRemoved>` marker is
+    /// the one addition this does not reproduce. The sheet here compiles no
+    /// declaration at all (`padding` has no legacy form), which is also a
+    /// measured case: kindlegen still does both.
+    #[test]
+    fn a_legacy_mobi_books_pre_and_display_none_match_kindlegen() {
+        let dir = TempDir::new("book_kf7_pre");
+        fs::write(dir.path().join("style.css"), "p { padding: 11px; }\n").unwrap();
+        fs::write(
+            dir.path().join("ch1.html"),
+            r#"<html><head><title>C</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body>
+<div>keep <span style="display:none">INLINE-HIDDEN</span> tail</div>
+<p style="display:none">P-HIDDEN</p><p>after</p>
+<pre>  a
+  b
+</pre>
+</body></html>"#,
+        )
+        .unwrap();
+        let opf_path = dir.path().join("content.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="css" href="style.css" media-type="text/css"/>
+    <item id="a" href="ch1.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="a"/></spine>
+</package>"#,
+        )
+        .unwrap();
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let kf7 = extract_text_from_uncompressed_mobi(&data);
+        let all = String::from_utf8_lossy(&data);
+
+        assert!(
+            kf7.contains("<div>keep  tail</div>"),
+            "a display:none element must be removed and its siblings kept, got: {}",
+            &kf7[..kf7.len().min(500)]
+        );
+        assert!(
+            !kf7.contains("INLINE-HIDDEN") && !kf7.contains("P-HIDDEN"),
+            "no hidden content may survive in the KF7 text"
+        );
+        assert!(
+            kf7.contains(
+                r#"<div height="0"></div><div align="left"><tt>&nbsp;&nbsp;a<br/>&nbsp;&nbsp;b<br/></tt></div>"#
+            ),
+            "a <pre> must ship kindlegen's wrapper and spelled-out whitespace"
+        );
+        assert!(
+            all.contains("INLINE-HIDDEN") && all.contains("<pre>  a"),
+            "KF8 must keep the source markup, hidden element and <pre> included"
+        );
+    }
+
+    /// Build a one-chapter book that declares no stylesheet, returning its KF7
+    /// text and the whole file. `metadata` is extra `<metadata>` XML.
+    fn build_cssless_book(name: &str, body: &str, metadata: &str) -> (String, Vec<u8>) {
+        let dir = TempDir::new(name);
+        fs::write(
+            dir.path().join("ch1.html"),
+            format!(r#"<html><head><title>C</title></head><body>{body}</body></html>"#),
+        )
+        .unwrap();
+        let opf_path = dir.path().join("content.opf");
+        fs::write(
+            &opf_path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata>
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+    <dc:language xmlns:dc="http://purl.org/dc/elements/1.1/">en</dc:language>
+    {metadata}
+  </metadata>
+  <manifest>
+    <item id="a" href="ch1.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="a"/></spine>
+</package>"#
+            ),
+        )
+        .unwrap();
+        let data = build_mobi_bytes(&opf_path, dir.path(), true, false, None);
+        let kf7 = extract_text_from_uncompressed_mobi(&data);
+        (kf7, data)
+    }
+
+    /// A reflowable book with no stylesheet still gets the KF7 treatment.
+    ///
+    /// An inline `display:none` and a `<pre>` are not stylesheet rules, but
+    /// kindlegen resolves them into MOBI7 regardless: measured on this source
+    /// with no `<style>` block anywhere, the hidden element is gone and the
+    /// `<pre>` becomes the spacer, indent and `<div align="left"><tt>`. A book
+    /// with no sheet now matches instead of shipping the raw element.
+    #[test]
+    fn a_legacy_mobi_book_without_a_stylesheet_gets_the_kf7_pass() {
+        let body = r#"<div>keep <span style="display:none">INLINE-HIDDEN</span> tail</div>
+<pre>  a
+  b
+</pre>"#;
+        let (kf7, data) = build_cssless_book("book_kf7_no_css", body, "");
+
+        assert!(
+            kf7.contains("<div>keep  tail</div>"),
+            "a display:none element must be removed without a stylesheet, got: {}",
+            &kf7[..kf7.len().min(500)]
+        );
+        assert!(!kf7.contains("INLINE-HIDDEN"));
+        assert!(
+            kf7.contains(
+                r#"<div height="0"></div><div align="left"><tt>&nbsp;&nbsp;a<br/>&nbsp;&nbsp;b<br/></tt></div>"#
+            ),
+            "a <pre> must ship kindlegen's wrapper without a stylesheet"
+        );
+        assert!(
+            String::from_utf8_lossy(&data).contains("INLINE-HIDDEN"),
+            "KF8 must keep the source markup"
+        );
+    }
+
+    /// Page-based content keeps the KF7 markup it always had.
+    ///
+    /// The comic builder marks its OPF fixed-layout (`pre-paginated`), because
+    /// its pages carry their own layout. Running the reflowable pass over them
+    /// would turn inline styles and `<pre>` into a book's markup, so a
+    /// fixed-layout package is skipped; this is the shape the comic builder
+    /// sees.
+    #[test]
+    fn a_fixed_layout_book_keeps_its_kf7_markup_untouched() {
+        let body = r#"<div>keep <span style="display:none">INLINE-HIDDEN</span> tail</div>
+<pre>  a
+  b
+</pre>"#;
+        let (kf7, _) = build_cssless_book(
+            "book_kf7_fixed",
+            body,
+            r#"<meta name="fixed-layout" content="true"/>"#,
+        );
+
+        assert!(
+            kf7.contains("INLINE-HIDDEN"),
+            "a fixed-layout page must keep its hidden element"
+        );
+        assert!(
+            kf7.contains("<pre>  a"),
+            "a fixed-layout page must keep its <pre> element"
+        );
+        assert!(
+            !kf7.contains("&nbsp;"),
+            "no <pre> transliteration may reach page-based content"
+        );
+    }
+
     /// A linked sheet's `@font-face` urls are relative to the sheet, so they
     /// resolve from where the sheet was found rather than from the directory
     /// its `href` text spells.
