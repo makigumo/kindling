@@ -983,6 +983,7 @@ mod tests {
             spine_items: Vec::new(),
             manifest: HashMap::new(),
             coverimage_id: None,
+            meta_cover_ids: Vec::new(),
             is_fixed_layout: false,
             original_resolution: None,
             page_progression_direction: None,

@@ -74,6 +74,10 @@ pub struct OPFData {
     pub raw_itemrefs: Vec<SpineItemRef>,
     /// Manifest item id with `properties="cover-image"` (EPUB 3 cover method).
     pub coverimage_id: Option<String>,
+    /// Manifest item ids named by `<meta name="cover" content="..."/>` (OPF 2
+    /// cover method), in document order, captured while the package document
+    /// is parsed.
+    pub meta_cover_ids: Vec<String>,
     /// True if the OPF declares fixed-layout (pre-paginated) rendering.
     pub is_fixed_layout: bool,
     /// Original resolution from OPF metadata (e.g. "1072x1448").
@@ -136,6 +140,7 @@ impl OPFData {
             manifest_items: Vec::new(),
             raw_itemrefs: Vec::new(),
             coverimage_id: None,
+            meta_cover_ids: Vec::new(),
             is_fixed_layout: false,
             original_resolution: None,
             page_progression_direction: None,
@@ -305,7 +310,7 @@ impl OPFData {
                         "embeddedcover" if in_current_xmetadata => {
                             current_tag = "EmbeddedCover".to_string();
                         }
-                        "meta" if in_metadata => {
+                        "meta" => {
                             // Check for fixed-layout and original-resolution metadata
                             let mut name_val = String::new();
                             let mut content_val = String::new();
@@ -326,19 +331,27 @@ impl OPFData {
                                     _ => {}
                                 }
                             }
-                            // <meta name="fixed-layout" content="true"/>
-                            if name_val == "fixed-layout" && content_val == "true" {
-                                self.is_fixed_layout = true;
+                            // The old cover lookup scanned the whole document for
+                            // this meta; capture every id here, in order, so the
+                            // getters never re-read the file.
+                            if name_val == "cover" && !content_val.is_empty() {
+                                self.meta_cover_ids.push(content_val.clone());
                             }
-                            // <meta name="original-resolution" content="WxH"/>
-                            if name_val == "original-resolution" && !content_val.is_empty() {
-                                self.original_resolution = Some(content_val.clone());
-                            }
-                            // <meta property="rendition:layout">pre-paginated</meta>
-                            // For empty/self-closing tags, the value is in content attr;
-                            // for start tags, we need to capture the text content
-                            if property_val == "rendition:layout" {
-                                current_tag = "rendition:layout".to_string();
+                            if in_metadata {
+                                // <meta name="fixed-layout" content="true"/>
+                                if name_val == "fixed-layout" && content_val == "true" {
+                                    self.is_fixed_layout = true;
+                                }
+                                // <meta name="original-resolution" content="WxH"/>
+                                if name_val == "original-resolution" && !content_val.is_empty() {
+                                    self.original_resolution = Some(content_val.clone());
+                                }
+                                // <meta property="rendition:layout">pre-paginated</meta>
+                                // For empty/self-closing tags, the value is in content attr;
+                                // for start tags, we need to capture the text content
+                                if property_val == "rendition:layout" {
+                                    current_tag = "rendition:layout".to_string();
+                                }
                             }
                         }
                         "item" if in_manifest => {
@@ -659,6 +672,19 @@ impl OPFData {
             .collect()
     }
 
+    /// Manifest id named by `properties="cover-image"` or by
+    /// `<meta name="cover">`, in that order; only image items count.
+    fn cover_id_from_metadata(&self) -> Option<&String> {
+        self.coverimage_id
+            .iter()
+            .chain(self.meta_cover_ids.iter())
+            .find(|id| {
+                self.manifest
+                    .get(*id)
+                    .is_some_and(|(_, media_type)| media_type.starts_with("image/"))
+            })
+    }
+
     /// Find the cover image manifest item id from OPF metadata.
     ///
     /// Returns the OPF manifest item `id` attribute for the cover image, which
@@ -667,66 +693,8 @@ impl OPFData {
     /// `properties="cover-image"` (EPUB 3) and falls back to
     /// `<meta name="cover" content="...">`.
     pub fn get_cover_image_id(&self) -> Option<String> {
-        if let Some(ref cover_id) = self.coverimage_id {
-            if let Some((_, media_type)) = self.manifest.get(cover_id) {
-                if media_type.starts_with("image/") {
-                    return Some(cover_id.clone());
-                }
-            }
-        }
-
-        let opf_path = self.base_dir.join(
-            std::fs::read_dir(&self.base_dir)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "opf")
-                        .unwrap_or(false)
-                })?
-                .file_name(),
-        );
-
-        let content = std::fs::read_to_string(&opf_path).ok()?;
-        let cleaned = clean_opf_xml(&content);
-
-        let mut reader = Reader::from_str(&cleaned);
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::new();
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                    let local_name = local_tag_name(e.name().as_ref());
-                    if local_name == "meta" {
-                        let mut name_val = String::new();
-                        let mut content_val = String::new();
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"name" => {
-                                    name_val = String::from_utf8_lossy(&attr.value).to_string()
-                                }
-                                b"content" => {
-                                    content_val = String::from_utf8_lossy(&attr.value).to_string()
-                                }
-                                _ => {}
-                            }
-                        }
-                        if name_val == "cover" && !content_val.is_empty() {
-                            if let Some((_, media_type)) = self.manifest.get(&content_val) {
-                                if media_type.starts_with("image/") {
-                                    return Some(content_val);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            buf.clear();
+        if let Some(cover_id) = self.cover_id_from_metadata() {
+            return Some(cover_id.clone());
         }
 
         // Method 3: OEB 1.x EmbeddedCover; reverse-look up the manifest id
@@ -751,71 +719,11 @@ impl OPFData {
     ///   `<x-metadata><EmbeddedCover>cover.png</EmbeddedCover>` naming a
     ///   manifest item by href. PyGlossary and other OEB 1.x tools emit this.
     pub fn get_cover_image_href(&self) -> Option<String> {
-        // Method 1: check for the cover-image property captured during manifest parsing
-        if let Some(ref cover_id) = self.coverimage_id {
-            if let Some((href, media_type)) = self.manifest.get(cover_id) {
-                if media_type.starts_with("image/") {
-                    return Some(href.clone());
-                }
+        // Methods 1 and 2: the property or meta captured during parsing.
+        if let Some(cover_id) = self.cover_id_from_metadata() {
+            if let Some((href, _)) = self.manifest.get(cover_id) {
+                return Some(href.clone());
             }
-        }
-
-        // Method 2: re-parse the OPF to find <meta name="cover" content="..."/>
-        let opf_path = self.base_dir.join(
-            // We need to find the OPF file - check common locations
-            std::fs::read_dir(&self.base_dir)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "opf")
-                        .unwrap_or(false)
-                })?
-                .file_name(),
-        );
-
-        let content = std::fs::read_to_string(&opf_path).ok()?;
-        let cleaned = clean_opf_xml(&content);
-
-        // Find <meta name="cover" content="..."/>
-        let mut reader = Reader::from_str(&cleaned);
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::new();
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                    let local_name = local_tag_name(e.name().as_ref());
-                    if local_name == "meta" {
-                        let mut name_val = String::new();
-                        let mut content_val = String::new();
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"name" => {
-                                    name_val = String::from_utf8_lossy(&attr.value).to_string()
-                                }
-                                b"content" => {
-                                    content_val = String::from_utf8_lossy(&attr.value).to_string()
-                                }
-                                _ => {}
-                            }
-                        }
-                        if name_val == "cover" && !content_val.is_empty() {
-                            // content_val is the manifest item ID
-                            if let Some((href, media_type)) = self.manifest.get(&content_val) {
-                                if media_type.starts_with("image/") {
-                                    return Some(href.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            buf.clear();
         }
 
         // Method 3: OEB 1.x <EmbeddedCover>cover.png</EmbeddedCover>. Validate
@@ -1462,6 +1370,72 @@ verb
                 "also-not-the-publication-id"
             ]
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cover_lookups_ignore_a_sibling_opf() {
+        // Two package documents share a directory. The sibling declares a
+        // cover; the OPF being parsed does not. Cover lookups used to re-parse
+        // whichever .opf read_dir returned first, so the coverless book could
+        // pick up its sibling's cover.
+        let dir = temp_dir("sibling_cover");
+        let opf = |with_cover: bool| {
+            let cover_meta = if with_cover {
+                r#"<meta name="cover" content="img"/>"#
+            } else {
+                ""
+            };
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Sibling Cover</dc:title>
+    <dc:language>en</dc:language>
+    <dc:identifier id="id">sibling-cover</dc:identifier>
+    {cover_meta}
+  </metadata>
+  <manifest>
+    <item id="img" href="cover.jpg" media-type="image/jpeg"/>
+    <item id="c" href="c.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c"/></spine>
+</package>"#
+            )
+        };
+
+        fs::write(dir.join("first.opf"), opf(false)).unwrap();
+        fs::write(dir.join("second.opf"), opf(false)).unwrap();
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".opf"))
+            .collect();
+        assert_eq!(names.len(), 2);
+        // Whichever entry read_dir returns first becomes the sibling, so the
+        // regression does not depend on the filesystem's directory order.
+        let sibling = names[0].clone();
+        let input = names[1].clone();
+        fs::write(dir.join(&sibling), opf(true)).unwrap();
+        fs::write(dir.join(&input), opf(false)).unwrap();
+
+        let data = OPFData::parse(&dir.join(&input)).unwrap();
+        assert_eq!(
+            data.get_cover_image_href(),
+            None,
+            "a sibling .opf with a cover must not supply one to the input"
+        );
+        assert_eq!(data.get_cover_image_id(), None);
+
+        // The sibling itself still resolves, so the fixture is not empty.
+        let sibling_data = OPFData::parse(&dir.join(&sibling)).unwrap();
+        assert_eq!(
+            sibling_data.get_cover_image_href().as_deref(),
+            Some("cover.jpg")
+        );
+        assert_eq!(sibling_data.get_cover_image_id().as_deref(), Some("img"));
+
         fs::remove_dir_all(&dir).ok();
     }
 
